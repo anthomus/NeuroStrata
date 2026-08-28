@@ -37,6 +37,16 @@ fn truncate_for_embedding(body: &str) -> String {
     format!("{}\n... (truncated at {} characters)", cut, MAX_SYMBOL_CHARS)
 }
 
+/// Node ids are paths, and a memory written by an agent names a file the way a
+/// human does: `src/parser/ingest.rs`. The walker yields a platform path with
+/// backslashes and a leading `./` on Windows, and an edge only forms when the
+/// two strings match exactly, so every id goes through here first.
+pub fn normalize_node_path(path: &str) -> String {
+    let forward = path.replace('\\', "/");
+    let trimmed = forward.strip_prefix("./").unwrap_or(&forward);
+    trimmed.trim_end_matches('/').to_string()
+}
+
 /// One extracted symbol, owned so that no tree-sitter type is alive when the
 /// embedding and upsert futures are awaited.
 struct SymbolRow {
@@ -112,9 +122,11 @@ pub async fn ingest_directory(
             std::env::current_dir().unwrap_or_default().join(path).to_string_lossy().to_string()
         };
 
+        let node_path = normalize_node_path(&path_str);
+
         // Create parent edge mapping
         let parent_id = if let Some(p) = path.parent() {
-            let p_str = p.to_string_lossy().to_string();
+            let p_str = normalize_node_path(&p.to_string_lossy());
             if p_str != "." && p_str != "" {
                 Some(p_str)
             } else {
@@ -124,9 +136,9 @@ pub async fn ingest_directory(
             None
         };
 
-        let mut related_to = Vec::new();
+        let mut contained_by = Vec::new();
         if let Some(pid) = parent_id {
-            related_to.push(pid);
+            contained_by.push(pid);
         }
 
         let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
@@ -147,12 +159,13 @@ pub async fn ingest_directory(
         // Upsert this structural node
         let mut metadata = serde_json::Map::new();
         metadata.insert("absolute_path".to_string(), serde_json::json!(abs_path));
-        metadata.insert("related_to".to_string(), serde_json::json!(related_to));
+        // Structure is containment, not a semantic link: the directory contains the file.
+        metadata.insert("contained_by".to_string(), serde_json::json!(contained_by));
 
-        let node_id = path_str.to_string();
+        let node_id = node_path.clone();
         let payload = MemoryPayload {
-            content: format!("Path: {}", path_str),
-            location: path_str.to_string(),
+            content: format!("Path: {}", node_path),
+            location: node_path.clone(),
             location_lines: String::new(),
             memory_type: mem_type.to_string(),
             metadata: serde_json::Value::Object(metadata),
@@ -245,9 +258,9 @@ pub async fn ingest_directory(
                     for symbol in pending {
                         let summary = format!(
                             "{} {} in {}\nlines {}-{}\n\n{}",
-                            symbol.kind, symbol.name, path_str, symbol.start_line, symbol.end_line, symbol.body
+                            symbol.kind, symbol.name, node_path, symbol.start_line, symbol.end_line, symbol.body
                         );
-                        let id = symbol_id(&path_str, &symbol.kind, &symbol.name, symbol.start_line);
+                        let id = symbol_id(&node_path, &symbol.kind, &symbol.name, symbol.start_line);
                         let lines = format!("{}-{}", symbol.start_line, symbol.end_line);
 
                         let mut metadata = serde_json::Map::new();
@@ -255,14 +268,15 @@ pub async fn ingest_directory(
                         metadata.insert("symbol".to_string(), serde_json::json!(symbol.name));
                         metadata.insert("symbol_kind".to_string(), serde_json::json!(symbol.kind));
                         metadata.insert("language".to_string(), serde_json::json!(lang_name));
-                        metadata.insert("related_to".to_string(), serde_json::json!([path_str.to_string()]));
+                        // The file contains the symbol, so this is a CONTAINS edge too.
+                        metadata.insert("contained_by".to_string(), serde_json::json!([node_path.clone()]));
                         metadata.insert("refs".to_string(), serde_json::json!([
-                            { "file": path_str.to_string(), "lines": lines.clone() }
+                            { "file": node_path.clone(), "lines": lines.clone() }
                         ]));
 
                         let payload = MemoryPayload {
                             content: summary.clone(),
-                            location: path_str.to_string(),
+                            location: node_path.clone(),
                             location_lines: lines,
                             memory_type: "code_ast".to_string(),
                             metadata: serde_json::Value::Object(metadata),
@@ -345,6 +359,16 @@ mod tests {
         }
         assert_eq!(map.get(&normalize_ext("rs")), Some(&"rust".to_string()));
         assert_eq!(map.get(&normalize_ext("tsx")), Some(&"tsx".to_string()));
+    }
+
+    /// Node ids double as edge targets, so a path an agent writes
+    /// ("src/lib.rs") has to land on the same string the walker produced.
+    #[test]
+    fn node_paths_normalise_to_one_form() {
+        assert_eq!(normalize_node_path(r".\src\lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_node_path("./src/lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_node_path("src/lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_node_path("src/"), "src");
     }
 
     #[test]
