@@ -15,13 +15,62 @@ pub struct LadybugStore {
     db: Arc<Database>,
 }
 
+/// The engine defaults to throwing when a WAL record fails to deserialize, which
+/// is how an ungraceful shutdown ends: the last transaction is torn. Throwing
+/// costs every committed transaction since the last checkpoint, because the
+/// caller's only recourse is to set the whole WAL aside.
+///
+/// With this off, the replayer's dry run stops at the last good COMMIT, replays
+/// everything up to it and truncates there -- so a kill costs the torn tail
+/// instead of the whole log. The rescue path below stays as a last resort for a
+/// WAL damaged beyond that.
+fn recovering_config() -> SystemConfig {
+    SystemConfig::default().throw_on_wal_replay_failure(false)
+}
+
+/// Copies a leftover write-ahead log aside before it is replayed and truncated.
+/// Best effort by design: failing to keep the copy is not a reason to refuse to
+/// open the database.
+fn preserve_unclean_wal(local_path: &std::path::Path) {
+    let mut wal_path = local_path.to_path_buf().into_os_string();
+    wal_path.push(".wal");
+    let wal_file = std::path::PathBuf::from(wal_path);
+
+    let size = match std::fs::metadata(&wal_file) {
+        Ok(m) if m.len() > 0 => m.len(),
+        _ => return,
+    };
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut copy_path = wal_file.clone().into_os_string();
+    copy_path.push(format!(".unclean.{}", timestamp));
+    let copy_file = std::path::PathBuf::from(copy_path);
+
+    eprintln!(
+        "WARNING: the last shutdown was not clean -- a {} byte write-ahead log was left behind. Recovering what it still holds.",
+        size
+    );
+    match std::fs::copy(&wal_file, &copy_file) {
+        Ok(_) => eprintln!("A copy was kept at {:?} in case recovery is incomplete.", copy_file),
+        Err(e) => eprintln!("WARNING: could not keep a copy of it: {}", e),
+    }
+}
+
 impl LadybugStore {
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
         let local_path = local_path.into();
 
+        // A WAL present at open time means the last process did not close cleanly:
+        // a clean close checkpoints and removes it. Keep a copy before the engine
+        // replays, because replay truncates the file to the last good record and
+        // whatever followed is then unrecoverable.
+        preserve_unclean_wal(&local_path);
+
         // We initialize the embedded Ladybug database once, and keep it in Arc to spawn connections from it
-        let config = SystemConfig::default();
-        let db = match Database::new(&local_path, config) {
+        let db = match Database::new(&local_path, recovering_config()) {
             Ok(db) => db,
             Err(e) => {
                 let err_msg = e.to_string();
@@ -50,8 +99,8 @@ impl LadybugStore {
                         );
                         eprintln!("ERROR: The discarded write-ahead log was kept at {:?} -- do not delete it if those writes mattered.", corrupted_file);
                         eprintln!("Reopening the database without them...");
-                        Database::new(&local_path, SystemConfig::default())
-                            .map_err(|retry_e| anyhow::anyhow!("Retry failed after self-healing: {}", retry_e))?
+                        Database::new(&local_path, recovering_config())
+                            .map_err(|retry_e| anyhow::anyhow!("Retry failed after discarding the WAL: {}", retry_e))?
                     } else {
                         return Err(anyhow::anyhow!("WAL corruption detected, but WAL file not found at {:?}", wal_file));
                     }
