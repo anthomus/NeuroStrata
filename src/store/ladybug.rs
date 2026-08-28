@@ -334,6 +334,24 @@ impl VectorStore for LadybugStore {
         Ok(())
     }
 
+    async fn export_database(&self, dir: &str) -> Result<()> {
+        let conn = self.get_conn()?;
+        // Checkpoint first so the export cannot miss writes still in the WAL --
+        // which, since replay does not restore rows, would otherwise be lost.
+        conn.query("CHECKPOINT")?;
+        let safe_dir = escape_kuzu_string(dir);
+        conn.query(&format!("EXPORT DATABASE '{}' (format='parquet')", safe_dir))?;
+        Ok(())
+    }
+
+    async fn import_database(&self, dir: &str) -> Result<()> {
+        let conn = self.get_conn()?;
+        let safe_dir = escape_kuzu_string(dir);
+        conn.query(&format!("IMPORT DATABASE '{}'", safe_dir))?;
+        conn.query("CHECKPOINT")?;
+        Ok(())
+    }
+
     async fn checkpoint(&self) -> Result<()> {
         let conn = self.get_conn()?;
         conn.query("CHECKPOINT")?;
