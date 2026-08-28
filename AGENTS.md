@@ -26,24 +26,26 @@ Work is NOT complete until `git push` succeeds and knowledge is extracted.
 - **Never Strand Work:** Never stop before pushing. Never say "ready to push when you are" (the agent must do it).
 
 ## 3. NeuroStrata Memory & The 3 Resilient Soft Locks
-Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. You MUST use the `neurostrata_add_memory` tool for explicit architectural rules and decisions, and the `neurostrata_append_log` tool for conversational context.
+Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. You MUST use the `neurostrata_add_memory` tool for explicit architectural rules and decisions.
+
+The MCP server advertises exactly five tools: `neurostrata_add_memory`, `neurostrata_get_snapshot`, `neurostrata_ingest_directory`, `neurostrata_list_namespaces`, and `neurostrata_search_memory`. Do not invoke any other `neurostrata_*` name -- it does not exist.
 
 - **CRITICAL RESTRICTION**: NEVER use `bd remember` to store memories. That tool is deprecated for agent use. You MUST use the dedicated `neurostrata_add_memory` tool.
 - **Lock 1 (Pre-Push Hook):** The system enforces logging via a git hook. If a push is blocked, the agent must run `neurostrata_add_memory` before retrying.
 - **Lock 2 (Checklist Abstraction):** Transitioning a bead from `working` to `done` must be accompanied by an architectural summary via `neurostrata_add_memory`.
 - **Lock 3 (The "Breath" Prompt):** If a task takes more than 3-5 steps, the agent must pause, summarize the current state, and commit it to Tier 3 (Task Stratum) memory before proceeding.
-- **Continuous Backup Protocol:** Silently use `neurostrata_append_log` to maintain a running log of the conversation. Pass tags (e.g., "auth, database") when a topic switch occurs.
+- **Continuous Backup Protocol (NOT YET IMPLEMENTED):** The Episodic Buffer described in `README.md` is a design, not a shipped capability -- there is no `neurostrata_append_log` tool in `src/server.rs`. Until it lands (bead `neurostrata-t0w.15`), persist conversational context with `neurostrata_add_memory` instead.
 - **MANDATORY PRE-FLIGHT HOOK (Zero-Trust Policy):** You are strictly BLOCKED from using `write`, `edit`, or `bash` (except for `bd` tracking commands) on a new task until you have FIRST executed `neurostrata_get_snapshot` to fetch the architectural rules for this project, OR `neurostrata_search_memory` using nouns/keywords from the user's prompt. You suffer from the "Unknown Unknowns" bias: you do not know when you are missing a constraint. Therefore, you must NEVER assume you know the architectural constraints of a codebase just because you read the code. The memory database is the ultimate ground truth. **You MUST call the memory tools as your very first action on every new task.**
 - **Retrieval Protocol (MANDATORY):** Every time you start a new session, or if a user asks about previous system design, YOU MUST proactively use `neurostrata_search_memory` or grep `.NeuroStrata/sessions/*` (if local fallback is needed) to retrieve the context before answering or coding.
 
 ## 4. Bootstrapping & Ingestion
-- **Docs:** If `.NeuroStrata/docs/` is missing, proactively invoke `./scripts/bootstrap.sh <pwd>`.
+- **Docs:** There is no `scripts/bootstrap.sh`. A project is bootstrapped by ingesting it (below); `.NeuroStrata/` is created on demand by `export-graph` and by `neurostrata_add_memory` with `create_new_namespace=true`.
 - **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.
 
 ## 5. Global Database Constraints (Safety)
 - **Shared Architecture:** The database (LadybugDB) is a SHARED, global memory architecture.
 - **No Destructive Operations:** NEVER attempt to delete the DB directory, drop tables, or run destructive operations.
-- **No Bulk Deletes:** Only delete specific memory IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination.
+- **No Bulk Deletes:** Only delete specific memory IDs, and only when explicitly correcting a hallucination. There is no `neurostrata_delete_memory` MCP tool; deletion is exposed on two other transports -- the CLI (`neurostrata-mcp delete <namespace> <id>`, which requires the daemon to be stopped) and the daemon's HTTP API (`POST /delete`, which is what the GUI uses).
 
 ## 6. Global Infrastructure & Tooling Constraints
 - **Containers:** ALWAYS use `podman` and `podman-compose`. NEVER use `docker`.
