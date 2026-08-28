@@ -15,27 +15,40 @@ pub struct LadybugStore {
     db: Arc<Database>,
 }
 
-/// The engine defaults to throwing when a WAL record fails to deserialize, which
-/// is how an ungraceful shutdown ends: the last transaction is torn. Throwing
-/// costs every committed transaction since the last checkpoint, because the
-/// caller's only recourse is to set the whole WAL aside.
+/// Normal open: checksums on, and replay failures throw. The throw is the whole
+/// point -- with it off the engine swallows a failed verification, opens anyway
+/// and silently drops every record it could not authenticate, which is exactly
+/// the outcome this code exists to make visible.
+fn verifying_config() -> SystemConfig {
+    SystemConfig::default().throw_on_wal_replay_failure(true)
+}
+
+/// Recovery open, used only after verification has already failed. The engine
+/// cannot currently verify a WAL it wrote itself once the process dies without a
+/// clean close: with checksums on, replay restores the catalog and discards
+/// every row; with them off, the same rows come back intact. See
+/// examples/wal_repro.rs, and bead neurostrata-kug for the upstream defect.
 ///
-/// With this off, the replayer's dry run stops at the last good COMMIT, replays
-/// everything up to it and truncates there -- so a kill costs the torn tail
-/// instead of the whole log. The rescue path below stays as a last resort for a
-/// WAL damaged beyond that.
-fn recovering_config() -> SystemConfig {
+/// This trades tamper-evidence for the writes, so it is never the normal path
+/// and never silent.
+fn unverified_config() -> SystemConfig {
     SystemConfig::default()
         .throw_on_wal_replay_failure(false)
-        // Checksums are what actually cost us the rows. Measured on both lbug
-        // 0.15.3 and 0.19.1, on Windows and Linux: write three rows, kill the
-        // process, reopen. With checksums on, replay recovers the catalog and
-        // zero rows; with them off, all three come back. The record bytes are
-        // fine -- verification rejects them. Leaving the default on means every
-        // ungraceful stop loses every row, which is a certainty, not a risk.
-        // Trade: a genuinely damaged record can no longer be detected as such.
-        // Revert once the engine can verify a WAL it wrote before a hard kill.
         .enable_checksums(false)
+}
+
+/// Set NEUROSTRATA_STRICT_WAL=1 to refuse the unverified retry. The database
+/// then fails to open rather than replaying records it could not authenticate --
+/// the right choice where an unreadable WAL should be investigated rather than
+/// recovered.
+fn strict_wal_verification() -> bool {
+    std::env::var("NEUROSTRATA_STRICT_WAL").map(|v| v == "1").unwrap_or(false)
+}
+
+fn is_wal_integrity_failure(err: &str) -> bool {
+    err.contains("Checksum verification failed")
+        || err.contains("Corrupted wal file")
+        || err.contains("invalid WAL record type")
 }
 
 /// Copies a leftover write-ahead log aside before it is replayed and truncated.
@@ -79,43 +92,68 @@ impl LadybugStore {
         // whatever followed is then unrecoverable.
         preserve_unclean_wal(&local_path);
 
-        // We initialize the embedded Ladybug database once, and keep it in Arc to spawn connections from it
-        let db = match Database::new(&local_path, recovering_config()) {
+        // Open with verification first. Only if the WAL fails to authenticate do we
+        // consider replaying it unverified, and never quietly.
+        let db = match Database::new(&local_path, verifying_config()) {
             Ok(db) => db,
             Err(e) => {
                 let err_msg = e.to_string();
-                if err_msg.contains("Corrupted wal file") || err_msg.contains("invalid WAL record type") {
-                    eprintln!("WARNING: the write-ahead log could not be read, which is what an ungraceful shutdown leaves behind. Rolling back to the last checkpoint.");
-                    
-                    let mut wal_path = local_path.clone().into_os_string();
-                    wal_path.push(".wal");
-                    let wal_file = std::path::PathBuf::from(wal_path);
-                    
-                    if wal_file.exists() {
-                        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                if !is_wal_integrity_failure(&err_msg) {
+                    return Err(e.into());
+                }
+
+                eprintln!("ERROR: the write-ahead log failed verification: {}", err_msg);
+
+                if strict_wal_verification() {
+                    return Err(anyhow::anyhow!(
+                        "Refusing to open: the write-ahead log did not verify, and NEUROSTRATA_STRICT_WAL=1 forbids replaying records that cannot be authenticated. The log has been left in place for inspection. Unset the variable to recover the writes without verification."
+                    ));
+                }
+
+                eprintln!("ERROR: retrying WITHOUT checksum verification to recover those writes. The records replayed this way are NOT authenticated -- if this database may have been tampered with, stop and inspect the preserved copy instead. Set NEUROSTRATA_STRICT_WAL=1 to refuse this fallback.");
+
+                match Database::new(&local_path, unverified_config()) {
+                    Ok(db) => {
+                        eprintln!("Recovered by replaying the unverified write-ahead log.");
+                        db
+                    }
+                    Err(retry_e) => {
+                        // Unreadable even without verification: set it aside rather
+                        // than leave the database unopenable, and say what was lost.
+                        let mut wal_path = local_path.clone().into_os_string();
+                        wal_path.push(".wal");
+                        let wal_file = std::path::PathBuf::from(wal_path);
+
+                        if !wal_file.exists() {
+                            return Err(anyhow::anyhow!(
+                                "WAL verification failed and the file is no longer at {:?}: {}",
+                                wal_file,
+                                retry_e
+                            ));
+                        }
+
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
                         let mut corrupted_path = wal_file.clone().into_os_string();
                         corrupted_path.push(format!(".corrupted.{}", timestamp));
                         let corrupted_file = std::path::PathBuf::from(corrupted_path);
-                        
-                        let dropped_bytes = std::fs::metadata(&wal_file).map(|m| m.len()).unwrap_or(0);
-                        std::fs::rename(&wal_file, &corrupted_file)
-                            .map_err(|err| anyhow::anyhow!("Recovery failed: Could not move the unreadable WAL file: {}", err))?;
 
-                        // The WAL is set aside, never replayed. Everything written since the
-                        // last checkpoint is gone, so say so plainly instead of reporting success.
+                        let dropped_bytes = std::fs::metadata(&wal_file).map(|m| m.len()).unwrap_or(0);
+                        std::fs::rename(&wal_file, &corrupted_file).map_err(|err| {
+                            anyhow::anyhow!("Recovery failed: could not move the unreadable WAL file: {}", err)
+                        })?;
+
                         eprintln!(
-                            "ERROR: DATA LOSS. {} bytes of un-checkpointed writes were discarded to reopen the database.",
+                            "ERROR: DATA LOSS. {} bytes of un-checkpointed writes could not be replayed even unverified, and were discarded to reopen the database.",
                             dropped_bytes
                         );
-                        eprintln!("ERROR: The discarded write-ahead log was kept at {:?} -- do not delete it if those writes mattered.", corrupted_file);
-                        eprintln!("Reopening the database without them...");
-                        Database::new(&local_path, recovering_config())
-                            .map_err(|retry_e| anyhow::anyhow!("Retry failed after discarding the WAL: {}", retry_e))?
-                    } else {
-                        return Err(anyhow::anyhow!("WAL corruption detected, but WAL file not found at {:?}", wal_file));
+                        eprintln!("ERROR: they were kept at {:?} -- do not delete it if those writes mattered.", corrupted_file);
+                        // No WAL left to verify at this point.
+                        Database::new(&local_path, verifying_config())
+                            .map_err(|last_e| anyhow::anyhow!("Retry failed after discarding the WAL: {}", last_e))?
                     }
-                } else {
-                    return Err(e.into());
                 }
             }
         };
