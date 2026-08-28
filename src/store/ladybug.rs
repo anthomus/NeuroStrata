@@ -74,6 +74,11 @@ impl LadybugStore {
     }
 }
 
+/// Memory types written with a zero vector by directory ingestion. They describe
+/// where something lives, not what it says, so they carry no meaning for a
+/// similarity search.
+const STRUCTURAL_MEMORY_TYPES: [&str; 3] = ["directory", "file", "markdown"];
+
 fn escape_kuzu_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
@@ -163,10 +168,21 @@ impl VectorStore for LadybugStore {
         let safe_ns = escape_kuzu_string(namespace);
         let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
-        // Step 1: Base vector search
+        // Step 1: Base vector search.
+        //
+        // Structural nodes are stored with an all-zero embedding, and the distance
+        // from an all-zero row is the query vector's own magnitude -- the same value
+        // for every one of them, whatever was asked. Left in, they tie with each
+        // other and can fill the limit with path stubs. They stay reachable through
+        // the graph expansion in step 2, which is where they are actually useful.
+        let structural_types = STRUCTURAL_MEMORY_TYPES
+            .iter()
+            .map(|t| format!("'{}'", t))
+            .collect::<Vec<_>>()
+            .join(", ");
         let search_query = format!(
-            "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC LIMIT {}",
-            safe_ns, vec_str, limit
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC LIMIT {}",
+            safe_ns, structural_types, vec_str, limit
         );
 
         let result = conn.query(&search_query)?;
@@ -291,11 +307,12 @@ impl VectorStore for LadybugStore {
         Ok(())
     }
 
-    async fn clear_ast(&self, namespace: &str) -> Result<()> {
+    async fn clear_ingested(&self, namespace: &str) -> Result<()> {
         let conn = self.get_conn()?;
         let safe_ns = escape_kuzu_string(namespace);
-        
-        // Delete all AST memories for this namespace
+
+        // Every row the ingester owns: the AST symbols and the directory/file
+        // nodes too, since ingestion rebuilds the whole structure for a namespace
         let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m", safe_ns);
         conn.query(&query)?;
         Ok(())

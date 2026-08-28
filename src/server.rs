@@ -303,6 +303,11 @@ async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<
     let memory_type = arguments.get("memory_type").and_then(|m| m.as_str()).unwrap_or("context");
     let create_new_namespace = arguments.get("create_new_namespace").and_then(|v| v.as_bool()).unwrap_or(false);
     let user_id = arguments.get("user_id").and_then(|u| u.as_str()).unwrap_or("unknown");
+    if user_id == "auto-ingestor" {
+        // Directory ingestion deletes every row owned by this user_id before it
+        // rebuilds, so a memory stored under it would vanish on the next ingest.
+        return "ERROR: 'auto-ingestor' is reserved for directory ingestion, and memories stored under it are deleted by the next ingest. Please use a different user_id.".to_string();
+    }
     let agent_name = arguments.get("agent_name").and_then(|a| a.as_str()).map(|s| s.to_string());
     let mut location = "".to_string();
     let mut location_lines = "".to_string();
