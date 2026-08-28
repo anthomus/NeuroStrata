@@ -25,7 +25,17 @@ pub struct LadybugStore {
 /// instead of the whole log. The rescue path below stays as a last resort for a
 /// WAL damaged beyond that.
 fn recovering_config() -> SystemConfig {
-    SystemConfig::default().throw_on_wal_replay_failure(false)
+    SystemConfig::default()
+        .throw_on_wal_replay_failure(false)
+        // Checksums are what actually cost us the rows. Measured on both lbug
+        // 0.15.3 and 0.19.1, on Windows and Linux: write three rows, kill the
+        // process, reopen. With checksums on, replay recovers the catalog and
+        // zero rows; with them off, all three come back. The record bytes are
+        // fine -- verification rejects them. Leaving the default on means every
+        // ungraceful stop loses every row, which is a certainty, not a risk.
+        // Trade: a genuinely damaged record can no longer be detected as such.
+        // Revert once the engine can verify a WAL it wrote before a hard kill.
+        .enable_checksums(false)
 }
 
 /// Copies a leftover write-ahead log aside before it is replayed and truncated.
