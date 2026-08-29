@@ -13,6 +13,29 @@ pub struct LadybugStore {
     local_path: PathBuf,
     dimensions: usize,
     db: Arc<Database>,
+    dirty: Dirty,
+}
+
+/// Whether a write is sitting in the log with no checkpoint behind it yet.
+///
+/// `take` clears and reports in one step so a write landing mid-checkpoint is
+/// not swallowed: the flag is cleared before the flush, and put back if the
+/// flush fails.
+#[derive(Default)]
+struct Dirty(std::sync::atomic::AtomicBool);
+
+impl Dirty {
+    fn mark(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn take(&self) -> bool {
+        self.0.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
 }
 
 /// Normal open: checksums on, and replay failures throw. The throw is the whole
@@ -162,6 +185,7 @@ impl LadybugStore {
             local_path,
             dimensions,
             db: Arc::new(db),
+            dirty: Dirty::default(),
         })
     }
 
@@ -178,7 +202,12 @@ impl LadybugStore {
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
     {
-        bounded(what, write_timeout(), self.with_conn(f)).await
+        let outcome = bounded(what, write_timeout(), self.with_conn(f)).await;
+        // Marked whatever the outcome: a write that timed out may still land,
+        // and an unnecessary checkpoint attempt costs nothing next to a write
+        // that never reaches disk.
+        self.dirty.mark();
+        outcome
     }
 
     /// Runs one piece of database work on a blocking thread.
@@ -261,7 +290,7 @@ impl VectorStore for LadybugStore {
     async fn init(&self, _namespace: &str) -> Result<()> {
         let _namespace = _namespace.to_string();
         let dimensions = self.dimensions;
-        self.with_conn(move |conn| {
+        let outcome = self.with_conn(move |conn| {
 
             let create_node_table = format!(
                 "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{}], PRIMARY KEY (id))",
@@ -284,7 +313,11 @@ impl VectorStore for LadybugStore {
 
             Ok(())
         })
-        .await
+        .await;
+
+        // Creating the tables is itself a write worth flushing.
+        self.dirty.mark();
+        outcome
     }
 
     async fn upsert(
@@ -532,11 +565,25 @@ impl VectorStore for LadybugStore {
     }
 
     async fn checkpoint(&self) -> Result<()> {
-        self.with_conn(move |conn| {
-            conn.query("CHECKPOINT")?;
-            Ok(())
-        })
-        .await
+        // Cleared first: a write that lands while the engine is flushing must
+        // survive, and clearing afterwards would drop its mark.
+        let had_writes = self.dirty.take();
+
+        let outcome = self
+            .with_conn(move |conn| {
+                conn.query("CHECKPOINT")?;
+                Ok(())
+            })
+            .await;
+
+        if outcome.is_err() && had_writes {
+            self.dirty.mark();
+        }
+        outcome
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.is_set()
     }
 
     async fn clear_ingested(&self, namespace: &str) -> Result<()> {
@@ -855,6 +902,37 @@ fn bump_access_count(metadata: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_fresh_store_has_nothing_to_flush() {
+        let dirty = Dirty::default();
+        assert!(!dirty.is_set());
+        assert!(!dirty.take());
+    }
+
+    #[test]
+    fn taking_the_flag_clears_it_so_one_checkpoint_answers_for_many_writes() {
+        let dirty = Dirty::default();
+        dirty.mark();
+        dirty.mark();
+
+        assert!(dirty.take(), "the flag was set, so taking it reports true");
+        assert!(!dirty.is_set(), "and leaves nothing behind");
+        assert!(!dirty.take(), "a second take has nothing to report");
+    }
+
+    #[test]
+    fn a_write_during_a_checkpoint_is_not_swallowed() {
+        let dirty = Dirty::default();
+        dirty.mark();
+
+        // The checkpoint takes the flag first, then a write lands while the
+        // engine is still flushing. That write must survive the clear.
+        let _flushing = dirty.take();
+        dirty.mark();
+
+        assert!(dirty.is_set());
+    }
 
     #[tokio::test]
     async fn a_write_that_outstays_its_deadline_says_the_database_is_busy() {
