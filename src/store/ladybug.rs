@@ -165,6 +165,22 @@ impl LadybugStore {
         })
     }
 
+    /// Runs a write with a deadline, so a caller is told the database is busy
+    /// rather than left holding a connection that never answers. Engine-level
+    /// lock waits of two and a half minutes were measured while a burst of
+    /// writes was in flight (bead neurostrata-3fi.6).
+    ///
+    /// The deadline releases the CALLER, not the query: spawn_blocking cannot be
+    /// cancelled, so the statement may still land afterwards. The message says
+    /// so, because retrying blind could otherwise duplicate work.
+    async fn write_with_deadline<T, F>(&self, what: &'static str, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        bounded(what, write_timeout(), self.with_conn(f)).await
+    }
+
     /// Runs one piece of database work on a blocking thread.
     ///
     /// Every lbug call is synchronous FFI. Called straight from an async handler
@@ -280,7 +296,7 @@ impl VectorStore for LadybugStore {
     ) -> Result<()> {
         let namespace = namespace.to_string();
         let id = id.to_string();
-        self.with_conn(move |conn| {
+        self.write_with_deadline("writing a memory", move |conn| {
 
             let safe_id = escape_kuzu_string(&id);
             let safe_ns = escape_kuzu_string(&namespace);
@@ -480,7 +496,7 @@ impl VectorStore for LadybugStore {
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
         let namespace = namespace.to_string();
         let id = id.to_string();
-        self.with_conn(move |conn| {
+        self.write_with_deadline("deleting a memory", move |conn| {
             let safe_ns = escape_kuzu_string(&namespace);
             let safe_id = escape_kuzu_string(&id);
         
@@ -525,7 +541,7 @@ impl VectorStore for LadybugStore {
 
     async fn clear_ingested(&self, namespace: &str) -> Result<()> {
         let namespace = namespace.to_string();
-        self.with_conn(move |conn| {
+        self.write_with_deadline("clearing the ingested rows", move |conn| {
             let safe_ns = escape_kuzu_string(&namespace);
 
             // Every row the ingester owns: the AST symbols and the directory/file
@@ -764,7 +780,7 @@ impl VectorStore for LadybugStore {
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()> {
         let namespace = namespace.to_string();
         let id = id.to_string();
-        self.with_conn(move |conn| {
+        self.write_with_deadline("counting a read", move |conn| {
             let safe_ns = escape_kuzu_string(&namespace);
             let safe_id = escape_kuzu_string(&id);
 
@@ -791,6 +807,35 @@ impl VectorStore for LadybugStore {
     }
 }
 
+/// How long a write may wait before the caller is told the database is busy.
+/// Override with NEUROSTRATA_WRITE_TIMEOUT_SECS where an unusually large
+/// database makes the default too tight.
+fn write_timeout() -> std::time::Duration {
+    let secs = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(30);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Fails a future that outstays its deadline, with a message that says what was
+/// waiting and admits the work may still be running.
+async fn bounded<T>(
+    what: &str,
+    limit: std::time::Duration,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "the database is busy: {} did not finish within {}s. The statement may still be running, so read the record back before retrying.",
+            what,
+            limit.as_secs()
+        )),
+    }
+}
+
 /// Adds one to `access_count` and leaves the rest of the blob alone. Metadata
 /// that is missing, empty or unparseable starts a fresh object at 1 instead of
 /// failing: reading a memory must never be the thing that errors.
@@ -810,6 +855,44 @@ fn bump_access_count(metadata: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_write_that_outstays_its_deadline_says_the_database_is_busy() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let err = bounded("deleting a memory", std::time::Duration::from_millis(50), slow)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("the database is busy"), "{}", err);
+        assert!(err.contains("deleting a memory"), "{}", err);
+        // The caller is released, not the query -- saying so is the point.
+        assert!(err.contains("may still be running"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn a_write_inside_its_deadline_is_left_alone() {
+        let quick = async { Ok::<u8, anyhow::Error>(7) };
+        let out = bounded("writing a memory", std::time::Duration::from_secs(5), quick)
+            .await
+            .unwrap();
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn the_write_deadline_can_be_overridden() {
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "90");
+        assert_eq!(write_timeout(), std::time::Duration::from_secs(90));
+
+        // A nonsense or zero value falls back rather than disabling the bound.
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "0");
+        assert_eq!(write_timeout(), std::time::Duration::from_secs(30));
+        std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS");
+    }
 
     #[test]
     fn a_first_read_starts_the_count_at_one() {
