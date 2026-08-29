@@ -696,26 +696,90 @@ impl VectorStore for LadybugStore {
         }))
     }
 
+    /// Retrieval bumps a counter, so it has to cost about what a counter costs.
+    /// Routing it through get() and upsert() rewrote the entire row -- its
+    /// 768-float embedding included -- and re-ran every edge MERGE, five times
+    /// per search, fire and forget. Later writes queued behind that burst: a
+    /// delete issued with no pause after a search took 154s where an idle one
+    /// takes none (bead neurostrata-3fi.6). Touch one column instead.
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()> {
-        if let Some((vector, mut payload)) = self.get(namespace, id).await? {
-            let count = payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            if let Some(obj) = payload.metadata.as_object_mut() {
-                obj.insert("access_count".to_string(), serde_json::json!(count + 1));
-            } else {
-                let mut obj = serde_json::Map::new();
-                obj.insert("access_count".to_string(), serde_json::json!(count + 1));
-                payload.metadata = Value::Object(obj);
-            }
-            self.upsert(namespace, id, vector, payload).await?;
-        }
+        let conn = self.get_conn()?;
+        let safe_ns = escape_kuzu_string(namespace);
+        let safe_id = escape_kuzu_string(id);
+
+        let read = format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.metadata",
+            safe_ns, safe_id
+        );
+        let mut result = conn.query(&read)?;
+        let current = match result.next() {
+            Some(row) => format!("{}", row[0]),
+            None => return Ok(()),
+        };
+
+        let write = format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
+            safe_ns,
+            safe_id,
+            escape_kuzu_string(&bump_access_count(&current))
+        );
+        conn.query(&write)?;
         Ok(())
     }
+}
+
+/// Adds one to `access_count` and leaves the rest of the blob alone. Metadata
+/// that is missing, empty or unparseable starts a fresh object at 1 instead of
+/// failing: reading a memory must never be the thing that errors.
+fn bump_access_count(metadata: &str) -> String {
+    let mut value: Value = serde_json::from_str(metadata).unwrap_or_else(|_| serde_json::json!({}));
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    if let Some(obj) = value.as_object_mut() {
+        let count = obj.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        obj.insert("access_count".to_string(), serde_json::json!(count + 1));
+    }
+    value.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_first_read_starts_the_count_at_one() {
+        assert_eq!(bump_access_count("{}"), json!({"access_count": 1}).to_string());
+    }
+
+    #[test]
+    fn counting_a_read_leaves_the_rest_of_the_blob_alone() {
+        let before = json!({
+            "domain": "database",
+            "governs": ["src/daemon.rs"],
+            "access_count": 4
+        })
+        .to_string();
+
+        let after: Value = serde_json::from_str(&bump_access_count(&before)).unwrap();
+
+        assert_eq!(after["access_count"], json!(5));
+        assert_eq!(after["domain"], json!("database"));
+        assert_eq!(after["governs"], json!(["src/daemon.rs"]));
+    }
+
+    #[test]
+    fn unusable_metadata_does_not_fail_a_read() {
+        for junk in ["", "not json at all", "[1,2,3]", "null"] {
+            assert_eq!(
+                bump_access_count(junk),
+                json!({"access_count": 1}).to_string(),
+                "junk metadata {:?} should still count the read",
+                junk
+            );
+        }
+    }
 
     #[test]
     fn each_metadata_key_maps_to_its_edge_table() {
