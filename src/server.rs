@@ -114,6 +114,36 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_edit_memory",
+                        "description": "Correct an existing memory in place. Use this instead of adding a second memory when a rule has evolved or was stored with a mistake, so the namespace keeps one coherent answer. Read the memory first with neurostrata_get_memory.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The id of the memory to edit, as returned by neurostrata_search_memory or neurostrata_get_memory." },
+                                "namespace": { "type": "string", "description": "The namespace the memory lives in. The memory is not moved; use neurostrata_move_memory for that." },
+                                "content": { "type": "string", "description": "Replacement text. The memory is re-embedded when this changes, so pass the whole new text rather than a fragment." },
+                                "memory_type": { "type": "string", "description": "Optional new type: 'rule', 'preference', 'bootstrap', 'persona', or 'context'." },
+                                "location": { "type": "string", "description": "Optional new primary file path this memory governs." },
+                                "location_lines": { "type": "string", "description": "Optional new line range (e.g. 42-49)." },
+                                "domain": { "type": "string", "description": "Optional new domain (e.g., 'frontend', 'database', 'devops', 'api')." },
+                                "allow_global": { "type": "boolean", "description": "Required to be true before anything in the 'global' namespace can be edited, because those rules apply to every project." }
+                            },
+                            "required": ["id", "namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_get_memory",
+                        "description": "Fetch a single memory by id. Use it to read a memory before editing it, and to follow a Related Nodes or Governs pointer to the exact record instead of guessing at it with a search.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The id of the memory to fetch." },
+                                "namespace": { "type": "string", "description": "The namespace the memory lives in." }
+                            },
+                            "required": ["id", "namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_get_snapshot",
                         "description": "Get a pre-computed cognitive snapshot of the most important active architectural rules for a project. Use this immediately upon starting a new task to ground yourself in the project's core architecture before searching.",
                         "inputSchema": {
@@ -184,6 +214,12 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_add_memory" => {
                             result_text = handle_add_memory(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_edit_memory" => {
+                            result_text = handle_edit_memory(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_get_memory" => {
+                            result_text = handle_get_memory(arguments, store.clone()).await;
                         }
                         "neurostrata_get_snapshot" => {
                             result_text = handle_get_snapshot(arguments, store.clone()).await;
@@ -532,41 +568,10 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
                         });
                     }
 
-                    let formatted: Vec<String> = results.into_iter().map(|r| {
-                        let mut out = format!(
-                            "--- Memory ID: {} ---
-Type: {}
-Content: {}",
-                            r.id, r.payload.memory_type, r.payload.content
-                        );
-                        if !r.payload.location.is_empty() {
-                            out.push_str(&format!("\nFile Location: {}", r.payload.location));
-                            if !r.payload.location_lines.is_empty() {
-                                out.push_str(&format!(" (Lines: {})", r.payload.location_lines));
-                            }
-                        }
-                        if let Some(locations) = r.payload.metadata.get("locations") {
-                            if let Some(arr) = locations.as_array() {
-                                if !arr.is_empty() {
-                                    out.push_str(&format!("\nCode Graph Locations: {}", locations));
-                                }
-                            }
-                        }
-                        for (key, label) in [
-                            ("related_to", "Related Nodes"),
-                            ("contained_by", "Contained By"),
-                            ("governs", "Governs"),
-                        ] {
-                            if let Some(value) = r.payload.metadata.get(key) {
-                                if let Some(arr) = value.as_array() {
-                                    if !arr.is_empty() {
-                                        out.push_str(&format!("\n{}: {}", label, value));
-                                    }
-                                }
-                            }
-                        }
-                        out
-                    }).collect();
+                    let formatted: Vec<String> = results
+                        .into_iter()
+                        .map(|r| format_memory(&r.id, &r.payload))
+                        .collect();
                     formatted.join("\n\n")
                 }
             } else {
@@ -577,5 +582,287 @@ Content: {}",
         }
     } else {
         "Failed to initialize namespace table.".to_string()
+    }
+}
+
+/// One rendering of a memory, shared by search and get, so a record reads the
+/// same however the agent reached it.
+fn format_memory(id: &str, payload: &MemoryPayload) -> String {
+    let mut out = format!(
+        "--- Memory ID: {} ---\nType: {}\nContent: {}",
+        id, payload.memory_type, payload.content
+    );
+    if !payload.location.is_empty() {
+        out.push_str(&format!("\nFile Location: {}", payload.location));
+        if !payload.location_lines.is_empty() {
+            out.push_str(&format!(" (Lines: {})", payload.location_lines));
+        }
+    }
+    if let Some(locations) = payload.metadata.get("locations") {
+        if let Some(arr) = locations.as_array() {
+            if !arr.is_empty() {
+                out.push_str(&format!("\nCode Graph Locations: {}", locations));
+            }
+        }
+    }
+    for (key, label) in [
+        ("related_to", "Related Nodes"),
+        ("contained_by", "Contained By"),
+        ("governs", "Governs"),
+    ] {
+        if let Some(value) = payload.metadata.get(key) {
+            if let Some(arr) = value.as_array() {
+                if !arr.is_empty() {
+                    out.push_str(&format!("\n{}: {}", label, value));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Secrets must not reach the database, whichever write surface they arrive on.
+fn contains_secret(text: &str) -> bool {
+    let secret_regex = regex::Regex::new(
+        r"(?i)(sk-ant-|ghp_|xoxb-|eyjhbg|api_key\s*=|password\s*=|sk-proj-)",
+    )
+    .unwrap();
+    secret_regex.is_match(text)
+}
+
+/// A namespace is a project name, never a path. 'global' additionally governs
+/// every project on the machine, so writing there has to be asked for rather
+/// than arrived at by defaulting.
+fn reject_write_namespace(namespace: &str, allow_global: bool) -> Option<String> {
+    if namespace.contains('/') || namespace.contains('\\') {
+        return Some("ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string());
+    }
+    if namespace == "global" && !allow_global {
+        return Some("ERROR [NAMESPACE]: 'global' rules apply to every project on this machine. Edit one only when the user has asked for a machine-wide change, and pass `allow_global: true` to confirm that is what you mean.".to_string());
+    }
+    None
+}
+
+async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let id = match arguments.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i,
+        None => return "Missing 'id' parameter. Ids are returned by neurostrata_search_memory.".to_string(),
+    };
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the namespace the memory lives in.".to_string(),
+    };
+    if namespace.contains('/') || namespace.contains('\\') {
+        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+    }
+
+    match store.get(namespace, id).await {
+        Ok(Some((_, payload))) => {
+            let store_clone = store.clone();
+            let ns_clone = namespace.to_string();
+            let id_clone = id.to_string();
+            tokio::spawn(async move {
+                let _ = store_clone.increment_access_count(&ns_clone, &id_clone).await;
+            });
+            format_memory(id, &payload)
+        }
+        Ok(None) => format!(
+            "No memory with id '{}' in namespace '{}'. Ids come from neurostrata_search_memory; check the namespace with neurostrata_list_namespaces.",
+            id, namespace
+        ),
+        Err(e) => format!("Failed to read memory '{}': {}", id, e),
+    }
+}
+
+async fn handle_edit_memory(
+    arguments: Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let id = match arguments.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i,
+        None => return "Missing 'id' parameter. Read the memory with neurostrata_get_memory first.".to_string(),
+    };
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the namespace the memory lives in.".to_string(),
+    };
+    let allow_global = arguments
+        .get("allow_global")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(rejection) = reject_write_namespace(namespace, allow_global) {
+        return rejection;
+    }
+
+    let new_content = arguments.get("content").and_then(|v| v.as_str());
+    let new_type = arguments.get("memory_type").and_then(|v| v.as_str());
+    let new_location = arguments.get("location").and_then(|v| v.as_str());
+    let new_lines = arguments.get("location_lines").and_then(|v| v.as_str());
+    let new_domain = arguments.get("domain").and_then(|v| v.as_str());
+
+    if new_content.is_none()
+        && new_type.is_none()
+        && new_location.is_none()
+        && new_lines.is_none()
+        && new_domain.is_none()
+    {
+        return "Nothing to edit: pass at least one of 'content', 'memory_type', 'location', 'location_lines' or 'domain'.".to_string();
+    }
+
+    if let Some(content) = new_content {
+        if contains_secret(content) {
+            return "ERROR [SECURITY]: Edit rejected due to sensitive information (e.g., API keys, passwords, or tokens). Please redact the secrets from your replacement text and try again.".to_string();
+        }
+    }
+
+    let (vector, mut payload) = match store.get(namespace, id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return format!(
+                "No memory with id '{}' in namespace '{}', so there is nothing to edit. Ids come from neurostrata_search_memory.",
+                id, namespace
+            )
+        }
+        Err(e) => return format!("Failed to read memory '{}': {}", id, e),
+    };
+
+    let mut changed: Vec<&str> = Vec::new();
+
+    // Only a content change earns a new embedding; metadata edits keep the
+    // vector they already have, so the stored text and its vector stay in step.
+    let vector = match new_content {
+        Some(content) if content != payload.content => {
+            payload.content = content.to_string();
+            changed.push("content");
+            match emb.embed(content).await {
+                Ok(v) => v,
+                Err(e) => return format!("Failed to re-embed the new content: {}", e),
+            }
+        }
+        _ => vector,
+    };
+
+    if let Some(memory_type) = new_type {
+        if memory_type != payload.memory_type {
+            payload.memory_type = memory_type.to_string();
+            changed.push("memory_type");
+        }
+    }
+    if let Some(location) = new_location {
+        if location != payload.location {
+            payload.location = location.to_string();
+            changed.push("location");
+        }
+    }
+    if let Some(lines) = new_lines {
+        if lines != payload.location_lines {
+            payload.location_lines = lines.to_string();
+            changed.push("location_lines");
+        }
+    }
+
+    if !payload.metadata.is_object() {
+        payload.metadata = serde_json::json!({});
+    }
+    if let Some(meta) = payload.metadata.as_object_mut() {
+        if let Some(domain) = new_domain {
+            let current = meta.get("domain").and_then(|d| d.as_str()).unwrap_or("");
+            if domain != current {
+                meta.insert("domain".to_string(), serde_json::json!(domain));
+                changed.push("domain");
+            }
+        }
+        if !changed.is_empty() {
+            meta.insert(
+                "edited_at".to_string(),
+                serde_json::json!(chrono::Utc::now().timestamp()),
+            );
+        }
+    }
+
+    if changed.is_empty() {
+        return format!(
+            "Memory {} already says exactly that; nothing was written.",
+            id
+        );
+    }
+
+    match store.upsert(namespace, id, vector, payload).await {
+        Ok(_) => {
+            // No checkpoint here: the store marks itself dirty and the daemon's
+            // background task flushes. Doing it inline made every writer wait
+            // for the engine to quiesce (bead neurostrata-3fi.6.4).
+            format!(
+                "Edited memory {} in namespace '{}'. Changed: {}.",
+                id,
+                namespace,
+                changed.join(", ")
+            )
+        }
+        Err(e) => format!("Failed to write the edit for memory '{}': {}", id, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(content: &str) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn global_is_writable_only_when_asked_for() {
+        assert!(reject_write_namespace("global", false).is_some());
+        assert!(reject_write_namespace("global", true).is_none());
+        assert!(reject_write_namespace("NeuroStrata", false).is_none());
+    }
+
+    #[test]
+    fn a_namespace_is_never_a_path() {
+        assert!(reject_write_namespace("c:\\dev\\projects", true).is_some());
+        assert!(reject_write_namespace("dev/projects", true).is_some());
+    }
+
+    #[test]
+    fn secrets_are_caught_on_every_write_surface() {
+        assert!(contains_secret("token is ghp_deadbeef"));
+        assert!(contains_secret("PASSWORD = hunter2"));
+        assert!(!contains_secret("the daemon binds 127.0.0.1:34343"));
+    }
+
+    #[test]
+    fn a_formatted_memory_carries_its_anchors() {
+        let mut p = payload("checkpoint every write");
+        p.location = "src/store/ladybug.rs".to_string();
+        p.location_lines = "428-440".to_string();
+        p.metadata = serde_json::json!({ "governs": ["src/daemon.rs"] });
+
+        let out = format_memory("abc-123", &p);
+
+        assert!(out.contains("--- Memory ID: abc-123 ---"));
+        assert!(out.contains("Content: checkpoint every write"));
+        assert!(out.contains("File Location: src/store/ladybug.rs (Lines: 428-440)"));
+        assert!(out.contains("Governs: [\"src/daemon.rs\"]"));
+    }
+
+    #[test]
+    fn an_empty_anchor_list_is_not_rendered() {
+        let mut p = payload("a rule with no edges");
+        p.metadata = serde_json::json!({ "governs": [], "related_to": [] });
+
+        let out = format_memory("abc-123", &p);
+
+        assert!(!out.contains("Governs"));
+        assert!(!out.contains("Related Nodes"));
     }
 }
