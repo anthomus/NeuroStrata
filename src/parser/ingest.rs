@@ -130,12 +130,21 @@ fn symbol_id(path: &str, kind: &str, name: &str, start_line: usize) -> String {
     format!("{}#{}:{}@{}", path, kind, name, start_line)
 }
 
+/// Told what the walk has done so far, so a caller does not have to wait for
+/// the whole thing to find out. Implementations are called from the walk, so
+/// they must be cheap and must not block.
+pub trait IngestObserver: Send + Sync {
+    fn file_ingested(&self, path: &str, symbols: usize);
+    fn relinked(&self, edges: usize);
+}
+
 pub async fn ingest_directory(
     dir_path: &Path,
     schema: &ParserSchema,
     embedder: Arc<dyn Embedder>,
     vector_store: Arc<dyn VectorStore>,
     namespace: &str,
+    observer: Option<Arc<dyn IngestObserver>>,
 ) -> anyhow::Result<()> {
     // Rebuild this namespace's ingested rows from scratch. Failing here is fatal:
     // ingesting on top of a stale tree would leave rows for files that no longer exist.
@@ -370,6 +379,9 @@ pub async fn ingest_directory(
 
                     if symbols_stored > 0 {
                         println!("Ingested {} symbols from {}", symbols_stored, path.display());
+                        if let Some(observer) = &observer {
+                            observer.file_ingested(&path.display().to_string(), symbols_stored);
+                        }
                     }
                 }
             }
@@ -382,7 +394,12 @@ pub async fn ingest_directory(
     // declare, now that the nodes they point at exist again (bead
     // neurostrata-sij).
     match vector_store.relink_edges(namespace).await {
-        Ok(linked) => println!("Relinked {} declared edges in namespace {}", linked, namespace),
+        Ok(linked) => {
+            println!("Relinked {} declared edges in namespace {}", linked, namespace);
+            if let Some(observer) = &observer {
+                observer.relinked(linked);
+            }
+        }
         Err(e) => eprintln!(
             "WARNING: ingestion finished but the declared edges could not be relinked, so rules may not reach their code: {}",
             e
