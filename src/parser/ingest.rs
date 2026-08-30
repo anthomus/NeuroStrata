@@ -57,7 +57,21 @@ pub fn normalize_node_path(path: &str) -> String {
 /// GUI -- and an absolute id does not survive the repository being checked out
 /// anywhere else (bead neurostrata-fld).
 pub fn node_id_for(root: &Path, path: &Path) -> String {
-    let relative = path.strip_prefix(root).unwrap_or(path);
+    // A relative walk already produces the documented form. `ingest ./src <ns>`
+    // is the example in CLI-readme.md, and it must keep yielding src/lib.rs --
+    // the same shape a rule names when it says "src/lib.rs" -- rather than the
+    // lib.rs that stripping the ingest root would leave.
+    let relative = if path.is_relative() {
+        path.to_path_buf()
+    } else {
+        // Absolute: prefer the working directory, so ingesting an absolute
+        // subdirectory of the project still reads relative to the project.
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| path.strip_prefix(&cwd).ok().map(Path::to_path_buf))
+            .unwrap_or_else(|| path.strip_prefix(root).unwrap_or(path).to_path_buf())
+    };
+
     let normalized = normalize_node_path(&relative.to_string_lossy());
     if normalized.is_empty() {
         // The root itself. Name it, rather than leaving an empty id.
@@ -418,17 +432,36 @@ mod tests {
     }
 
     #[test]
+    fn ingesting_a_subdirectory_keeps_the_documented_repo_relative_form() {
+        // CLI-readme.md documents `neurostrata-mcp ingest ./src my-rust-project`,
+        // and rules name files as "src/lib.rs". Stripping the ingest root would
+        // leave "lib.rs" and quietly unlink every rule that names the file.
+        assert_eq!(
+            node_id_for(Path::new("./src"), Path::new("./src/store/ladybug.rs")),
+            "src/store/ladybug.rs"
+        );
+        assert_eq!(
+            node_id_for(Path::new("src"), Path::new("src/lib.rs")),
+            "src/lib.rs"
+        );
+    }
+
+    #[test]
     fn the_ingest_root_is_named_rather_than_left_empty() {
         let root = Path::new(r"C:\dev\projects\neurostrata");
         assert_eq!(node_id_for(root, root), "neurostrata");
     }
 
     #[test]
-    fn a_path_outside_the_root_keeps_its_own_shape() {
-        // strip_prefix finds no prefix to strip; a usable absolute id beats a panic.
+    fn a_path_outside_everything_keeps_its_absolute_shape() {
+        // Neither the working directory nor the ingest root is a prefix, so
+        // there is nothing to strip. A usable absolute id beats a panic.
         assert_eq!(
-            node_id_for(Path::new(r"C:\dev\projects\other"), Path::new(r"C:\dev\projects\neurostrata\a.rs")),
-            "C:/dev/projects/neurostrata/a.rs"
+            node_id_for(
+                Path::new(r"C:\dev\projects\other"),
+                Path::new(r"D:\elsewhere\a.rs")
+            ),
+            "D:/elsewhere/a.rs"
         );
     }
 
