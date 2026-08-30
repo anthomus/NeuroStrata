@@ -14,6 +14,25 @@ pub struct LadybugStore {
     dimensions: usize,
     db: Arc<Database>,
     dirty: Dirty,
+    /// LadybugDB allows exactly one write transaction and REFUSES a second
+    /// rather than queueing it, so two writers that overlap produce "Cannot
+    /// start a new write transaction in the system" for whichever arrives
+    /// second. Every search spawns access-count writes, which makes that
+    /// collision ordinary rather than exotic (bead neurostrata-3fi.6.6).
+    ///
+    /// Taking a turn here converts a random failure into a short wait. Writes
+    /// are milliseconds now that checkpointing has left the request path, and
+    /// the caller's deadline covers the wait as well as the write. The
+    /// checkpoint deliberately does NOT take this lock: it waits for
+    /// transactions to drain, so holding writers out for its duration would
+    /// recreate the stall it was moved out of the request path to avoid.
+    write_lock: tokio::sync::Mutex<()>,
+    /// Set once the tables exist. init() is called on the way into add, move
+    /// and -- because it is cheap to write and expensive to mean -- every
+    /// search, and each call issued CREATE NODE TABLE only to be told it
+    /// already exists. That is a write transaction per read, colliding with
+    /// real writes for nothing.
+    schema_ready: std::sync::atomic::AtomicBool,
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -186,6 +205,8 @@ impl LadybugStore {
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
+            write_lock: tokio::sync::Mutex::new(()),
+            schema_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -200,9 +221,33 @@ impl LadybugStore {
     async fn write_with_deadline<T, F>(&self, what: &'static str, f: F) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        F: Fn(&Connection) -> Result<T> + Clone + Send + 'static,
     {
-        let outcome = bounded(what, write_timeout(), self.with_conn(f)).await;
+        let outcome = bounded(what, write_timeout(), async {
+            // One writer at a time, because the engine refuses the second
+            // rather than making it wait. The deadline covers this queue too:
+            // a caller stuck behind a stalled write hears that the database is
+            // busy instead of waiting indefinitely for its turn.
+            let _turn = self.write_lock.lock().await;
+
+            // The lock orders our own writers; the background checkpoint and
+            // any other process are outside it, so a refusal can still arrive.
+            // Those clear in milliseconds, so wait and try again rather than
+            // handing the caller a failure it can do nothing about.
+            let mut attempt = 0;
+            loop {
+                match self.with_conn(f.clone()).await {
+                    Err(e) if is_write_collision(&e) && attempt < WRITE_COLLISION_RETRIES => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(25 * attempt as u64))
+                            .await;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await;
+
         // Marked whatever the outcome: a write that timed out may still land,
         // and an unnecessary checkpoint attempt costs nothing next to a write
         // that never reaches disk.
@@ -288,8 +333,13 @@ fn escape_kuzu_string(s: &str) -> String {
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, _namespace: &str) -> Result<()> {
+        if self.schema_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+
         let _namespace = _namespace.to_string();
         let dimensions = self.dimensions;
+        let _turn = self.write_lock.lock().await;
         let outcome = self.with_conn(move |conn| {
 
             let create_node_table = format!(
@@ -315,6 +365,11 @@ impl VectorStore for LadybugStore {
         })
         .await;
 
+        if outcome.is_ok() {
+            self.schema_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         // Creating the tables is itself a write worth flushing.
         self.dirty.mark();
         outcome
@@ -336,7 +391,9 @@ impl VectorStore for LadybugStore {
             let safe_content = escape_kuzu_string(&payload.content);
             let safe_user_id = escape_kuzu_string(&payload.user_id);
             let safe_memory_type = escape_kuzu_string(&payload.memory_type);
-            let safe_agent_name = escape_kuzu_string(&payload.agent_name.unwrap_or_else(|| "unknown".to_string()));
+            let safe_agent_name = escape_kuzu_string(
+                payload.agent_name.as_deref().unwrap_or("unknown"),
+            );
             let safe_location = escape_kuzu_string(&payload.location);
             let safe_location_lines = escape_kuzu_string(&payload.location_lines);
             let safe_metadata = escape_kuzu_string(&serde_json::to_string(&payload.metadata)?);
@@ -866,6 +923,21 @@ fn write_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// How many times a write retries after being refused the write transaction.
+/// Waits are 25ms, 50ms and so on, and the caller's deadline caps the total
+/// regardless, so this only decides how patient a single attempt is.
+const WRITE_COLLISION_RETRIES: u32 = 6;
+
+/// The engine's refusal when something else already holds the write
+/// transaction. Worth recognising by name: the fix is to wait a moment, not to
+/// report a failure, and the in-process lock cannot prevent every case -- the
+/// background checkpoint and any other process opening the same database are
+/// both outside it.
+fn is_write_collision(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("Cannot start a new write transaction")
+}
+
 /// Fails a future that outstays its deadline, with a message that says what was
 /// waiting and admits the work may still be running.
 async fn bounded<T>(
@@ -902,6 +974,20 @@ fn bump_access_count(metadata: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_engines_refusal_is_recognised_as_a_collision() {
+        let refusal = anyhow::anyhow!(
+            "Query execution failed: Cannot start a new write transaction in the system. Only one write transaction at a time is allowed in the system."
+        );
+        assert!(is_write_collision(&refusal));
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_retried_as_a_collision() {
+        let other = anyhow::anyhow!("Binder exception: Table Memory does not exist");
+        assert!(!is_write_collision(&other));
+    }
 
     #[test]
     fn a_fresh_store_has_nothing_to_flush() {
@@ -950,6 +1036,26 @@ mod tests {
         assert!(err.contains("deleting a memory"), "{}", err);
         // The caller is released, not the query -- saying so is the point.
         assert!(err.contains("may still be running"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn waiting_a_turn_to_write_counts_against_the_deadline() {
+        // The shape write_with_deadline uses: the queue for the single writer
+        // sits inside the bound, so a caller stuck behind a stalled write is
+        // told the database is busy rather than waiting for its turn forever.
+        let lock = tokio::sync::Mutex::new(());
+        let held = lock.lock().await;
+
+        let err = bounded("writing a memory", std::time::Duration::from_millis(50), async {
+            let _turn = lock.lock().await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("the database is busy"), "{}", err);
+        drop(held);
     }
 
     #[tokio::test]
