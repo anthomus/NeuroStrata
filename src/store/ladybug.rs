@@ -716,9 +716,14 @@ impl VectorStore for LadybugStore {
             let mut result = conn.query(&query)?;
         
             if let Some(row) = result.next() {
+                // The column is declared FLOAT[768], and a fixed-width vector
+                // comes back as Value::Array, not Value::List. Matching only
+                // List returned an empty embedding for every row, which no
+                // caller noticed until move_memory tried to write one back and
+                // the engine refused it: "Expected: 768, Actual: 0".
                 let mut vec: Vec<f32> = Vec::new();
-                if let lbug::Value::List(_, list_vals) = &row[0] {
-                    for v in list_vals {
+                if let lbug::Value::List(_, values) | lbug::Value::Array(_, values) = &row[0] {
+                    for v in values {
                         if let lbug::Value::Float(f) = v {
                             vec.push(*f);
                         } else if let lbug::Value::Double(d) = v {
