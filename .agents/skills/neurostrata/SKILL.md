@@ -20,8 +20,10 @@ NeuroStrata provides the following native MCP tools that you MUST use to manage 
 * `neurostrata_get_snapshot`: Fetch the project's active architectural rules in one call. Use it as your first action on a new task.
 * `neurostrata_list_namespaces`: List the namespaces the shared database holds.
 * `neurostrata_ingest_directory`: Batch ingest an entire directory of markdown files (e.g., `docs/architecture/`) into NeuroStrata. The server will automatically chunk and embed the files.
+* `neurostrata_get_memory`: Fetch one Engram by id. Use it to read a memory before editing it, and to follow a Related Nodes or Governs pointer to the exact record instead of guessing at it with a search.
+* `neurostrata_edit_memory`: Correct an Engram in place -- content, type, location, lines or domain. Reach for this instead of adding a second Engram when a rule has evolved or was stored with a mistake, so the namespace keeps one coherent answer. Editing anything in the `global` namespace additionally requires `allow_global: true`.
 
-**These five are the whole surface.** There is no MCP tool for updating or deleting an Engram, for generating a canvas, or for dumping the database. To supersede a rule, add a new Engram that states the correction. To delete one, the user runs `neurostrata-mcp delete <namespace> <id>` with the daemon stopped, or the GUI posts to the daemon's `/delete`. `neurostrata_move_memory` is dispatched by the server but never advertised, so do not call it.
+**Those seven are the whole surface.** There is still no MCP tool for DELETING an Engram, for generating a canvas, or for dumping the database. To remove a record the user runs `neurostrata-mcp delete <namespace> <id>` with the daemon stopped, or the GUI posts to the daemon's `/delete`. `neurostrata_move_memory` is dispatched by the server but never advertised, so do not call it.
 
 ## SynapticGraph Integrity Rules
 To prevent broken graphs and dead links, all Domain Narratives (markdown files) must adhere to these rigid constraints:
@@ -63,7 +65,7 @@ If an agent skips the verification step (e.g., claiming a fix is complete withou
    * *Domain*: Is this a project-specific architecture rule, API contract, or data flow? (Route to Domain Stratum).
    * *Task*: Is this only relevant to the current bug/feature? (Route to `namespace="<task_id>"`).
 2. **Auto-Detect Domain**: If it's a Domain insight, look at your current working directory (`pwd`) or the files you are editing to infer which domain it belongs to.
-3. **Autonomously Prune & Update**: When inscribing a new Engram, first `neurostrata_search_memory` to see if a similar or contradictory rule already exists. If an old rule is outdated, say so explicitly in the new Engram ("supersedes the earlier rule that ...") so the correction wins on retrieval, and tell the user which id is now stale.
+3. **Autonomously Prune & Update**: When inscribing a new Engram, first `neurostrata_search_memory` to see if a similar or contradictory rule already exists. If an old rule is outdated, read it with `neurostrata_get_memory` and correct it with `neurostrata_edit_memory` rather than leaving two answers in the namespace. Where the old Engram should survive as history, say in the new one what it supersedes.
 
 ## 🌱 EIDETIC RECALL (Project Genesis)
 Every active project MUST have a foundational "Bootstrap" Engram (a LadybugDB node with `memory_type="bootstrap"`). This acts as the supreme context anchor for the entire repository.
