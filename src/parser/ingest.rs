@@ -47,6 +47,31 @@ pub fn normalize_node_path(path: &str) -> String {
     trimmed.trim_end_matches('/').to_string()
 }
 
+/// The id a node gets, relative to the directory being ingested.
+///
+/// Ids used to inherit whatever the caller passed: the CLI walked a relative
+/// path and produced `src/store/ladybug.rs`, while the GUI passes an absolute
+/// project path and produced `C:/dev/projects/neurostrata/src/store/ladybug.rs`.
+/// GOVERNS edges match ids by exact string, so a rule an agent wrote against
+/// `src/store/ladybug.rs` could never link to the same file ingested from the
+/// GUI -- and an absolute id does not survive the repository being checked out
+/// anywhere else (bead neurostrata-fld).
+pub fn node_id_for(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let normalized = normalize_node_path(&relative.to_string_lossy());
+    if normalized.is_empty() {
+        // The root itself. Name it, rather than leaving an empty id.
+        normalize_node_path(
+            &root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.to_string_lossy().to_string()),
+        )
+    } else {
+        normalized
+    }
+}
+
 /// One extracted symbol, owned so that no tree-sitter type is alive when the
 /// embedding and upsert futures are awaited.
 struct SymbolRow {
@@ -122,12 +147,12 @@ pub async fn ingest_directory(
             std::env::current_dir().unwrap_or_default().join(path).to_string_lossy().to_string()
         };
 
-        let node_path = normalize_node_path(&path_str);
+        let node_path = node_id_for(dir_path, path);
 
         // Create parent edge mapping
         let parent_id = if let Some(p) = path.parent() {
-            let p_str = normalize_node_path(&p.to_string_lossy());
-            if p_str != "." && p_str != "" {
+            let p_str = node_id_for(dir_path, p);
+            if p_str != "." && p_str != "" && p_str != node_path {
                 Some(p_str)
             } else {
                 None
@@ -303,6 +328,20 @@ pub async fn ingest_directory(
             }
         }
     }
+
+    // Clearing the previous ingest took every edge attached to those nodes with
+    // it, including the GOVERNS edges rules had to them -- and a rule is not
+    // rewritten just because its file came back. Replay what the memories still
+    // declare, now that the nodes they point at exist again (bead
+    // neurostrata-sij).
+    match vector_store.relink_edges(namespace).await {
+        Ok(linked) => println!("Relinked {} declared edges in namespace {}", linked, namespace),
+        Err(e) => eprintln!(
+            "WARNING: ingestion finished but the declared edges could not be relinked, so rules may not reach their code: {}",
+            e
+        ),
+    }
+
     Ok(())
 }
 
@@ -363,6 +402,36 @@ mod tests {
 
     /// Node ids double as edge targets, so a path an agent writes
     /// ("src/lib.rs") has to land on the same string the walker produced.
+    #[test]
+    fn a_node_id_is_relative_to_the_directory_being_ingested() {
+        let root = Path::new(r"C:\dev\projects\neurostrata");
+
+        assert_eq!(
+            node_id_for(root, Path::new(r"C:\dev\projects\neurostrata\src\store\ladybug.rs")),
+            "src/store/ladybug.rs",
+            "an absolute walk must produce the same id as a relative one"
+        );
+        assert_eq!(
+            node_id_for(Path::new("."), Path::new("./src/store/ladybug.rs")),
+            "src/store/ladybug.rs"
+        );
+    }
+
+    #[test]
+    fn the_ingest_root_is_named_rather_than_left_empty() {
+        let root = Path::new(r"C:\dev\projects\neurostrata");
+        assert_eq!(node_id_for(root, root), "neurostrata");
+    }
+
+    #[test]
+    fn a_path_outside_the_root_keeps_its_own_shape() {
+        // strip_prefix finds no prefix to strip; a usable absolute id beats a panic.
+        assert_eq!(
+            node_id_for(Path::new(r"C:\dev\projects\other"), Path::new(r"C:\dev\projects\neurostrata\a.rs")),
+            "C:/dev/projects/neurostrata/a.rs"
+        );
+    }
+
     #[test]
     fn node_paths_normalise_to_one_form() {
         assert_eq!(normalize_node_path(r".\src\lib.rs"), "src/lib.rs");

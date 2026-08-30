@@ -283,7 +283,7 @@ impl LadybugStore {
 }
 
 /// One edge a memory asks for, read off its metadata.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct EdgeSpec {
     pub rel_type: &'static str,
     pub target_id: String,
@@ -641,6 +641,49 @@ impl VectorStore for LadybugStore {
 
     fn is_dirty(&self) -> bool {
         self.dirty.is_set()
+    }
+
+    async fn relink_edges(&self, namespace: &str) -> Result<usize> {
+        // Declarations live in each memory's metadata, which survives ingestion;
+        // only the edges themselves are lost with the nodes. Replaying them is
+        // therefore a read of what is already stored, not a guess.
+        let memories = self.list(namespace, None).await?;
+
+        let declared: Vec<(String, Vec<EdgeSpec>)> = memories
+            .into_iter()
+            .map(|m| (m.id, edge_specs(&m.payload.metadata)))
+            .filter(|(_, specs)| !specs.is_empty())
+            .collect();
+
+        if declared.is_empty() {
+            return Ok(0);
+        }
+
+        self.write_with_deadline("relinking the graph", move |conn| {
+            let mut linked = 0usize;
+            for (id, specs) in &declared {
+                let safe_id = escape_kuzu_string(id);
+                for edge in specs {
+                    let target_safe = escape_kuzu_string(&edge.target_id);
+                    let (from, to) = if edge.points_at_target {
+                        (safe_id.as_str(), target_safe.as_str())
+                    } else {
+                        (target_safe.as_str(), safe_id.as_str())
+                    };
+                    // Both ends must exist; a rule naming a file the ingester
+                    // never reached still produces nothing, exactly as before.
+                    let query = format!(
+                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:{}]->(b)",
+                        from, to, edge.rel_type
+                    );
+                    if conn.query(&query).is_ok() {
+                        linked += 1;
+                    }
+                }
+            }
+            Ok(linked)
+        })
+        .await
     }
 
     async fn clear_ingested(&self, namespace: &str) -> Result<()> {
