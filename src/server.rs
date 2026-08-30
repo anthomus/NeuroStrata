@@ -782,10 +782,34 @@ pub(crate) async fn resolve_namespace(store: &Arc<dyn VectorStore>, requested: &
             if existing.iter().any(|known| known == requested) {
                 return requested.to_string();
             }
-            existing
+            let mut candidates: Vec<String> = existing
                 .into_iter()
-                .find(|known| known.eq_ignore_ascii_case(requested))
-                .unwrap_or_else(|| requested.to_string())
+                .filter(|known| known.eq_ignore_ascii_case(requested))
+                .collect();
+
+            match candidates.len() {
+                0 => requested.to_string(),
+                1 => candidates.remove(0),
+                _ => {
+                    // Two spellings already exist. Row order is not a decision,
+                    // so take the fuller namespace and say what was passed over.
+                    candidates.sort();
+                    let mut best = candidates[0].clone();
+                    let mut best_len = 0usize;
+                    for candidate in &candidates {
+                        let held = store.list(candidate, None).await.map(|m| m.len()).unwrap_or(0);
+                        if held > best_len {
+                            best_len = held;
+                            best = candidate.clone();
+                        }
+                    }
+                    eprintln!(
+                        "WARNING: '{}' matches {:?}; using '{}', which holds the most memories. Merge them with neurostrata_move_memory.",
+                        requested, candidates, best
+                    );
+                    best
+                }
+            }
         }
         // A namespace that cannot be verified is used as given: refusing the
         // write would be worse than writing it where the caller asked.

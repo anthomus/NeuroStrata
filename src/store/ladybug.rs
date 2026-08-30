@@ -282,6 +282,29 @@ impl LadybugStore {
     }
 }
 
+/// Finds the node a declaration means, when it does not name one exactly.
+///
+/// Node ids became repository-relative, so a memory written when ingestion
+/// produced absolute ids declares `C:/proj/src/foo.rs` and now matches nothing.
+/// Its tail still identifies the file, so a declaration ending in `/<id>`
+/// resolves to that id. A suffix matching more than one node is ambiguous and
+/// is left alone: a wrong edge is worse than a missing one.
+pub fn resolve_declared_target(declared: &str, known: &[String]) -> Option<String> {
+    if known.iter().any(|id| id == declared) {
+        return Some(declared.to_string());
+    }
+
+    let declared = declared.replace('\\', "/");
+    let mut matches = known
+        .iter()
+        .filter(|id| !id.is_empty() && declared.ends_with(&format!("/{}", id)));
+
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
+}
+
 /// One edge a memory asks for, read off its metadata.
 #[derive(Debug, PartialEq, Clone)]
 pub struct EdgeSpec {
@@ -659,12 +682,33 @@ impl VectorStore for LadybugStore {
             return Ok(0);
         }
 
+        // Ids stored before node ids became repository-relative are absolute, so
+        // a rule written to match them declares C:/proj/src/foo.rs and matches
+        // nothing now. Resolve those by path suffix against the ids that do
+        // exist, and leave an ambiguous suffix alone rather than guess.
+        let known: Vec<String> = self
+            .list(namespace, None)
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
         self.write_with_deadline("relinking the graph", move |conn| {
             let mut linked = 0usize;
+            let mut by_suffix = 0usize;
             for (id, specs) in &declared {
                 let safe_id = escape_kuzu_string(id);
                 for edge in specs {
-                    let target_safe = escape_kuzu_string(&edge.target_id);
+                    let target = match resolve_declared_target(&edge.target_id, &known) {
+                        Some(resolved) => {
+                            if resolved != edge.target_id {
+                                by_suffix += 1;
+                            }
+                            resolved
+                        }
+                        None => edge.target_id.clone(),
+                    };
+                    let target_safe = escape_kuzu_string(&target);
                     let (from, to) = if edge.points_at_target {
                         (safe_id.as_str(), target_safe.as_str())
                     } else {
@@ -680,6 +724,12 @@ impl VectorStore for LadybugStore {
                         linked += 1;
                     }
                 }
+            }
+            if by_suffix > 0 {
+                println!(
+                    "Relinked {} edge(s) whose declared target was an older absolute path",
+                    by_suffix
+                );
             }
             Ok(linked)
         })
@@ -1035,6 +1085,41 @@ mod tests {
     fn an_ordinary_failure_is_not_retried_as_a_collision() {
         let other = anyhow::anyhow!("Binder exception: Table Memory does not exist");
         assert!(!is_write_collision(&other));
+    }
+
+    #[test]
+    fn a_legacy_absolute_declaration_finds_the_file_it_meant() {
+        let known = vec!["src/store/ladybug.rs".to_string(), "src/daemon.rs".to_string()];
+        assert_eq!(
+            resolve_declared_target("C:/dev/projects/neurostrata/src/store/ladybug.rs", &known).as_deref(),
+            Some("src/store/ladybug.rs")
+        );
+        // Backslashes are the same path, written the way Windows hands it over.
+        assert_eq!(
+            resolve_declared_target(r"C:\dev\projects
+eurostrata\src\daemon.rs", &known).as_deref(),
+            Some("src/daemon.rs")
+        );
+    }
+
+    #[test]
+    fn an_exact_declaration_is_returned_untouched() {
+        let known = vec!["src/daemon.rs".to_string()];
+        assert_eq!(resolve_declared_target("src/daemon.rs", &known).as_deref(), Some("src/daemon.rs"));
+    }
+
+    #[test]
+    fn an_ambiguous_suffix_is_left_alone() {
+        // A wrong edge is worse than a missing one.
+        // Both "mod.rs" and "x/mod.rs" are suffixes of the declaration.
+        let known = vec!["mod.rs".to_string(), "x/mod.rs".to_string()];
+        assert_eq!(resolve_declared_target("C:/proj/x/mod.rs", &known), None);
+    }
+
+    #[test]
+    fn a_target_that_was_never_ingested_stays_unresolved() {
+        let known = vec!["src/daemon.rs".to_string()];
+        assert_eq!(resolve_declared_target("C:/proj/src/nowhere.rs", &known), None);
     }
 
     #[test]
