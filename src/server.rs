@@ -214,6 +214,22 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_move_memory",
+                        "description": "Promote or demote an Engram between strata by moving it between namespaces, keeping its id and its access history. Use it for the Tri-Strata lifecycle (task insight -> project rule -> machine-wide rule); adding a copy instead resets the access count that drives recall ordering and pruning.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The id of the memory to move." },
+                                "source_namespace": { "type": "string", "description": "The namespace it lives in now." },
+                                "target_namespace": { "type": "string", "description": "The namespace it should live in. Must already exist unless create_new_namespace is set." },
+                                "project_root": { "type": "string", "description": "Absolute path of the project you are working in. Required unless the target is 'global'." },
+                                "create_new_namespace": { "type": "boolean", "description": "Set to true ONLY when the target namespace is genuinely new." },
+                                "allow_global": { "type": "boolean", "description": "Required to be true when either end of the move is the 'global' namespace." }
+                            },
+                            "required": ["id", "source_namespace", "target_namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_search_memory",
                         "description": "Search the project's long-term memory for architectural rules.",
                         "inputSchema": {
@@ -558,36 +574,135 @@ async fn handle_ingest_directory(arguments: Value, emb: Arc<dyn Embedder>, store
     }
 }
 
+/// Promotes an Engram between strata: Task -> Domain -> Global.
+///
+/// The lifecycle is what the Tri-Strata model is FOR, and doing it by hand with
+/// add_memory resets access_count to zero -- which drives both recall ordering
+/// and pruning, so a memory promoted for having proved itself would arrive
+/// ranked as brand new. Moving the row keeps that history.
+///
+/// It was dispatched but never advertised, and rightly so: namespaces are a
+/// string column on one flat table, not schema objects, which makes every tool
+/// that writes that column the isolation boundary. This one enforced nothing
+/// (bead neurostrata-t0w.8). It now applies the same guards add_memory does,
+/// plus one of its own -- the target namespace has to already exist unless the
+/// caller says otherwise.
 async fn handle_move_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(i) => i,
-        None => return "Missing required parameters: id, source_namespace, or target_namespace.".to_string(),
+        None => return "Missing 'id'. Read the memory with neurostrata_get_memory first.".to_string(),
     };
     let src = match arguments.get("source_namespace").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return "Missing required parameters: id, source_namespace, or target_namespace.".to_string(),
+        None => return "Missing 'source_namespace'.".to_string(),
     };
     let tgt = match arguments.get("target_namespace").and_then(|v| v.as_str()) {
         Some(t) => t,
-        None => return "Missing required parameters: id, source_namespace, or target_namespace.".to_string(),
+        None => return "Missing 'target_namespace'.".to_string(),
     };
 
-    if let Ok(Some((vec, payload))) = store.get(src, id).await {
-        if let Ok(_) = store.init(tgt).await {
-            if let Ok(_) = store.upsert(tgt, id, vec, payload).await {
-                if let Ok(_) = store.delete(src, id).await {
-                    format!("Successfully moved memory {} from {} to {}", id, src, tgt)
-                } else {
-                    "Memory copied to target but failed to delete from source.".to_string()
-                }
-            } else {
-                "Failed to insert memory into target namespace.".to_string()
-            }
-        } else {
-            "Failed to initialize target namespace.".to_string()
+    if src == tgt {
+        return format!("Source and target are both '{}'; nothing to move.", src);
+    }
+
+    let allow_global = arguments
+        .get("allow_global")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Both ends are writes: one namespace loses a row, the other gains one.
+    for ns in [src, tgt] {
+        if let Some(rejection) = reject_write_namespace(ns, allow_global) {
+            return rejection;
         }
-    } else {
-        "Memory not found in source namespace.".to_string()
+    }
+
+    let create_new_namespace = arguments
+        .get("create_new_namespace")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let existing = match store.list_namespaces().await {
+        Ok(n) => n,
+        Err(e) => return format!("Failed to verify the namespaces before moving: {}", e),
+    };
+    if !existing.contains(&src.to_string()) {
+        return format!(
+            "Source namespace '{}' does not exist. Existing namespaces are: {:?}.",
+            src, existing
+        );
+    }
+    if !existing.contains(&tgt.to_string()) && !create_new_namespace {
+        return format!(
+            "Target namespace '{}' does not exist, and moving a memory is not the way to mint one. Existing namespaces are: {:?}. Pass `create_new_namespace: true` if that really is the intent.",
+            tgt, existing
+        );
+    }
+
+    // The same ownership check add_memory applies: an agent working in one
+    // project should not be able to push an Engram into another project's
+    // stratum without saying where it is working from.
+    if tgt != "global" {
+        match arguments.get("project_root").and_then(|r| r.as_str()) {
+            Some(project_root) => {
+                let ns_dir = std::path::Path::new(project_root).join(".NeuroStrata");
+                if !tokio::fs::try_exists(&ns_dir).await.unwrap_or(false) {
+                    if !create_new_namespace {
+                        return format!("ERROR: No .NeuroStrata directory found at {}. Do not guess the target namespace: ask the user whether to initialise this directory as a context, then call again with create_new_namespace=true.", project_root);
+                    }
+                    if let Err(e) = tokio::fs::create_dir_all(&ns_dir).await {
+                        return format!("ERROR: Failed to create .NeuroStrata directory: {}", e);
+                    }
+                }
+            }
+            None => {
+                return "Missing 'project_root'. Moving an Engram into a project stratum requires saying which project you are working in.".to_string()
+            }
+        }
+    }
+
+    let (vector, payload) = match store.get(src, id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return format!(
+                "No memory with id '{}' in namespace '{}', so there is nothing to move.",
+                id, src
+            )
+        }
+        Err(e) => return format!("Failed to read memory '{}': {}", id, e),
+    };
+
+    if let Err(e) = store.init(tgt).await {
+        return format!("Failed to prepare namespace '{}': {}", tgt, e);
+    }
+
+    if let Err(e) = store.upsert(tgt, id, vector, payload.clone()).await {
+        return format!("Failed to write memory '{}' into '{}': {}. Nothing was removed from '{}'.", id, tgt, e, src);
+    }
+
+    match store.delete(src, id).await {
+        Ok(_) => format!(
+            "Moved {} from '{}' to '{}':\n{}",
+            id,
+            src,
+            tgt,
+            summarise_memory(id, &payload)
+        ),
+        Err(e) => {
+            // There is no transaction spanning the two writes, so undo the copy
+            // rather than leave the same id in both namespaces.
+            let rollback = store.delete(tgt, id).await;
+            match rollback {
+                Ok(_) => format!(
+                    "Could not remove '{}' from '{}': {}. The copy in '{}' was rolled back, so the memory is unchanged.",
+                    id, src, e, tgt
+                ),
+                Err(re) => format!(
+                    "INCONSISTENT: '{}' was copied into '{}' but could not be removed from '{}' ({}), and the copy could not be rolled back either ({}). The same id now exists in both namespaces -- delete one with neurostrata_delete_memory.",
+                    id, tgt, src, e, re
+                ),
+            }
+        }
     }
 }
 
