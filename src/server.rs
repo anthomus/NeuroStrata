@@ -144,6 +144,45 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_delete_memory",
+                        "description": "Delete one memory by id. Use it to prune a hallucinated or obsolete Engram you put there. Prefer neurostrata_edit_memory when the record should survive in corrected form; deletion is for records that should never have existed.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The id of the memory to delete, as returned by neurostrata_search_memory or neurostrata_get_memory." },
+                                "namespace": { "type": "string", "description": "The namespace the memory lives in." },
+                                "allow_global": { "type": "boolean", "description": "Required to be true before anything in the 'global' namespace can be deleted, because those rules apply to every project." }
+                            },
+                            "required": ["id", "namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_get_graph",
+                        "description": "Walk the memory graph. Given an id, returns what that node is connected to and how (CONTAINS for structure, GOVERNS for a rule over code, RELATES_TO for a semantic link); without one, returns a summary of the namespace's shape. Use it to find the rule governing a file, or the file a symbol belongs to.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The namespace to walk." },
+                                "id": { "type": "string", "description": "Optional node to start from. Ids of code nodes are normalised paths, e.g. 'src/store/ladybug.rs'. Omit for a summary of the whole namespace." },
+                                "depth": { "type": "integer", "description": "How many hops to follow from the starting node. Defaults to 1, capped at 3." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_list_memories",
+                        "description": "List what a namespace holds, without a similarity query. Use it to audit or de-duplicate -- noticing that four Engrams cover the same component is impossible through search alone.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The namespace to list." },
+                                "memory_type": { "type": "string", "description": "Optional filter: 'rule', 'context', 'bootstrap', 'code_ast', 'file', 'directory', and so on." },
+                                "limit": { "type": "integer", "description": "How many to return. Defaults to 50." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_get_snapshot",
                         "description": "Get a pre-computed cognitive snapshot of the most important active architectural rules for a project. Use this immediately upon starting a new task to ground yourself in the project's core architecture before searching.",
                         "inputSchema": {
@@ -218,8 +257,17 @@ pub async fn process_mcp_request(
                         "neurostrata_edit_memory" => {
                             result_text = handle_edit_memory(arguments, emb.clone(), store.clone()).await;
                         }
+                        "neurostrata_delete_memory" => {
+                            result_text = handle_delete_memory(arguments, store.clone()).await;
+                        }
+                        "neurostrata_get_graph" => {
+                            result_text = handle_get_graph_tool(arguments, store.clone()).await;
+                        }
                         "neurostrata_get_memory" => {
                             result_text = handle_get_memory(arguments, store.clone()).await;
+                        }
+                        "neurostrata_list_memories" => {
+                            result_text = handle_list_memories(arguments, store.clone()).await;
                         }
                         "neurostrata_get_snapshot" => {
                             result_text = handle_get_snapshot(arguments, store.clone()).await;
@@ -638,7 +686,7 @@ fn reject_write_namespace(namespace: &str, allow_global: bool) -> Option<String>
         return Some("ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string());
     }
     if namespace == "global" && !allow_global {
-        return Some("ERROR [NAMESPACE]: 'global' rules apply to every project on this machine. Edit one only when the user has asked for a machine-wide change, and pass `allow_global: true` to confirm that is what you mean.".to_string());
+        return Some("ERROR [NAMESPACE]: 'global' rules apply to every project on this machine. Change one only when the user has asked for a machine-wide change, and pass `allow_global: true` to confirm that is what you mean.".to_string());
     }
     None
 }
@@ -804,6 +852,245 @@ async fn handle_edit_memory(
     }
 }
 
+/// A memory in one line, for listings where the full text would bury the reader.
+fn summarise_memory(id: &str, payload: &MemoryPayload) -> String {
+    let mut content: String = payload.content.replace('\n', " ");
+    if content.chars().count() > 120 {
+        content = content.chars().take(117).collect::<String>() + "...";
+    }
+    let where_it_lives = if payload.location.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", payload.location)
+    };
+    format!("{}  ({}){}\n    {}", id, payload.memory_type, where_it_lives, content)
+}
+
+async fn handle_list_memories(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return "ERROR [NAMESPACE]: 'namespace' is missing. Use neurostrata_list_namespaces if you are unsure which exist.".to_string(),
+    };
+    if namespace.contains('/') || namespace.contains('\\') {
+        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata').".to_string();
+    }
+
+    let wanted_type = arguments.get("memory_type").and_then(|v| v.as_str());
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .clamp(1, 500) as usize;
+
+    let rows = match store.list(namespace, None).await {
+        Ok(rows) => rows,
+        Err(e) => return format!("Failed to list namespace '{}': {}", namespace, e),
+    };
+
+    let total = rows.len();
+    let matching: Vec<_> = rows
+        .into_iter()
+        .filter(|r| wanted_type.map_or(true, |t| r.payload.memory_type == t))
+        .collect();
+
+    if matching.is_empty() {
+        return match wanted_type {
+            Some(t) => format!("Namespace '{}' holds {} memories, none of type '{}'.", namespace, total, t),
+            None => format!("Namespace '{}' is empty.", namespace),
+        };
+    }
+
+    let shown = matching.len().min(limit);
+    let mut out = match wanted_type {
+        Some(t) => format!(
+            "Namespace '{}': {} of {} memories are type '{}', showing {}.\n\n",
+            namespace, matching.len(), total, t, shown
+        ),
+        None => format!(
+            "Namespace '{}' holds {} memories, showing {}.\n\n",
+            namespace, total, shown
+        ),
+    };
+
+    // A count per type is what makes duplication visible, which is the point of
+    // listing rather than searching.
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for row in &matching {
+        *counts.entry(row.payload.memory_type.clone()).or_insert(0) += 1;
+    }
+    let breakdown: Vec<String> = counts.iter().map(|(t, n)| format!("{} {}", n, t)).collect();
+    out.push_str(&format!("By type: {}\n\n", breakdown.join(", ")));
+
+    for row in matching.into_iter().take(shown) {
+        out.push_str(&summarise_memory(&row.id, &row.payload));
+        out.push_str("\n\n");
+    }
+    out.trim_end().to_string()
+}
+
+/// One step of the walk: every edge touching `node`, in both directions.
+fn edges_touching(links: &[Value], node: &str) -> Vec<(String, String, String)> {
+    links
+        .iter()
+        .filter_map(|l| {
+            let source = l.get("source")?.as_str()?;
+            let target = l.get("target")?.as_str()?;
+            let kind = l.get("type").and_then(|t| t.as_str()).unwrap_or("LINK");
+            if source == node || target == node {
+                Some((source.to_string(), kind.to_string(), target.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+async fn handle_get_graph_tool(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return "ERROR [NAMESPACE]: 'namespace' is missing.".to_string(),
+    };
+
+    let graph = match store.export_graph().await {
+        Ok(g) => g,
+        Err(e) => return format!("Failed to read the graph: {}", e),
+    };
+
+    let empty = Vec::new();
+    let nodes = graph.get("nodes").and_then(|n| n.as_array()).unwrap_or(&empty);
+    let links = graph.get("links").and_then(|l| l.as_array()).unwrap_or(&empty);
+
+    let in_scope: std::collections::HashSet<String> = nodes
+        .iter()
+        .filter(|n| {
+            n.get("namespace")
+                .and_then(|v| v.as_str())
+                .map_or(false, |ns| ns == namespace || ns == "global")
+        })
+        .filter_map(|n| n.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+
+    let scoped_links: Vec<Value> = links
+        .iter()
+        .filter(|l| {
+            let s = l.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let t = l.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            in_scope.contains(s) && in_scope.contains(t)
+        })
+        .cloned()
+        .collect();
+
+    let start = arguments.get("id").and_then(|v| v.as_str());
+    let depth = arguments
+        .get("depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .clamp(1, 3) as usize;
+
+    let start = match start {
+        // No starting point: describe the shape rather than dump every edge,
+        // which would cost more context than it is worth.
+        None => {
+            let mut kinds: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            for l in &scoped_links {
+                let kind = l.get("type").and_then(|t| t.as_str()).unwrap_or("LINK");
+                *kinds.entry(kind.to_string()).or_insert(0) += 1;
+            }
+            let breakdown: Vec<String> = kinds.iter().map(|(k, n)| format!("{} {}", n, k)).collect();
+            return format!(
+                "Namespace '{}': {} nodes, {} edges ({}).\nPass an id to walk from a node -- code ids are normalised paths, e.g. 'src/store/ladybug.rs'.",
+                namespace,
+                in_scope.len(),
+                scoped_links.len(),
+                if breakdown.is_empty() { "none".to_string() } else { breakdown.join(", ") }
+            );
+        }
+        Some(s) => s.to_string(),
+    };
+
+    if !in_scope.contains(&start) {
+        return format!(
+            "No node '{}' in namespace '{}'. Code nodes are keyed by normalised path (forward slashes, no leading './'); memories are keyed by id.",
+            start, namespace
+        );
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(start.clone());
+    let mut frontier = vec![start.clone()];
+    let mut out = format!("Walking from {} in '{}', {} hop(s):\n", start, namespace, depth);
+
+    for hop in 1..=depth {
+        let mut next = Vec::new();
+        let mut lines = Vec::new();
+
+        for node in &frontier {
+            for (source, kind, target) in edges_touching(&scoped_links, node) {
+                let other = if &source == node { &target } else { &source };
+                lines.push(format!("  {} -[{}]-> {}", source, kind, target));
+                if seen.insert(other.clone()) {
+                    next.push(other.clone());
+                }
+            }
+        }
+
+        lines.sort();
+        lines.dedup();
+        if lines.is_empty() {
+            out.push_str(&format!("\nHop {}: nothing further.\n", hop));
+            break;
+        }
+        out.push_str(&format!("\nHop {}:\n{}\n", hop, lines.join("\n")));
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+
+    out.trim_end().to_string()
+}
+
+async fn handle_delete_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let id = match arguments.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i,
+        None => return "Missing 'id' parameter. Read the memory with neurostrata_get_memory first, so you know what you are removing.".to_string(),
+    };
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return "ERROR [NAMESPACE]: 'namespace' is missing.".to_string(),
+    };
+    let allow_global = arguments
+        .get("allow_global")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(rejection) = reject_write_namespace(namespace, allow_global) {
+        return rejection;
+    }
+
+    // Read it first: a deletion should be able to say what it removed, and an
+    // id that is already gone should say so rather than report a cheerful
+    // success.
+    let removed = match store.get(namespace, id).await {
+        Ok(Some((_, payload))) => payload,
+        Ok(None) => {
+            return format!(
+                "No memory with id '{}' in namespace '{}'. Nothing was deleted.",
+                id, namespace
+            )
+        }
+        Err(e) => return format!("Failed to read memory '{}' before deleting it: {}", id, e),
+    };
+
+    match store.delete(namespace, id).await {
+        Ok(_) => format!(
+            "Deleted from '{}':\n{}",
+            namespace,
+            summarise_memory(id, &removed)
+        ),
+        Err(e) => format!("Failed to delete memory '{}': {}", id, e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,6 +1105,53 @@ mod tests {
             location_lines: String::new(),
             metadata: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn a_listing_line_stays_short_enough_to_scan() {
+        let mut p = payload(&"x".repeat(400));
+        p.location = "src/store/ladybug.rs".to_string();
+
+        let line = summarise_memory("abc-123", &p);
+
+        assert!(line.contains("abc-123"));
+        assert!(line.contains("[src/store/ladybug.rs]"));
+        assert!(line.contains("..."), "long content is cut: {}", line);
+        assert!(line.len() < 250, "a listing entry must not bury the reader: {}", line.len());
+    }
+
+    #[test]
+    fn a_listing_line_keeps_short_content_whole() {
+        let line = summarise_memory("abc-123", &payload("checkpoint every write"));
+        assert!(line.contains("checkpoint every write"));
+        assert!(!line.contains("..."));
+    }
+
+    #[test]
+    fn newlines_do_not_break_a_listing_into_fake_entries() {
+        let line = summarise_memory("abc-123", &payload("first line\nsecond line"));
+        assert!(line.contains("first line second line"), "{}", line);
+    }
+
+    #[test]
+    fn a_walk_follows_an_edge_in_both_directions() {
+        let links = vec![
+            serde_json::json!({"source": "src", "target": "src/store", "type": "CONTAINS"}),
+            serde_json::json!({"source": "rule-1", "target": "src/store", "type": "GOVERNS"}),
+            serde_json::json!({"source": "other", "target": "elsewhere", "type": "CONTAINS"}),
+        ];
+
+        let touching = edges_touching(&links, "src/store");
+
+        assert_eq!(touching.len(), 2, "both the parent and the rule touch this node");
+        assert!(touching.iter().any(|(s, k, _)| s == "src" && k == "CONTAINS"));
+        assert!(touching.iter().any(|(s, k, _)| s == "rule-1" && k == "GOVERNS"));
+    }
+
+    #[test]
+    fn a_node_with_no_edges_walks_nowhere() {
+        let links = vec![serde_json::json!({"source": "a", "target": "b", "type": "CONTAINS"})];
+        assert!(edges_touching(&links, "lonely").is_empty());
     }
 
     #[test]
