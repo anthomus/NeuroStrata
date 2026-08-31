@@ -82,11 +82,15 @@ fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Clie
         .map_err(|e| e.to_string())
 }
 
-/// Ingestion walks and embeds a whole repository, which is minutes of work on a
-/// large one.
-const INGEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
-
-/// Everything else is a single query, but not necessarily a fast one: /graph
+/// There used to be an INGEST_TIMEOUT of 1800s here, because the GUI held a
+/// request open for the whole walk and needed a bound larger than the biggest
+/// repository it might meet. Nothing waits on a walk from this process any
+/// more: it starts one and polls (bead neurostrata-fwe), so every call is an
+/// ordinary query again.
+///
+/// Not a fast one necessarily: /graph
+/// has been measured at 28s while a write was in flight, so the old 30s left
+/// nothing spare.
 /// has been measured at 28s while a write was in flight, so the old 30s left
 /// nothing spare.
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -226,25 +230,64 @@ fn open_external(url: String) -> Result<(), String> {
     open::that(&url).map_err(|e| format!("Could not open '{}': {}", url, e))
 }
 
+/// Asks the daemon to begin a walk and returns as soon as it has been
+/// registered.
+///
+/// The window used to await `ingest_ast` before it drew anything, so opening it
+/// against an already-ingested project meant minutes of blank screen while the
+/// daemon rebuilt a graph that was already on disk. The graph is loaded first
+/// now and this runs behind it (bead neurostrata-7t1).
 #[tauri::command]
-fn ingest_ast(project_path: String) -> Result<String, String> {
+fn start_ingest(project_path: String) -> Result<serde_json::Value, String> {
     ensure_daemon()?;
-    
+
     let namespace = namespace_for(&project_path);
 
-    let client = daemon_client(INGEST_TIMEOUT)?;
+    // QUERY_TIMEOUT, not INGEST_TIMEOUT: this call does not wait for the walk,
+    // so anything longer than an ordinary request means the daemon is wedged.
+    let client = daemon_client(QUERY_TIMEOUT)?;
     let resp = client.post("http://127.0.0.1:34343/ingest")
         .json(&serde_json::json!({
             "dir": project_path,
-            "namespace": namespace
+            "namespace": namespace,
+            "wait": false
         }))
         .send()
         .map_err(|e| e.to_string())?;
 
     if resp.status().is_success() {
-        Ok("AST ingested successfully".to_string())
+        resp.json().map_err(|e| e.to_string())
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to ingest".to_string()))
+        Err(resp.text().unwrap_or_else(|_| "Failed to start the ingest".to_string()))
+    }
+}
+
+/// How the walk started by `start_ingest` is getting on.
+///
+/// `None` when the daemon has no job for this namespace, which is what a
+/// restarted daemon reports for a project whose graph is already on disk. The
+/// caller treats that as "nothing running", not as an error.
+#[tauri::command]
+fn ingest_status(project_path: String) -> Result<Option<serde_json::Value>, String> {
+    ensure_daemon()?;
+
+    let namespace = namespace_for(&project_path);
+
+    let client = daemon_client(QUERY_TIMEOUT)?;
+    let resp = client
+        .get("http://127.0.0.1:34343/ingest/status")
+        .query(&[("namespace", namespace.as_str())])
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    if resp.status().is_success() {
+        resp.json().map(Some).map_err(|e| e.to_string())
+    } else {
+        Err(resp.text().unwrap_or_else(|_| "Failed to read the ingest status".to_string()))
     }
 }
 
@@ -329,7 +372,8 @@ fn main() {
             get_graph,
             get_last_project_path,
             save_project_path,
-            ingest_ast,
+            start_ingest,
+            ingest_status,
             open_external,
             delete_memory,
             edit_memory,
