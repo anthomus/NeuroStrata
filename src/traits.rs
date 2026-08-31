@@ -65,9 +65,16 @@ pub trait VectorStore: Send + Sync {
     /// Delete a specific memory by its ID.
     async fn delete(&self, namespace: &str, id: &str) -> Result<()>;
 
-    /// Remove every row owned by the directory ingester in a namespace: the AST
-    /// symbols and the directory/file nodes, which ingestion then rebuilds.
-    async fn clear_ingested(&self, namespace: &str) -> Result<()>;
+    // There was a `clear_ingested` here: delete every row the ingester owns in a
+    // namespace. Ingestion called it before writing anything back, which is what
+    // made a re-ingest cost as much as a first one and left the namespace empty
+    // for the whole walk. Ingestion now keeps unchanged rows and sweeps only
+    // what the walk did not see, so nothing calls it (bead neurostrata-k48).
+    //
+    // Removed rather than kept unused: it is one call away from restoring the
+    // behaviour it was part of, and a trait method with no caller invites that
+    // call. `git show 32e09bd^:src/traits.rs` has it if a deliberate "reset this
+    // namespace" command ever wants one.
 
     /// Rebuilds the edges a namespace's memories declare, and reports how many
     /// were materialised.
