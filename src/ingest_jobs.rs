@@ -121,11 +121,25 @@ impl IngestJobs {
     /// since it started -- which is not the same as never having ingested it,
     /// since the registry lives in memory and the graph lives on disk.
     pub fn progress(&self, namespace: &str) -> Option<IngestProgress> {
-        self.jobs
-            .lock()
-            .unwrap()
-            .get(namespace)
-            .map(|rx| rx.borrow().clone())
+        // The receiver is cloned out and the map lock released BEFORE the watch
+        // is read. Holding both at once puts this route's lock order against
+        // the running walk's, and the whole point of the route is to answer
+        // while that walk is in flight (bead neurostrata-c0d).
+        let rx = {
+            let jobs = self.jobs.lock().unwrap();
+            jobs.get(namespace).cloned()
+        };
+
+        rx.map(|rx| rx.borrow().clone())
+    }
+
+    /// Whether a walk is registered under exactly this name.
+    ///
+    /// Lets a caller skip resolving the namespace against the database when the
+    /// name it was given is already a key here -- a lookup that has no business
+    /// touching storage on a route meant to answer during a busy walk.
+    pub fn knows(&self, namespace: &str) -> bool {
+        self.jobs.lock().unwrap().contains_key(namespace)
     }
 
     /// Starts the walk without waiting for it, and reports what it is doing.
@@ -296,6 +310,43 @@ mod tests {
         let jobs = IngestJobs::new();
 
         assert!(jobs.progress("never-ingested").is_none());
+        assert!(!jobs.knows("never-ingested"));
+    }
+
+    /// A name already registered is answered without resolving it against the
+    /// database. The route is polled once a second during a walk, so a storage
+    /// round trip there is a window that freezes whenever the store is busy
+    /// (bead neurostrata-c0d).
+    #[test]
+    fn a_registered_name_needs_no_lookup() {
+        let jobs = IngestJobs::new();
+        let (_tx, rx) = watch::channel(progress(IngestState::Running));
+        jobs.jobs.lock().unwrap().insert("pyworkflow".to_string(), rx);
+
+        assert!(jobs.knows("pyworkflow"));
+        // Not folded here: resolving a name that is not a key is the caller's
+        // fallback, and claiming to know it would skip that.
+        assert!(!jobs.knows("PyWorkflow"));
+    }
+
+    /// Reading progress must not hold the registry lock while it reads the
+    /// watch: that is the pair of locks the walk itself takes, and the route
+    /// has to answer while the walk is running.
+    #[test]
+    fn reading_progress_releases_the_registry_first() {
+        let jobs = IngestJobs::new();
+        let (tx, rx) = watch::channel(progress(IngestState::Running));
+        jobs.jobs.lock().unwrap().insert("ns".to_string(), rx);
+
+        // Held open across the read, the way a live walk holds its sender.
+        let _writer = tx.clone();
+        tx.send_modify(|progress| progress.files_seen = 7);
+
+        let seen = jobs.progress("ns").expect("registered");
+        assert_eq!(seen.files_seen, 7);
+
+        // And the registry is free immediately afterwards.
+        assert!(jobs.jobs.try_lock().is_ok(), "the registry lock was still held");
     }
 
     /// What a caller polls instead of holding the connection open: the live

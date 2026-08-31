@@ -71,8 +71,8 @@ fn save_project_path(path: String) {
 /// stopped mid-walk without ever reaching relink_edges. What the user saw was a
 /// graph frozen half-built with no GOVERNS edges, a daemon still answering
 /// /health, and no error anywhere (bead neurostrata-zbw).
-fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         // Separate from the call's own bound: a port with nothing behind it
         // hangs rather than refusing here, so without this a daemon that is not
         // running is indistinguishable from one that is merely busy.
@@ -91,18 +91,16 @@ fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Clie
 /// Not a fast one necessarily: /graph
 /// has been measured at 28s while a write was in flight, so the old 30s left
 /// nothing spare.
-/// has been measured at 28s while a write was in flight, so the old 30s left
-/// nothing spare.
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-fn ensure_daemon() -> Result<(), String> {
+async fn ensure_daemon() -> Result<(), String> {
     // Check if daemon is responding
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(500))
         .build()
         .map_err(|e| e.to_string())?;
 
-    if client.get("http://127.0.0.1:34343/health").send().is_err() {
+    if client.get("http://127.0.0.1:34343/health").send().await.is_err() {
         // Not running, spawn it
         println!("MCP Daemon not running. Starting it...");
 
@@ -130,7 +128,15 @@ fn ensure_daemon() -> Result<(), String> {
         }
 
         // Wait for it to boot
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // Give it a moment to start listening. This was a 2s thread sleep,
+        // which on a synchronous command was 2s of frozen window; waiting on a
+        // health request instead yields to the runtime, and returns as soon as
+        // the daemon answers rather than always taking the full wait.
+        let _ = client
+            .get("http://127.0.0.1:34343/health")
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await;
     }
     Ok(())
 }
@@ -238,8 +244,8 @@ fn open_external(url: String) -> Result<(), String> {
 /// daemon rebuilt a graph that was already on disk. The graph is loaded first
 /// now and this runs behind it (bead neurostrata-7t1).
 #[tauri::command]
-fn start_ingest(project_path: String) -> Result<serde_json::Value, String> {
-    ensure_daemon()?;
+async fn start_ingest(project_path: String) -> Result<serde_json::Value, String> {
+    ensure_daemon().await?;
 
     let namespace = namespace_for(&project_path);
 
@@ -253,12 +259,13 @@ fn start_ingest(project_path: String) -> Result<serde_json::Value, String> {
             "wait": false
         }))
         .send()
+        .await
         .map_err(|e| e.to_string())?;
 
     if resp.status().is_success() {
-        resp.json().map_err(|e| e.to_string())
+        resp.json().await.map_err(|e| e.to_string())
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to start the ingest".to_string()))
+        Err(resp.text().await.unwrap_or_else(|_| "Failed to start the ingest".to_string()))
     }
 }
 
@@ -268,8 +275,8 @@ fn start_ingest(project_path: String) -> Result<serde_json::Value, String> {
 /// restarted daemon reports for a project whose graph is already on disk. The
 /// caller treats that as "nothing running", not as an error.
 #[tauri::command]
-fn ingest_status(project_path: String) -> Result<Option<serde_json::Value>, String> {
-    ensure_daemon()?;
+async fn ingest_status(project_path: String) -> Result<Option<serde_json::Value>, String> {
+    ensure_daemon().await?;
 
     let namespace = namespace_for(&project_path);
 
@@ -278,6 +285,7 @@ fn ingest_status(project_path: String) -> Result<Option<serde_json::Value>, Stri
         .get("http://127.0.0.1:34343/ingest/status")
         .query(&[("namespace", namespace.as_str())])
         .send()
+        .await
         .map_err(|e| e.to_string())?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -285,15 +293,15 @@ fn ingest_status(project_path: String) -> Result<Option<serde_json::Value>, Stri
     }
 
     if resp.status().is_success() {
-        resp.json().map(Some).map_err(|e| e.to_string())
+        resp.json().await.map(Some).map_err(|e| e.to_string())
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to read the ingest status".to_string()))
+        Err(resp.text().await.unwrap_or_else(|_| "Failed to read the ingest status".to_string()))
     }
 }
 
 #[tauri::command]
-fn delete_memory(namespace: String, id: String) -> Result<String, String> {
-    ensure_daemon()?;
+async fn delete_memory(namespace: String, id: String) -> Result<String, String> {
+    ensure_daemon().await?;
     
     let client = daemon_client(QUERY_TIMEOUT)?;
     let resp = client.post("http://127.0.0.1:34343/delete")
@@ -302,24 +310,25 @@ fn delete_memory(namespace: String, id: String) -> Result<String, String> {
             "id": id
         }))
         .send()
+        .await
         .map_err(|e| e.to_string())?;
 
     if resp.status().is_success() {
         Ok("Deleted".to_string())
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to delete".to_string()))
+        Err(resp.text().await.unwrap_or_else(|_| "Failed to delete".to_string()))
     }
 }
 
 #[tauri::command]
-fn edit_memory(
+async fn edit_memory(
     old_namespace: String,
     id: String,
     new_namespace: String,
     content: String,
     location: String,
 ) -> Result<String, String> {
-    ensure_daemon()?;
+    ensure_daemon().await?;
 
     let client = daemon_client(QUERY_TIMEOUT)?;
     let resp = client.post("http://127.0.0.1:34343/edit")
@@ -331,18 +340,19 @@ fn edit_memory(
             "location": location
         }))
         .send()
+        .await
         .map_err(|e| e.to_string())?;
 
     if resp.status().is_success() {
         Ok("Edited".to_string())
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to edit".to_string()))
+        Err(resp.text().await.unwrap_or_else(|_| "Failed to edit".to_string()))
     }
 }
 
 #[tauri::command]
-fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
-    ensure_daemon()?;
+async fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
+    ensure_daemon().await?;
 
     let mut namespace_filter = "global".to_string();
     if let Some(path_str) = &project_path {
@@ -353,13 +363,14 @@ fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
     let resp = client.get("http://127.0.0.1:34343/graph")
         .query(&[("namespace", namespace_filter)])
         .send()
+        .await
         .map_err(|e| e.to_string())?;
 
     if resp.status().is_success() {
-        let data: GraphData = resp.json().map_err(|e| e.to_string())?;
+        let data: GraphData = resp.json().await.map_err(|e| e.to_string())?;
         Ok(data)
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to fetch graph".to_string()))
+        Err(resp.text().await.unwrap_or_else(|_| "Failed to fetch graph".to_string()))
     }
 }
 
