@@ -377,7 +377,9 @@ async fn handle_edit(
 async fn handle_mcp(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
     if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
         let response = crate::server::process_mcp_request(
             rpc_req,
@@ -386,9 +388,20 @@ async fn handle_mcp(
             state.ingests.clone(),
         )
         .await;
-        Json(response)
+
+        // A notification is answered with nothing, and nothing has to mean an
+        // EMPTY BODY. Serialising Null here would send the four bytes "null",
+        // and the empty object this used to send arrived at the client as a
+        // bare `{}` line -- not a JSON-RPC message, so the client closed the
+        // connection on it every session (bead neurostrata-kue).
+        if response.is_null() {
+            return axum::http::StatusCode::NO_CONTENT.into_response();
+        }
+
+        Json(response).into_response()
     } else {
         Json(serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}))
+            .into_response()
     }
 }
 
