@@ -27,6 +27,19 @@ struct AppState {
 struct IngestReq {
     dir: String,
     namespace: String,
+    /// Whether to hold the response until the walk finishes.
+    ///
+    /// Absent means yes, which is what the CLI wants: `neurostrata-mcp ingest`
+    /// is a command that should not return before it has done the thing. A GUI
+    /// passes false and polls `/ingest/status` instead, so its window is not
+    /// hostage to the size of the repository.
+    #[serde(default)]
+    wait: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct IngestStatusQuery {
+    namespace: String,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +81,7 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
         .route("/health", get(|| async { "OK" }))
         .route("/graph", get(handle_get_graph))
         .route("/ingest", post(handle_ingest))
+        .route("/ingest/status", get(handle_ingest_status))
         .route("/delete", post(handle_delete))
         .route("/edit", post(handle_edit))
         .route("/mcp", post(handle_mcp))
@@ -209,21 +223,62 @@ async fn handle_ingest(
 
     // The walk belongs to the registry, not to this request: a client that
     // disconnects no longer takes it down half-finished (bead neurostrata-7ej).
-    let progress = state
-        .ingests
-        .run(
+    let progress = if req.wait.unwrap_or(true) {
+        state
+            .ingests
+            .run(
+                &namespace,
+                &req.dir,
+                schema,
+                state.embedder.clone(),
+                state.vector_store.clone(),
+            )
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        // Returns as soon as the job is registered. Every caller of the waiting
+        // form needs a timeout longer than the largest repository it will ever
+        // see -- 1800s in both the Tauri client and the stdio proxy -- and those
+        // numbers exist only because the request could not come back early
+        // (bead neurostrata-fwe).
+        state.ingests.start(
             &namespace,
             &req.dir,
             schema,
             state.embedder.clone(),
             state.vector_store.clone(),
         )
-        .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    };
 
     Ok(Json(serde_json::to_value(progress).unwrap_or_else(
         |_| serde_json::json!({ "state": "finished" }),
     )))
+}
+
+/// What the last walk of a namespace is doing, for a caller that started one
+/// without waiting.
+///
+/// 404 rather than an empty body when nothing is known: the registry is in
+/// memory, so a namespace ingested by a previous daemon has a graph on disk and
+/// no job here, and a caller must be able to tell that from "still running".
+async fn handle_ingest_status(
+    State(state): State<AppState>,
+    Query(query): Query<IngestStatusQuery>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    // Matches the folded name the ingest itself resolved to, or the GUI asking
+    // about `pyworkflow` would never find the job it started (bead
+    // neurostrata-fld).
+    let namespace = crate::server::resolve_namespace(&state.vector_store, &query.namespace).await;
+
+    match state.ingests.progress(&namespace) {
+        Some(progress) => Ok(Json(serde_json::to_value(progress).unwrap_or_else(
+            |_| serde_json::json!({ "state": "unknown" }),
+        ))),
+        None => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            format!("no ingest of namespace '{}' has run since this daemon started", namespace),
+        )),
+    }
 }
 
 /// Backup and restore run here rather than in the CLI so they work against a
