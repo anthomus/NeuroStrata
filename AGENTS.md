@@ -28,7 +28,7 @@ Work is NOT complete until `git push` succeeds and knowledge is extracted.
 ## 3. NeuroStrata Memory & The 3 Resilient Soft Locks
 Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. You MUST use the `neurostrata_add_memory` tool for explicit architectural rules and decisions.
 
-The MCP server advertises exactly five tools: `neurostrata_add_memory`, `neurostrata_get_snapshot`, `neurostrata_ingest_directory`, `neurostrata_list_namespaces`, and `neurostrata_search_memory`. Do not invoke any other `neurostrata_*` name -- it does not exist.
+The MCP server advertises seven tools: `neurostrata_add_memory`, `neurostrata_get_memory`, `neurostrata_get_snapshot`, `neurostrata_ingest_directory`, `neurostrata_list_namespaces`, `neurostrata_search_memory`, and `neurostrata_supersede_memory`. Do not invoke any other `neurostrata_*` name -- it does not exist. Rather than pin a count, check `tools/list` when it matters: this list has been wrong twice.
 
 - **CRITICAL RESTRICTION**: NEVER use `bd remember` to store memories. That tool is deprecated for agent use. You MUST use the dedicated `neurostrata_add_memory` tool.
 - **Lock 1 (Pre-Push Hook):** The system enforces logging via a git hook. If a push is blocked, the agent must run `neurostrata_add_memory` before retrying.
@@ -46,6 +46,7 @@ The MCP server advertises exactly five tools: `neurostrata_add_memory`, `neurost
 - **Shared Architecture:** The database (LadybugDB) is a SHARED, global memory architecture.
 - **No Destructive Operations:** NEVER attempt to delete the DB directory, drop tables, or run destructive operations.
 - **No Bulk Deletes:** Only delete specific memory IDs, and only when explicitly correcting a hallucination. There is no `neurostrata_delete_memory` MCP tool; deletion is exposed on two other transports -- the CLI (`neurostrata-mcp delete <namespace> <id>`, which requires the daemon to be stopped) and the daemon's HTTP API (`POST /delete`, which is what the GUI uses).
+- **Correcting a memory:** use `neurostrata_supersede_memory`. It stores the corrected text as a new memory and retires the old one, which keeps its wording and stops being returned by search. Editing in place, deleting and moving between namespaces are CLI and GUI operations -- they are absent from the MCP surface, so do not look for them there.
 
 ## 6. Global Infrastructure & Tooling Constraints
 - **Containers:** ALWAYS use `podman` and `podman-compose`. NEVER use `docker`.
