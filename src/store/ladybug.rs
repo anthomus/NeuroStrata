@@ -923,20 +923,6 @@ impl VectorStore for LadybugStore {
         .await
     }
 
-    async fn clear_ingested(&self, namespace: &str) -> Result<()> {
-        let namespace = namespace.to_string();
-        self.write_with_deadline("clearing the ingested rows", move |conn| {
-            let safe_ns = escape_kuzu_string(&namespace);
-
-            // Every row the ingester owns: the AST symbols and the directory/file
-            // nodes too, since ingestion rebuilds the whole structure for a namespace
-            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m", safe_ns);
-            conn.query(&query)?;
-            Ok(())
-        })
-        .await
-    }
-
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>> {
         let namespace = namespace.to_string();
         let user_id = user_id.map(|v| v.to_string());
