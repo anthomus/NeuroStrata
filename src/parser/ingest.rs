@@ -2,10 +2,11 @@ use crate::parser::schema::ParserSchema;
 use crate::parser::get_language;
 use crate::traits::{Embedder, VectorStore, MemoryPayload};
 use ignore::WalkBuilder;
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 /// Schemas declare extensions bare ("rs"), but one passed via --schema-path may
@@ -191,6 +192,84 @@ fn symbol_id(path: &str, kind: &str, name: &str, start_line: usize) -> String {
     format!("{}#{}:{}@{}", path, kind, name, start_line)
 }
 
+/// Metadata key holding the fingerprint of the text a row was embedded from.
+const FINGERPRINT_KEY: &str = "content_fingerprint";
+
+/// The user_id every row the ingester owns is written under. Also what
+/// `clear_ingested` matches on, and what separates an ingested row from a rule
+/// an agent wrote by hand.
+const INGESTER_USER_ID: &str = "auto-ingestor";
+
+/// Fingerprint of exactly the text that gets embedded.
+///
+/// Hashing the assembled summary rather than the raw source is deliberate: the
+/// body is put through `truncate_for_embedding` first, so an edit past
+/// MAX_SYMBOL_CHARS changes the file without changing what was embedded, and
+/// re-embedding it would buy nothing. The summary also carries the kind, name
+/// and line range, so a symbol that merely moved is re-embedded -- its stored
+/// text names its own line numbers.
+fn content_fingerprint(summary: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(summary.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// What the previous ingest of this namespace left behind: row id to the
+/// fingerprint it was embedded from, `None` for rows written before
+/// fingerprints existed or by a path that does not set one.
+///
+/// Read once, up front. The alternative -- asking the store per symbol -- is
+/// thousands of round trips to avoid thousands of embeddings.
+async fn previous_fingerprints(
+    vector_store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> HashMap<String, Option<String>> {
+    let rows = match vector_store.list(namespace, Some(INGESTER_USER_ID)).await {
+        Ok(rows) => rows,
+        // A namespace being ingested for the first time has nothing to list,
+        // and a store that cannot answer should cost a slow ingest rather than
+        // a failed one: every symbol simply looks new.
+        Err(e) => {
+            eprintln!("Could not read the previous ingest of namespace {}, so every symbol will be re-embedded: {}", namespace, e);
+            return HashMap::new();
+        }
+    };
+
+    rows.into_iter()
+        .map(|row| {
+            let fingerprint = row
+                .payload
+                .metadata
+                .get(FINGERPRINT_KEY)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            (row.id, fingerprint)
+        })
+        .collect()
+}
+
+/// Whether the row already in the store was embedded from this exact text.
+///
+/// A row with no recorded fingerprint is never reused: it predates them, and
+/// there is no way to tell what it holds.
+fn can_reuse(previous: &HashMap<String, Option<String>>, id: &str, fingerprint: &str) -> bool {
+    previous
+        .get(id)
+        .is_some_and(|stored| stored.as_deref() == Some(fingerprint))
+}
+
+/// Rows the previous ingest left that this walk did not account for.
+///
+/// Sorted so a sweep is deterministic and its log reads the same twice.
+fn orphaned_ids<'a>(
+    previous: &'a HashMap<String, Option<String>>,
+    seen: &HashSet<String>,
+) -> Vec<&'a String> {
+    let mut orphans: Vec<&String> = previous.keys().filter(|id| !seen.contains(*id)).collect();
+    orphans.sort();
+    orphans
+}
+
 /// Told what the walk has done so far, so a caller does not have to wait for
 /// the whole thing to find out. Implementations are called from the walk, so
 /// they must be cheap and must not block.
@@ -207,12 +286,21 @@ pub async fn ingest_directory(
     namespace: &str,
     observer: Option<Arc<dyn IngestObserver>>,
 ) -> anyhow::Result<()> {
-    // Rebuild this namespace's ingested rows from scratch. Failing here is fatal:
-    // ingesting on top of a stale tree would leave rows for files that no longer exist.
-    vector_store
-        .clear_ingested(namespace)
-        .await
-        .map_err(|e| anyhow::anyhow!("Refusing to ingest: could not clear the previous ingest of namespace {}: {}", namespace, e))?;
+    // What the last ingest left, so a symbol whose text has not changed can keep
+    // the embedding it already has.
+    //
+    // This replaced a `clear_ingested` here, which deleted every row the
+    // ingester owned before writing a single one back. That made a re-ingest
+    // cost exactly as much as a first ingest -- on a 4,463-symbol project,
+    // fifteen minutes of embedding to arrive back where it started -- and it
+    // left the namespace EMPTY for the duration, so anything reading the graph
+    // mid-walk saw a project that had lost its code. Nothing is deleted now
+    // until the walk has finished and the orphans are known (bead
+    // neurostrata-k48).
+    let previous = previous_fingerprints(&vector_store, namespace).await;
+    // Every id this walk wrote or deliberately kept. What is absent from it at
+    // the end is what no longer exists on disk.
+    let mut seen: HashSet<String> = HashSet::new();
 
     let ext_to_lang = build_ext_map(schema);
 
@@ -283,10 +371,14 @@ pub async fn ingest_directory(
             location_lines: String::new(),
             memory_type: mem_type.to_string(),
             metadata: serde_json::Value::Object(metadata),
-            user_id: "auto-ingestor".to_string(),
+            user_id: INGESTER_USER_ID.to_string(),
             agent_name: Some("neurostrata-mcp-ingestor".to_string()),
         };
 
+        // Structural nodes are always rewritten. They carry the zero vector, so
+        // there is no embedding to save, and their metadata records containment
+        // that a move can change without changing the path itself.
+        seen.insert(node_id.clone());
         if let Err(e) = vector_store.upsert(namespace, &node_id, zero_vector.clone(), payload).await {
             eprintln!("Failed to upsert graph node {}: {}", node_id, e);
         }
@@ -369,6 +461,7 @@ pub async fn ingest_directory(
                     }
 
                     let mut symbols_stored = 0usize;
+                    let mut symbols_reused = 0usize;
                     for symbol in pending {
                         let summary = format!(
                             "{} {} in {}\nlines {}-{}\n\n{}",
@@ -379,8 +472,21 @@ pub async fn ingest_directory(
                             &symbol_id(&node_path, &symbol.kind, &symbol.name, symbol.start_line),
                         );
                         let lines = format!("{}-{}", symbol.start_line, symbol.end_line);
+                        let fingerprint = content_fingerprint(&summary);
+
+                        // Whether it is rewritten or kept, this row exists on
+                        // disk and must survive the orphan sweep below.
+                        seen.insert(id.clone());
+
+                        // The expensive half of ingestion is the embed call, and
+                        // an identical summary produces an identical vector.
+                        if can_reuse(&previous, &id, &fingerprint) {
+                            symbols_reused += 1;
+                            continue;
+                        }
 
                         let mut metadata = serde_json::Map::new();
+                        metadata.insert(FINGERPRINT_KEY.to_string(), serde_json::json!(fingerprint));
                         metadata.insert("domain".to_string(), serde_json::json!("code_ast"));
                         metadata.insert("symbol".to_string(), serde_json::json!(symbol.name));
                         metadata.insert("symbol_kind".to_string(), serde_json::json!(symbol.kind));
@@ -400,7 +506,7 @@ pub async fn ingest_directory(
                             location_lines: lines,
                             memory_type: "code_ast".to_string(),
                             metadata: serde_json::Value::Object(metadata),
-                            user_id: "auto-ingestor".to_string(),
+                            user_id: INGESTER_USER_ID.to_string(),
                             agent_name: Some("neurostrata-mcp-ingestor".to_string()),
                         };
 
@@ -416,10 +522,21 @@ pub async fn ingest_directory(
                         }
                     }
 
-                    if symbols_stored > 0 {
-                        println!("Ingested {} symbols from {}", symbols_stored, path.display());
+                    // Reused symbols count as ingested: the file has them, and a
+                    // caller watching progress is told what the graph holds,
+                    // not how much of it had to be recomputed.
+                    let symbols_present = symbols_stored + symbols_reused;
+                    if symbols_present > 0 {
+                        if symbols_reused > 0 {
+                            println!(
+                                "Ingested {} symbols from {} ({} unchanged, embedding reused)",
+                                symbols_present, path.display(), symbols_reused
+                            );
+                        } else {
+                            println!("Ingested {} symbols from {}", symbols_present, path.display());
+                        }
                         if let Some(observer) = &observer {
-                            observer.file_ingested(&path.display().to_string(), symbols_stored);
+                            observer.file_ingested(&path.display().to_string(), symbols_present);
                         }
                     }
                 }
@@ -427,11 +544,31 @@ pub async fn ingest_directory(
         }
     }
 
-    // Clearing the previous ingest took every edge attached to those nodes with
-    // it, including the GOVERNS edges rules had to them -- and a rule is not
-    // rewritten just because its file came back. Replay what the memories still
-    // declare, now that the nodes they point at exist again (bead
-    // neurostrata-sij).
+    // Everything the previous ingest left that this walk did not account for:
+    // files that were deleted or renamed, symbols that were removed, and -- the
+    // first time this runs against a tree ingested before the walker pruned
+    // properly -- whole vendor directories that should never have been walked.
+    //
+    // Deleted one row at a time on purpose. `write_with_deadline` is sized for
+    // a single write, and a sweep of thousands in one transaction would trip
+    // that deadline the way relink_edges did at 304 edges.
+    let mut removed = 0usize;
+    for id in orphaned_ids(&previous, &seen) {
+        match vector_store.delete(namespace, id).await {
+            Ok(()) => removed += 1,
+            // Worth saying, not worth abandoning the walk over: a row that
+            // could not be deleted is stale, but everything else is correct.
+            Err(e) => eprintln!("Could not remove the stale ingested row {}: {}", id, e),
+        }
+    }
+    if removed > 0 {
+        println!("Removed {} rows in namespace {} that are no longer on disk", removed, namespace);
+    }
+
+    // Rewriting a code node takes every edge attached to it, including the
+    // GOVERNS edges rules had to it -- and a rule is not rewritten just because
+    // its file came back. Replay what the memories still declare, now that the
+    // nodes they point at exist again (bead neurostrata-sij).
     match vector_store.relink_edges(namespace).await {
         Ok(linked) => {
             println!("Relinked {} declared edges in namespace {}", linked, namespace);
@@ -649,6 +786,69 @@ mod tests {
     fn unknown_extension_has_no_language() {
         let map = map_from(r#"{"languages":{"rust":{"extensions":["rs"],"queries":{}}}}"#);
         assert_eq!(map.get(&normalize_ext("toml")), None);
+    }
+
+    fn stored(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(id, fp)| (id.to_string(), fp.map(|s| s.to_string())))
+            .collect()
+    }
+
+    /// The whole point of the fingerprint: an unchanged symbol keeps the vector
+    /// it already has instead of being embedded again.
+    #[test]
+    fn an_unchanged_summary_is_reused() {
+        let summary = "functions foo in src/a.rs\nlines 1-4\n\nfn foo() {}";
+        let previous = stored(&[("ns::src/a.rs#functions:foo@1", Some(&content_fingerprint(summary)))]);
+
+        assert!(can_reuse(&previous, "ns::src/a.rs#functions:foo@1", &content_fingerprint(summary)));
+    }
+
+    /// Editing the body has to produce a different vector, or the graph answers
+    /// searches with code that is no longer there.
+    #[test]
+    fn an_edited_summary_is_not_reused() {
+        let before = "functions foo in src/a.rs\nlines 1-4\n\nfn foo() {}";
+        let after = "functions foo in src/a.rs\nlines 1-4\n\nfn foo() { work(); }";
+        let previous = stored(&[("ns::a", Some(&content_fingerprint(before)))]);
+
+        assert!(!can_reuse(&previous, "ns::a", &content_fingerprint(after)));
+    }
+
+    /// Rows written before fingerprints existed carry none. There is no way to
+    /// tell what they hold, so they are re-embedded rather than trusted.
+    #[test]
+    fn a_row_without_a_fingerprint_is_never_reused() {
+        let previous = stored(&[("ns::a", None)]);
+
+        assert!(!can_reuse(&previous, "ns::a", &content_fingerprint("anything")));
+    }
+
+    /// A symbol the walk never saw is one that left the tree. The up-front
+    /// clear this replaced is what used to remove it.
+    #[test]
+    fn rows_the_walk_did_not_see_are_orphans() {
+        let previous = stored(&[
+            ("ns::kept", Some("aaa")),
+            ("ns::deleted", Some("bbb")),
+            ("ns::also_deleted", None),
+        ]);
+        let seen: HashSet<String> = ["ns::kept".to_string()].into_iter().collect();
+
+        let orphans = orphaned_ids(&previous, &seen);
+
+        assert_eq!(orphans, vec!["ns::also_deleted", "ns::deleted"]);
+    }
+
+    /// Reuse must not save a row from the sweep on its own: a symbol whose text
+    /// is unchanged is still marked seen by the walk, and that is what keeps it.
+    #[test]
+    fn nothing_is_an_orphan_when_the_walk_saw_everything() {
+        let previous = stored(&[("ns::a", Some("aaa")), ("ns::b", Some("bbb"))]);
+        let seen: HashSet<String> = ["ns::a".to_string(), "ns::b".to_string()].into_iter().collect();
+
+        assert!(orphaned_ids(&previous, &seen).is_empty());
     }
 
     fn temp_tree(name: &str) -> std::path::PathBuf {
