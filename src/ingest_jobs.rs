@@ -37,6 +37,10 @@ pub struct IngestProgress {
     pub state: IngestState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Every file the walk has finished with. Moves through directories that
+    /// hold no symbols, which is what tells a watcher the walk is alive.
+    pub files_seen: usize,
+    /// The subset that produced at least one symbol.
     pub files_ingested: usize,
     pub symbols_ingested: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +59,7 @@ impl IngestProgress {
             dir: dir.to_string(),
             state: IngestState::Running,
             error: None,
+            files_seen: 0,
             files_ingested: 0,
             symbols_ingested: 0,
             last_file: None,
@@ -78,11 +83,17 @@ struct ProgressReporter {
 }
 
 impl IngestObserver for ProgressReporter {
-    fn file_ingested(&self, path: &str, symbols: usize) {
+    fn file_walked(&self, path: &str, symbols: usize) {
         self.tx.send_modify(|progress| {
-            progress.files_ingested += 1;
-            progress.symbols_ingested += symbols;
+            // Every file moves this and last_file, so a watcher can tell a walk
+            // crossing a directory of markdown from one that has stopped.
+            progress.files_seen += 1;
             progress.last_file = Some(path.to_string());
+
+            if symbols > 0 {
+                progress.files_ingested += 1;
+                progress.symbols_ingested += symbols;
+            }
         });
     }
 
@@ -320,14 +331,35 @@ mod tests {
         let (tx, rx) = watch::channel(progress(IngestState::Running));
         let reporter = ProgressReporter { tx };
 
-        reporter.file_ingested("src/a.rs", 3);
-        reporter.file_ingested("src/b.rs", 4);
+        reporter.file_walked("src/a.rs", 3);
+        reporter.file_walked("src/b.rs", 4);
         reporter.relinked(20);
 
         let progress = rx.borrow();
+        assert_eq!(progress.files_seen, 2);
         assert_eq!(progress.files_ingested, 2);
         assert_eq!(progress.symbols_ingested, 7);
         assert_eq!(progress.last_file.as_deref(), Some("src/b.rs"));
         assert_eq!(progress.relinked_edges, Some(20));
+    }
+
+    /// The bug this guards: a walk crossing markdown, JSON and configs reported
+    /// nothing at all, so a healthy ingest looked hung and the counter stopped
+    /// being evidence of anything (bead neurostrata-hit).
+    #[test]
+    fn a_file_with_no_symbols_still_moves_the_walk() {
+        let (tx, rx) = watch::channel(progress(IngestState::Running));
+        let reporter = ProgressReporter { tx };
+
+        reporter.file_walked("README.md", 0);
+        reporter.file_walked("package.json", 0);
+
+        let progress = rx.borrow();
+        assert_eq!(progress.files_seen, 2, "the walk moved and must say so");
+        assert_eq!(progress.last_file.as_deref(), Some("package.json"));
+
+        // And it must not claim symbols it did not find.
+        assert_eq!(progress.files_ingested, 0);
+        assert_eq!(progress.symbols_ingested, 0);
     }
 }

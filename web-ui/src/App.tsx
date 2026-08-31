@@ -281,8 +281,11 @@ function App() {
       {isIngesting && (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 bg-indigo-500/20 backdrop-blur-md border border-indigo-500/30 text-indigo-200 px-4 py-2 rounded-full font-mono text-sm flex items-center gap-2">
           <div className="w-4 h-4 rounded-full border-2 border-indigo-400 border-t-transparent animate-spin" />
+          {/* files_seen leads, because it is the number that keeps moving. The
+              other two sit still whenever the walk is crossing files that hold
+              no symbols, which is what made a working ingest look hung. */}
           {ingestProgress
-            ? `Ingesting AST: ${ingestProgress.files_ingested} files, ${ingestProgress.symbols_ingested} symbols`
+            ? `Ingesting AST: ${ingestProgress.files_seen} scanned, ${ingestProgress.files_ingested} with symbols, ${ingestProgress.symbols_ingested} symbols`
             : 'Starting AST ingest...'}
         </div>
       )}

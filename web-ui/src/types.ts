@@ -28,6 +28,9 @@ export interface IngestProgress {
   dir: string;
   state: 'running' | 'finished' | 'failed';
   error?: string;
+  /// Every file the walk has finished with, including those with no symbols.
+  files_seen: number;
+  /// The subset that produced at least one symbol.
   files_ingested: number;
   symbols_ingested: number;
   last_file?: string;

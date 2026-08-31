@@ -274,7 +274,12 @@ fn orphaned_ids<'a>(
 /// the whole thing to find out. Implementations are called from the walk, so
 /// they must be cheap and must not block.
 pub trait IngestObserver: Send + Sync {
-    fn file_ingested(&self, path: &str, symbols: usize);
+    /// One file the walk has finished with, and how many symbols it holds.
+    ///
+    /// Called for EVERY file, including those that parse to nothing: a caller
+    /// showing progress needs to see the walk moving through a directory of
+    /// markdown as much as through one of source.
+    fn file_walked(&self, path: &str, symbols: usize);
     fn relinked(&self, edges: usize);
 }
 
@@ -386,6 +391,10 @@ pub async fn ingest_directory(
         if !is_file {
             continue;
         }
+
+        // Counted for every file, including the ones that parse to nothing, so
+        // the walk can be reported as moving through them (bead neurostrata-hit).
+        let mut symbols_present = 0usize;
 
         // Now if it is a parseable file, extract AST nodes
         if let Some(ext_os) = path.extension() {
@@ -525,7 +534,7 @@ pub async fn ingest_directory(
                     // Reused symbols count as ingested: the file has them, and a
                     // caller watching progress is told what the graph holds,
                     // not how much of it had to be recomputed.
-                    let symbols_present = symbols_stored + symbols_reused;
+                    symbols_present = symbols_stored + symbols_reused;
                     if symbols_present > 0 {
                         if symbols_reused > 0 {
                             println!(
@@ -535,12 +544,18 @@ pub async fn ingest_directory(
                         } else {
                             println!("Ingested {} symbols from {}", symbols_present, path.display());
                         }
-                        if let Some(observer) = &observer {
-                            observer.file_ingested(&path.display().to_string(), symbols_present);
-                        }
                     }
                 }
             }
+        }
+
+        // Once per file, whatever came of it. Reporting only the files that
+        // produced symbols left the walk silent through markdown, JSON, configs
+        // and anything the schema extracts nothing from -- so a healthy ingest
+        // looked stalled, and "the number is not moving" stopped being evidence
+        // of anything (bead neurostrata-hit).
+        if let Some(observer) = &observer {
+            observer.file_walked(&path.display().to_string(), symbols_present);
         }
     }
 
