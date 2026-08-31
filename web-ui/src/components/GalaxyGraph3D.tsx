@@ -2,6 +2,7 @@ import { useRef, useMemo, useEffect, useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import ForceGraph3D from 'react-force-graph-3d';
 import * as THREE from 'three';
+import { useElementSize } from '../useElementSize';
 import type { GraphData, MemoryNode, MemoryLink } from '../types';
 
 /// Whether this webview can actually give three.js a canvas to draw on.
@@ -67,6 +68,7 @@ const getGlowTexture = () => {
 export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
   const [webgl] = useState(detectWebGL);
+  const { ref: sizeRef, width, height } = useElementSize();
 
   useEffect(() => {
     invoke('log_message', {
@@ -82,26 +84,67 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
   // screen -- which reads as "the 3D view is broken" (bead neurostrata-u30).
   // The 2D view never had the problem because its default zoom happens to suit
   // that scale.
-  const framedFor = useRef<GraphData | null>(null);
+  // Two framings, tracked apart on purpose.
+  //
+  // They used to share one flag, so whichever fired first marked the data
+  // framed and turned the other into a no-op. On any graph big enough that the
+  // simulation is still expanding at 2.5s the timer always won: it fitted a
+  // bounding box that was obsolete milliseconds later, the charge force pushed
+  // every node outside the frustum, and the framing that would have been right
+  // -- the one at engine stop, with positions settled -- never ran. A
+  // 5,303-node graph rendered as a black screen while the log said it had been
+  // framed (bead neurostrata-0o1).
+  const backstopFramedFor = useRef<GraphData | null>(null);
+  const settledFramedFor = useRef<GraphData | null>(null);
 
-  const frameGraph = useCallback(() => {
-    if (!fgRef.current || !data?.nodes?.length || framedFor.current === data) return;
-    framedFor.current = data;
+  const frame = useCallback((reason: string) => {
+    if (!fgRef.current || !data?.nodes?.length) return;
     try {
       fgRef.current.zoomToFit(600, 80);
-      invoke('log_message', { msg: `3D view framed ${data.nodes.length} nodes` });
+
+      // Where the nodes actually ARE, not merely how far apart they are.
+      // Span says nothing about position: a graph 345 units wide centred a long
+      // way from the origin is off-screen however tightly it is framed.
+      const pos = data.nodes.filter((n: any) => Number.isFinite(n.x));
+      const stat = (axis: string) => {
+        const vs = pos.map((n: any) => n[axis] as number);
+        const mean = vs.reduce((a: number, b: number) => a + b, 0) / (vs.length || 1);
+        return `${axis}[${Math.round(Math.min(...vs))}..${Math.round(Math.max(...vs))} mid ${Math.round(mean)}]`;
+      };
+      const cam = fgRef.current.cameraPosition();
+      invoke('log_message', {
+        msg:
+          `3D geometry (${reason}): nodes=${pos.length} ` +
+          `${stat('x')} ${stat('y')} ${stat('z')} ` +
+          `camera=(${Math.round(cam.x)},${Math.round(cam.y)},${Math.round(cam.z)})`,
+      });
     } catch (e) {
       invoke('log_message', { msg: `3D view could not frame the graph: ${e}` });
     }
   }, [data]);
 
+  // An early, rough view so the window is not empty while a large graph
+  // settles. Deliberately allowed to be wrong: it is replaced below.
+  const frameBackstop = useCallback(() => {
+    if (backstopFramedFor.current === data) return;
+    backstopFramedFor.current = data;
+    frame('backstop');
+  }, [data, frame]);
+
+  // The one that counts. Runs whatever the backstop did, and only once the
+  // layout has stopped moving.
+  const frameSettled = useCallback(() => {
+    if (settledFramedFor.current === data) return;
+    settledFramedFor.current = data;
+    frame('settled');
+  }, [data, frame]);
+
   useEffect(() => {
-    framedFor.current = null;
-    // The engine usually settles first and onEngineStop does the framing; this
-    // is the backstop for a graph small enough that it never fires.
-    const timer = setTimeout(frameGraph, 2500);
+    backstopFramedFor.current = null;
+    settledFramedFor.current = null;
+    const timer = setTimeout(frameBackstop, 2500);
     return () => clearTimeout(timer);
-  }, [data, frameGraph]);
+  }, [data, frameBackstop]);
 
   useEffect(() => {
     if (fgRef.current) {
@@ -207,7 +250,23 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     if (!node) return new THREE.Object3D();
     const mNode = node as MemoryNode;
     const material = nodeMaterials[mNode.memory_type] || defaultNodeMaterial;
-    const size = Math.max(16, (mNode.degree || 1) * 3);
+
+    // Sized against the graph, which the force layout settles into roughly 350
+    // units across whatever the node count.
+    //
+    // This was `max(16, degree * 3)`, unbounded. A repository root contains
+    // everything under it, so its degree runs to ~300 and its sprite came out
+    // 891 units wide -- nearly three times the width of the entire galaxy. That
+    // sprite dominates the scene bounding box, so zoomToFit retreated to 2,965
+    // units to contain it, from where every ordinary 16-unit node is smaller
+    // than a pixel and the giant one is an additive gradient smeared across the
+    // whole viewport. The result is a black screen, which is what the 3D view
+    // has always shown on a real graph (bead neurostrata-0o1).
+    //
+    // sqrt keeps a hub visibly larger than a leaf without letting it run away:
+    // degree 1 gives 5, degree 300 gives the cap.
+    const degree = Math.max(1, mNode.degree || 1);
+    const size = Math.min(28, 5 * Math.sqrt(degree));
     
     const sprite = new THREE.Sprite(material);
     sprite.scale.set(size, size, 1);
@@ -279,9 +338,12 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
   }
 
   return (
-    <div className="absolute inset-0 bg-black z-0">
+    <div ref={sizeRef} className="absolute inset-0 bg-black z-0">
+      {width > 0 && height > 0 && (
       <ForceGraph3D
         ref={fgRef}
+        width={width}
+        height={height}
         graphData={data}
         backgroundColor="#000000"
         nodeThreeObject={createNodeObject}
@@ -289,8 +351,9 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
         linkWidth={getLinkWidth}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
         onLinkClick={(l) => onLinkClick(l as MemoryLink)}
-        onEngineStop={frameGraph}
+        onEngineStop={frameSettled}
       />
+      )}
     </div>
   );
 };
