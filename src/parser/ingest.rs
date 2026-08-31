@@ -475,14 +475,31 @@ mod tests {
         assert_eq!(map.get(&normalize_ext("tsx")), Some(&"tsx".to_string()));
     }
 
+    /// A project root that is genuinely absolute on the platform running the
+    /// test.
+    ///
+    /// These fixtures used a literal `C:\dev\projects\neurostrata`, which is
+    /// absolute only on Windows: on Linux and macOS it has no leading separator,
+    /// so `node_id_for` took its `is_relative()` branch and returned the whole
+    /// string instead of stripping the root. Both tests below failed there and
+    /// nothing reported it, because CI builds and smoke-tests the binary but
+    /// never runs the suite (bead neurostrata-vh2).
+    fn absolute_root() -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\dev\projects\neurostrata")
+        } else {
+            std::path::PathBuf::from("/dev/projects/neurostrata")
+        }
+    }
+
     /// Node ids double as edge targets, so a path an agent writes
     /// ("src/lib.rs") has to land on the same string the walker produced.
     #[test]
     fn a_node_id_is_relative_to_the_directory_being_ingested() {
-        let root = Path::new(r"C:\dev\projects\neurostrata");
+        let root = absolute_root();
 
         assert_eq!(
-            node_id_for(root, Path::new(r"C:\dev\projects\neurostrata\src\store\ladybug.rs")),
+            node_id_for(&root, &root.join("src").join("store").join("ladybug.rs")),
             "src/store/ladybug.rs",
             "an absolute walk must produce the same id as a relative one"
         );
@@ -509,8 +526,8 @@ mod tests {
 
     #[test]
     fn the_ingest_root_is_named_rather_than_left_empty() {
-        let root = Path::new(r"C:\dev\projects\neurostrata");
-        assert_eq!(node_id_for(root, root), "neurostrata");
+        let root = absolute_root();
+        assert_eq!(node_id_for(&root, &root), "neurostrata");
     }
 
     #[test]
