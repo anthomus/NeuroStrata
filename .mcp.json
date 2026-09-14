@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "neurostrata": {
+      "command": "neurostrata-mcp",
+      "args": []
+    }
+  }
+}
