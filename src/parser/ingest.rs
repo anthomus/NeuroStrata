@@ -270,6 +270,21 @@ fn orphaned_ids<'a>(
     orphans
 }
 
+/// The rows a sweep may remove: the orphans, unless the walk could not read part
+/// of the tree. An unreadable subtree yields no ids, so every row under it looks
+/// orphaned, and a permission error or a locked directory would erase that part
+/// of the graph instead of leaving it merely stale until the next ingest.
+fn rows_to_sweep<'a>(
+    previous: &'a HashMap<String, Option<String>>,
+    seen: &HashSet<String>,
+    unreadable: usize,
+) -> Vec<&'a String> {
+    if unreadable > 0 {
+        return Vec::new();
+    }
+    orphaned_ids(previous, seen)
+}
+
 /// Told what the walk has done so far, so a caller does not have to wait for
 /// the whole thing to find out. Implementations are called from the walk, so
 /// they must be cheap and must not block.
@@ -568,7 +583,7 @@ pub async fn ingest_directory(
 
     if unreadable > 0 {
         eprintln!(
-            "WARNING: {} path(s) under {:?} could not be read, so they are missing from this ingest of namespace {}.",
+            "WARNING: {} path(s) under {:?} could not be read, so this ingest of namespace {} did not see them. Nothing was swept: rows for files that are gone stay until an ingest reads the whole tree.",
             unreadable, dir_path, namespace
         );
     }
@@ -582,7 +597,7 @@ pub async fn ingest_directory(
     // a single write, and a sweep of thousands in one transaction would trip
     // that deadline the way relink_edges did at 304 edges.
     let mut removed = 0usize;
-    for id in orphaned_ids(&previous, &seen) {
+    for id in rows_to_sweep(&previous, &seen, unreadable) {
         match vector_store.delete(namespace, id).await {
             Ok(()) => removed += 1,
             // Worth saying, not worth abandoning the walk over: a row that
@@ -946,6 +961,17 @@ mod tests {
         let seen: HashSet<String> = ["ns::a".to_string(), "ns::b".to_string()].into_iter().collect();
 
         assert!(orphaned_ids(&previous, &seen).is_empty());
+    }
+
+    /// A walk that could not read part of the tree did not see what is there,
+    /// so it must not delete what it did not see.
+    #[test]
+    fn nothing_is_swept_after_a_walk_that_could_not_read_everything() {
+        let previous = stored(&[("ns::unread", Some("aaa"))]);
+        let seen: HashSet<String> = HashSet::new();
+
+        assert_eq!(rows_to_sweep(&previous, &seen, 0), vec!["ns::unread"]);
+        assert!(rows_to_sweep(&previous, &seen, 1).is_empty());
     }
 
     fn temp_tree(name: &str) -> std::path::PathBuf {
