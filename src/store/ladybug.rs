@@ -4851,6 +4851,63 @@ impl VectorStore for LadybugStore {
         outcome
     }
 
+    async fn relocate_namespace(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<crate::traits::NamespaceRelocation> {
+        let mut out = crate::traits::NamespaceRelocation::default();
+        if from == to {
+            return Ok(out);
+        }
+        // Same eligibility rule as `relocate`, decided in Rust so the single
+        // statement below and the index rewrite act on exactly the same ids.
+        let mut movable = Vec::new();
+        for row in self.list(from, None, None).await? {
+            if row.payload.user_id == "auto-ingestor"
+                || row.id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+            {
+                out.ingested += 1;
+            } else {
+                movable.push(row);
+            }
+        }
+        if movable.is_empty() {
+            return Ok(out);
+        }
+
+        let id_list = movable
+            .iter()
+            .map(|r| format!("'{}'", escape_ladybug_string(&r.id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (q_from, q_to) = (escape_ladybug_string(from), escape_ladybug_string(to));
+        self.write_with_deadline("moving a namespace", move |conn| {
+            // One statement: either every row changes namespace or none does.
+            conn.query(&format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{q_from}' AND m.id IN [{id_list}] SET m.namespace = '{q_to}'"
+            ))?;
+            // SET matches-and-mutates silently, so confirm nothing was left.
+            let mut left = conn.query(&format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{q_from}' AND m.id IN [{id_list}] RETURN m.id LIMIT 1"
+            ))?;
+            if left.next().is_some() {
+                anyhow::bail!("namespace move left rows behind in '{}'", q_from);
+            }
+            Ok(())
+        })
+        .await?;
+
+        for row in &movable {
+            self.lexical_remove_doc(from, &row.id);
+            let mut doc = Self::lexical_doc(to, &row.id, &row.payload);
+            doc.namespace = to.to_string();
+            self.lexical_apply_doc(doc);
+        }
+        out.moved = movable.len();
+        Ok(out)
+    }
+
     async fn export_database(&self, dir: &str) -> Result<()> {
         let dir = std::path::PathBuf::from(dir);
         let source = self.local_path.clone();
@@ -9420,6 +9477,45 @@ eurostrata\src\daemon.rs",
             1,
             "its edges came with it"
         );
+    }
+
+    #[tokio::test]
+    async fn moving_a_namespace_moves_authored_rows_and_leaves_ingested_ones() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "probe::src/a.rs",
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        for id in ["rule-1", "rule-2"] {
+            store
+                .upsert(
+                    "probe",
+                    id,
+                    vec![0.0; 4],
+                    retired_test_payload("rule", "agent", json!({ "governs": ["probe::src/a.rs"] })),
+                )
+                .await
+                .unwrap();
+        }
+
+        let out = store.relocate_namespace("probe", "renamed").await.unwrap();
+        assert_eq!((out.moved, out.ingested), (2, 1));
+        assert!(store.get("renamed", "rule-1").await.unwrap().is_some());
+        assert!(store.get("renamed", "rule-2").await.unwrap().is_some());
+        assert!(store.get("probe", "rule-1").await.unwrap().is_none());
+        assert!(
+            store.get("probe", "probe::src/a.rs").await.unwrap().is_some(),
+            "the ingested row stays"
+        );
+        assert_eq!(governs_edges_from(&store, "rule-1").await, 1, "edges survive");
+
+        let again = store.relocate_namespace("probe", "renamed").await.unwrap();
+        assert_eq!((again.moved, again.ingested), (0, 1), "re-running is a no-op");
     }
 
     #[tokio::test]

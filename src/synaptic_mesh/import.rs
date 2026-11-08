@@ -5140,6 +5140,7 @@ mod tests {
     /// Hostile checkout contents — path traversal, symlinks, executable
     /// payload bits, garbage JSON — are all ignored, and the store stays
     /// untouched.
+    #[cfg(unix)]
     #[tokio::test]
     async fn traversal_symlink_executable_and_garbage_are_ignored_and_store_untouched() {
         // Traversal never becomes a candidate: the classifier refuses any

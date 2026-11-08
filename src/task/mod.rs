@@ -6708,6 +6708,13 @@ mod tests {
         ) -> anyhow::Result<crate::traits::RelocateOutcome> {
             self.inner.relocate(id, from, to).await
         }
+        async fn relocate_namespace(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::NamespaceRelocation> {
+            self.inner.relocate_namespace(from, to).await
+        }
         async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
             self.inner.list_namespaces().await
         }
@@ -6818,6 +6825,13 @@ mod tests {
             to: &str,
         ) -> anyhow::Result<crate::traits::RelocateOutcome> {
             self.inner.relocate(id, from, to).await
+        }
+        async fn relocate_namespace(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::NamespaceRelocation> {
+            self.inner.relocate_namespace(from, to).await
         }
         async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
             self.inner.list_namespaces().await

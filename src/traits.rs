@@ -170,6 +170,15 @@ pub enum RelocateOutcome {
     SameNamespace,
 }
 
+/// What moving a whole namespace did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NamespaceRelocation {
+    pub moved: usize,
+    /// Ingestion-written rows, which stay where they are (see
+    /// `RelocateOutcome::Ingested`).
+    pub ingested: usize,
+}
+
 
 /// Embedding-space identity persisted on namespace metadata. Enforcement on
 /// every vector path ensures incompatible spaces are never mixed.
@@ -445,6 +454,24 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// own, which makes "write to the target, delete from the source" delete the
     /// only copy.
     async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome>;
+
+    /// Moves every non-ingested memory in `from` into `to`. Stores that can do
+    /// it as one statement override this so the move is atomic; this default
+    /// moves row by row through `relocate`, which is correct but not atomic.
+    async fn relocate_namespace(&self, from: &str, to: &str) -> Result<NamespaceRelocation> {
+        let mut out = NamespaceRelocation::default();
+        if from == to {
+            return Ok(out);
+        }
+        for row in self.list(from, None, None).await? {
+            match self.relocate(&row.id, from, to).await? {
+                RelocateOutcome::Moved => out.moved += 1,
+                RelocateOutcome::Ingested => out.ingested += 1,
+                RelocateOutcome::NotFound | RelocateOutcome::SameNamespace => {}
+            }
+        }
+        Ok(out)
+    }
 
     /// List all existing namespaces (tables)
     async fn list_namespaces(&self) -> Result<Vec<String>>;

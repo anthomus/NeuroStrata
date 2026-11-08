@@ -149,6 +149,52 @@ enum Commands {
         id: String,
     },
 
+    /// Delete EVERY memory in a namespace, after typed confirmation
+    ///
+    /// Destructive and irreversible, so it is a CLI command rather than an MCP
+    /// tool. Shows the count first and asks you to retype the namespace name;
+    /// `--yes` skips the prompt for scripts, `--dry-run` only reports.
+    #[command(name = "delete-namespace")]
+    DeleteNamespace {
+        /// The namespace to empty
+        namespace: String,
+
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Report what would be deleted and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Rename a namespace by moving every memory in it, after confirmation
+    ///
+    /// Needs the daemon stopped, like `move`. Rows whose ids name the
+    /// namespace (ingested code nodes, export-freshness flags) cannot be
+    /// relocated; they are reported and left behind. Re-ingesting into the new
+    /// name recreates the code nodes.
+    #[command(name = "rename-namespace")]
+    RenameNamespace {
+        /// The namespace to rename
+        source_namespace: String,
+
+        /// The new name
+        target_namespace: String,
+
+        /// Allow the new name to already hold memories
+        #[arg(long)]
+        merge: bool,
+
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Report what would move and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Archive a memory by ID: tombstone it, keeping its content
     ///
     /// Not `delete`. Archiving merges `archived: true` into the row's own
@@ -1095,6 +1141,29 @@ impl ReadSource {
             }
         }
     }
+
+    /// Remove one memory. The only mutating method here: it exists so the
+    /// namespace-wide delete can run against either a daemon or a direct store.
+    async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+        match self {
+            ReadSource::Direct(s) => s.delete(namespace, id).await,
+            ReadSource::Daemon => {
+                let res = daemon_operator_client()
+                    .post(format!("http://{DAEMON_ADDR}/delete"))
+                    .json(&serde_json::json!({ "namespace": namespace, "id": id }))
+                    .send()
+                    .await?;
+                if !res.status().is_success() {
+                    anyhow::bail!(
+                        "daemon /delete returned HTTP {}: {}",
+                        res.status(),
+                        res.text().await.unwrap_or_default()
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 fn print_learn_control(req: crate::learning::control::LearningControlRequest) {
@@ -1432,9 +1501,146 @@ async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ask the operator to retype `namespace`. `--yes` skips the prompt; with no
+/// terminal and no `--yes` there is nobody to ask, so refuse rather than guess.
+fn confirm_by_typing(namespace: &str, yes: bool) -> anyhow::Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("no terminal to confirm on; pass --yes to proceed without a prompt");
+    }
+    print!("Type the namespace name '{}' to confirm: ", namespace);
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim() == namespace)
+}
+
+fn reject_bad_namespace(name: &str) -> anyhow::Result<()> {
+    if name.trim().is_empty() || name.contains('/') || name.contains('\\') {
+        anyhow::bail!("'{}' is not a namespace name (empty or looks like a path)", name);
+    }
+    if name == "global" {
+        anyhow::bail!("refusing to touch the shared 'global' namespace");
+    }
+    Ok(())
+}
+
+async fn run_delete_namespace(
+    read: &ReadSource,
+    namespace: &str,
+    yes: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    reject_bad_namespace(namespace)?;
+    let rows = read.list(namespace).await?;
+    if rows.is_empty() {
+        println!("Namespace '{}' holds 0 memories; nothing to delete.", namespace);
+        return Ok(());
+    }
+    println!("Namespace '{}' holds {} memories.", namespace, rows.len());
+    if dry_run {
+        println!("Dry run: would delete {} memories. Nothing changed.", rows.len());
+        return Ok(());
+    }
+    println!("This permanently deletes all of them. It cannot be undone.");
+    if !confirm_by_typing(namespace, yes)? {
+        println!("Aborted: name did not match. Nothing deleted.");
+        std::process::exit(1);
+    }
+    let (mut deleted, mut failed) = (0usize, 0usize);
+    for row in &rows {
+        match read.delete(namespace, &row.id).await {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                failed += 1;
+                eprintln!("  failed to delete {}: {}", row.id, e);
+            }
+        }
+    }
+    println!("Deleted {} of {} memories from '{}'; {} failed.", deleted, rows.len(), namespace, failed);
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn run_rename_namespace(
+    store: &Arc<dyn VectorStore>,
+    source: &str,
+    target: &str,
+    merge: bool,
+    yes: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    reject_bad_namespace(source)?;
+    reject_bad_namespace(target)?;
+    if source == target {
+        anyhow::bail!("source and target are both '{}'", source);
+    }
+    let rows = store.list(source, None, None).await?;
+    if rows.is_empty() {
+        println!("Namespace '{}' holds 0 memories; nothing to rename.", source);
+        return Ok(());
+    }
+    let existing = store.list(target, None, None).await?.len();
+    if existing > 0 && !merge {
+        anyhow::bail!(
+            "'{}' already holds {} memories; pass --merge to move into it anyway",
+            target,
+            existing
+        );
+    }
+    println!("Will move {} memories from '{}' to '{}'.", rows.len(), source, target);
+    if dry_run {
+        println!("Dry run: nothing changed.");
+        return Ok(());
+    }
+    if !confirm_by_typing(source, yes)? {
+        println!("Aborted: name did not match. Nothing moved.");
+        std::process::exit(1);
+    }
+    // One atomic statement in the store: all eligible rows move or none do.
+    let outcome = store.relocate_namespace(source, target).await?;
+    println!("Moved {} of {} memories to '{}'.", outcome.moved, rows.len(), target);
+    if outcome.ingested > 0 {
+        println!(
+            "{} rows whose ids name the namespace (ingested code nodes, export-freshness flags) stay in '{}'; run `ingest` into '{}' to recreate code nodes, then `delete-namespace {}`.",
+            outcome.ingested, source, target, source
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_namespace_commands_parse_and_refuse_bad_names() {
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "delete-namespace", "old", "--dry-run"])
+            .expect("delete-namespace parses");
+        match cli.command {
+            Some(Commands::DeleteNamespace { namespace, yes, dry_run }) => {
+                assert_eq!(namespace, "old");
+                assert!(!yes);
+                assert!(dry_run);
+            }
+            other => panic!("expected DeleteNamespace, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "rename-namespace", "a", "b", "--merge"])
+            .expect("rename-namespace parses");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::RenameNamespace { merge: true, .. })
+        ));
+        assert!(reject_bad_namespace("global").is_err());
+        assert!(reject_bad_namespace("C:\\dev\\proj").is_err());
+        assert!(reject_bad_namespace("").is_err());
+        assert!(reject_bad_namespace("MyProj").is_ok());
+    }
 
     #[test]
     fn a_mistyped_subcommand_is_an_error_not_an_execution() {
@@ -1599,6 +1805,16 @@ mod tests {
     /// hook gets the executable bit; on Windows, git runs the hook via the
     /// filename (`.git/hooks/<name>` without an extension, executed through
     /// Git Bash) rather than POSIX permissions, so the helper is a no-op.
+    #[cfg(not(unix))]
+    #[test]
+    fn set_hook_executable_is_a_harmless_noop_off_unix() {
+        let path = std::env::temp_dir().join(format!("ns-hook-noop-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "#!/bin/sh\necho ok\n").unwrap();
+        set_hook_executable(&path).expect("a no-op cannot fail");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#!/bin/sh\necho ok\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[cfg(unix)]
     #[test]
     fn set_hook_executable_marks_the_file_executable_on_unix() {
@@ -3917,6 +4133,10 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!("Delete failed: {}", body);
                             std::process::exit(1);
                         }
+                        Commands::DeleteNamespace { namespace, yes, dry_run } => {
+                            run_delete_namespace(&read, namespace, *yes, *dry_run).await?;
+                            return Ok(());
+                        }
                         Commands::Archive { namespace, id } => {
                             let res = daemon_http_client()
                                 .post(format!("http://{DAEMON_ADDR}/memory/archive"))
@@ -4333,6 +4553,26 @@ async fn run() -> anyhow::Result<()> {
                     Commands::Delete { namespace, id } => {
                         vector_store.delete(&namespace, &id).await?;
                         println!("Memory deleted successfully.");
+                    }
+                    Commands::DeleteNamespace { namespace, yes, dry_run } => {
+                        run_delete_namespace(&read, &namespace, yes, dry_run).await?;
+                    }
+                    Commands::RenameNamespace {
+                        source_namespace,
+                        target_namespace,
+                        merge,
+                        yes,
+                        dry_run,
+                    } => {
+                        run_rename_namespace(
+                            &vector_store,
+                            &source_namespace,
+                            &target_namespace,
+                            merge,
+                            yes,
+                            dry_run,
+                        )
+                        .await?;
                     }
                     Commands::Archive { namespace, id } => {
                         // The same handler `neurostrata_archive_memory` calls,
