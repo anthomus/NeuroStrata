@@ -336,6 +336,14 @@ fn slugify(s: &str) -> String {
 /// the whole thing to find out. Implementations are called from the walk, so
 /// they must be cheap and must not block.
 pub trait IngestObserver: Send + Sync {
+    /// One file the walk has finished with, whatever came of it.
+    ///
+    /// Called for EVERY file, including those that parse to nothing (markdown,
+    /// JSON, configs) and those skipped because they are unchanged. A caller
+    /// showing progress needs to see the walk moving through a directory of
+    /// documentation as much as through one of source; reporting only files with
+    /// symbols left a healthy ingest looking hung.
+    fn file_walked(&self, _path: &str) {}
     fn file_ingested(&self, path: &str, symbols: usize);
     fn file_skipped(&self, path: &str) {
         tracing::debug!("ingest skipped file: {path}");
@@ -556,6 +564,7 @@ fn run_producer(
                     if prev_hash == file_sha256.as_deref().unwrap_or("") {
                         if let Some(obs) = &observer {
                             obs.file_skipped(&path_str);
+                            obs.file_walked(&path_str);
                         }
                         // Record the current hash so unchanged rows can be carried.
                         if let Some(h) = file_sha256.as_deref() {
@@ -569,6 +578,14 @@ fn run_producer(
         // Record the current hash for every file the walk visits.
         if let Some(h) = file_sha256.as_deref() {
             current_hashes.insert(node_path.clone(), h.to_string());
+        }
+
+        // Counted once per file here, so a walk crossing markdown, JSON and
+        // configs is reported as moving even though none of them yields symbols.
+        if is_file {
+            if let Some(obs) = &observer {
+                obs.file_walked(&path_str);
+            }
         }
 
         // Apply backpressure: if the channel is full, block until space is
@@ -1981,6 +1998,54 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A walk crossing markdown and JSON used to report nothing, because the
+    /// observer was told only about files that produced symbols; a healthy
+    /// ingest then looked hung. `file_walked` fires once per file whatever came
+    /// of it, including on a re-ingest where every file is unchanged and skipped.
+    #[tokio::test]
+    async fn every_file_is_reported_as_walked_even_with_no_symbols() {
+        let tmp = std::env::temp_dir().join(format!("ns-walked-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("lib.rs"), "fn main() {}").expect("write code");
+        std::fs::write(tmp.join("README.md"), "no headings here\n").expect("write markdown");
+        std::fs::write(tmp.join("package.json"), "{}").expect("write json");
+        let db = std::env::temp_dir().join(format!("ns-walked-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+
+        struct Walked(std::sync::Mutex<Vec<String>>);
+        impl IngestObserver for Walked {
+            fn file_walked(&self, path: &str) {
+                self.0.lock().unwrap().push(path.to_string());
+            }
+            fn file_ingested(&self, _path: &str, _symbols: usize) {}
+            fn relinked(&self, _edges: usize) {}
+        }
+
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        for pass in ["first ingest", "unchanged re-ingest"] {
+            let seen = Arc::new(Walked(std::sync::Mutex::new(Vec::new())));
+            ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(seen.clone()), &[])
+                .await
+                .expect(pass);
+            let names: Vec<String> = seen
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string())
+                .collect();
+            assert_eq!(names.len(), 3, "{pass}: one report per file, got {names:?}");
+            for file in ["lib.rs", "README.md", "package.json"] {
+                assert!(names.iter().any(|n| n == file), "{pass}: {file} must be reported: {names:?}");
+            }
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
     }
 
