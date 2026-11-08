@@ -397,6 +397,9 @@ fn run_producer(
     std::collections::HashSet<String>,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, Vec<String>>,
+    // How many paths the walk could not read. Non-zero means the walk did not
+    // see the whole tree, so what it did not see must not be treated as gone.
+    usize,
 )> {
     let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current_hashes: std::collections::HashMap<String, String> =
@@ -694,7 +697,7 @@ fn run_producer(
 
     if unreadable > 0 {
         eprintln!(
-            "WARNING: {} path(s) under {:?} could not be read, so they are missing from this ingest of namespace {}.",
+            "WARNING: {} path(s) under {:?} could not be read, so this ingest of namespace {} did not see them. Their previous rows are kept: rows for files that are really gone stay until an ingest reads the whole tree.",
             unreadable, dir_path, namespace
         );
     }
@@ -707,7 +710,32 @@ fn run_producer(
             resolved.insert(src, targets);
         }
     }
-    Ok((current_paths, current_hashes, resolved))
+    Ok((current_paths, current_hashes, resolved, unreadable))
+}
+
+/// Whether a row from the previous generation is carried into the new one.
+///
+/// A row whose file the walk saw is carried only if the bytes are unchanged (a
+/// changed file was re-staged by the walk itself). A row whose file the walk did
+/// NOT see is dropped, since the file is gone -- unless the walk could not read
+/// part of the tree. An unreadable subtree yields no paths, so every row under
+/// it looks deleted, and a permission error or a locked directory would erase
+/// that part of the graph until the next complete walk. Keeping them trades
+/// a missing subtree for possibly stale rows; neither loses authored memories.
+fn carries_forward(
+    file_seen: bool,
+    stored_hash: Option<&str>,
+    current_hash: Option<&str>,
+    walk_incomplete: bool,
+) -> bool {
+    if file_seen {
+        match stored_hash {
+            Some(h) => current_hash == Some(h),
+            None => true,
+        }
+    } else {
+        walk_incomplete
+    }
 }
 /// Stamps the per-node `relative_path` onto a copy of the shared source
 /// identity. The identity is otherwise identical across a tree, but the path
@@ -1130,11 +1158,13 @@ pub async fn ingest_directory(
     let mut current_hashes = std::collections::HashMap::new();
     let mut current_paths = std::collections::HashSet::new();
     let mut dependency_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut walk_incomplete = false;
     let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
-        (Ok(()), Ok(Ok((paths, hashes, deps)))) => {
+        (Ok(()), Ok(Ok((paths, hashes, deps, unreadable)))) => {
             current_paths = paths;
             current_hashes = hashes;
             dependency_map = deps;
+            walk_incomplete = unreadable > 0;
             None
         }
         (Err(e), _) => Some(e),
@@ -1187,15 +1217,15 @@ pub async fn ingest_directory(
             let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
             // Carry a previous row only when its file is still present with
             // the same bytes, or (for no-hash rows) when the path is still
-            // visited. Deleted files and stale symbols drop out.
-            let carry = if current_paths.contains(&file_path) {
-                match &hash {
-                    Some(h) => current_hashes.get(&file_path) == Some(h),
-                    None => true,
-                }
-            } else {
-                false
-            };
+            // visited. Deleted files and stale symbols drop out -- unless the
+            // walk could not read the whole tree, in which case a file it did
+            // not see is not known to be gone (see `carries_forward`).
+            let carry = carries_forward(
+                current_paths.contains(&file_path),
+                hash.as_deref(),
+                current_hashes.get(&file_path).map(|s| s.as_str()),
+                walk_incomplete,
+            );
             if !carry { continue; }
             match vector_store.get(namespace, &id).await {
                 Ok(Some((vec, mut payload))) => {
@@ -1982,6 +2012,34 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A file the walk saw is carried only when its bytes are unchanged; a file
+    /// it did not see is dropped as deleted. That is correct for a complete walk
+    /// and destructive for a partial one.
+    #[test]
+    fn a_complete_walk_drops_files_it_did_not_see() {
+        // seen, unchanged -> carried
+        assert!(carries_forward(true, Some("aaa"), Some("aaa"), false));
+        // seen, changed -> not carried (the walk re-staged it)
+        assert!(!carries_forward(true, Some("aaa"), Some("bbb"), false));
+        // seen, row never had a hash -> carried
+        assert!(carries_forward(true, None, Some("bbb"), false));
+        // not seen on a complete walk -> the file is gone
+        assert!(!carries_forward(false, Some("aaa"), None, false));
+    }
+
+    /// A walk that could not read part of the tree did not see what is there, so
+    /// it must not drop what it did not see: an unreadable subtree yields no
+    /// paths, and every row under it would look deleted.
+    #[test]
+    fn an_incomplete_walk_keeps_rows_for_files_it_did_not_see() {
+        assert!(carries_forward(false, Some("aaa"), None, true));
+        assert!(carries_forward(false, None, None, true));
+        // Seen files are still judged on their bytes: an incomplete walk does
+        // not resurrect a stale version of a file it did read.
+        assert!(!carries_forward(true, Some("aaa"), Some("bbb"), true));
+        assert!(carries_forward(true, Some("aaa"), Some("aaa"), true));
     }
 
     #[tokio::test]
