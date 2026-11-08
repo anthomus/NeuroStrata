@@ -3,6 +3,7 @@ use crate::parser::schema::ParserSchema;
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -38,6 +39,55 @@ fn build_ext_map(schema: &ParserSchema) -> HashMap<String, String> {
 /// cutting here keeps the stored content and the vector describing the same
 /// text instead of letting them drift apart on large definitions.
 const MAX_SYMBOL_CHARS: usize = 4000;
+
+/// Third-party, cache and build directories, excluded even where a repository
+/// does not gitignore them.
+const SKIPPED_DIRS: [&str; 19] = [
+    "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
+    "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__",
+    ".fastembed_cache", ".idea", ".vscode", "coverage",
+];
+
+/// Whether the walk should refuse to descend into `entry`.
+///
+/// Matched on the entry's own name rather than by searching the path string.
+/// The patterns this replaced were built as `/{dir}/`, `{dir}/` and `./{dir}`
+/// and tested against `entry.path().to_string_lossy()`, which is
+/// backslash-separated on Windows: not one of them could match there, so the
+/// whole list was dead code and a Windows host ingested `node_modules`,
+/// `target` and `.venv` while a Linux host did not. One repository produced two
+/// different graphs depending on who walked it.
+///
+/// Naming the component also stops `dist` from matching inside
+/// `redistributable`, which substring searching did.
+fn should_prune(entry: &ignore::DirEntry) -> bool {
+    // The root is the directory the caller asked to ingest. Pruning it would
+    // hand back an empty walk for a checkout that happens to sit in `build`.
+    if entry.depth() == 0 {
+        return false;
+    }
+
+    // Only directories are pruned. A *file* called `out` or `dist` is source
+    // like any other, and the patterns this replaced did not skip one either.
+    if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
+        return false;
+    }
+
+    SKIPPED_DIRS.iter().any(|skipped| entry.file_name() == OsStr::new(skipped))
+}
+
+/// The walk the ingest and its dry run perform.
+///
+/// Built here rather than inline so the tests prune through the same wiring the
+/// ingest does, instead of a copy of it that can drift.
+fn build_walker(dir_path: &Path) -> ignore::Walk {
+    // filter_entry prunes the subtree, so a 183MB node_modules is never walked
+    // at all. Discarding its entries one at a time, as this used to, still had
+    // to enumerate every one of them first.
+    let mut builder = WalkBuilder::new(dir_path);
+    builder.filter_entry(|entry| !should_prune(entry));
+    builder.build()
+}
 
 fn truncate_for_embedding(body: &str) -> String {
     if body.chars().count() <= MAX_SYMBOL_CHARS {
@@ -403,29 +453,7 @@ fn run_producer(
         std::collections::HashMap::new();
     let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    let skipped_dirs = [
-        "node_modules",
-        "target",
-        "vendor",
-        ".venv",
-        "venv",
-        "env",
-        ".env",
-        "dist",
-        "build",
-        "out",
-        ".dolt",
-        ".git",
-        ".next",
-        ".nuxt",
-        "__pycache__",
-        ".fastembed_cache",
-        ".idea",
-        ".vscode",
-        "coverage",
-    ];
-
-    let walker = WalkBuilder::new(&dir_path).build();
+    let walker = build_walker(&dir_path);
 
     let mut unreadable = 0usize;
 
@@ -443,23 +471,6 @@ fn run_producer(
 
         let path = entry.path();
         let path_str = path.to_string_lossy();
-
-        let mut should_skip = false;
-        for skip_dir in &skipped_dirs {
-            let skip_pattern = format!("/{}/", skip_dir);
-            let skip_start = format!("{}/", skip_dir);
-            let skip_exact = format!("./{}", skip_dir);
-            if path_str.contains(&skip_pattern)
-                || path_str.starts_with(&skip_start)
-                || path_str == skip_exact
-            {
-                should_skip = true;
-                break;
-            }
-        }
-        if should_skip {
-            continue;
-        }
 
         let abs_path = if path.is_absolute() {
             path.to_string_lossy().to_string()
@@ -2329,6 +2340,106 @@ use super::x;"#;
         std::fs::write(tmp.join("hello.rs"), "pub fn hello_new() {}").unwrap();
         ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("modified");
     }
+
+    fn walk_temp_tree(name: &str) -> std::path::PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!("neurostrata-walk-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        root
+    }
+
+    fn walk_touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("file has a parent")).expect("create parents");
+        std::fs::write(path, b"fn main() {}\n").expect("write file");
+    }
+
+    /// Walk paths relative to the root, with separators normalised, so the
+    /// assertions below read the same on Windows as on Linux.
+    fn walked(root: &Path) -> Vec<String> {
+        build_walker(root)
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.path().strip_prefix(root).map(|p| p.to_path_buf()).ok())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
+    /// The skip list was built as "/{dir}/", "{dir}/" and "./{dir}" and tested
+    /// against the path string. That string is backslash-separated on Windows,
+    /// so not one pattern could match: Windows ingested node_modules and target
+    /// while Linux did not, and one repository produced two different graphs
+    /// depending on which host walked it.
+    #[test]
+    fn vendor_and_build_directories_are_pruned_on_every_platform() {
+        let root = walk_temp_tree("prunes");
+        walk_touch(&root.join("src/main.rs"));
+        walk_touch(&root.join("node_modules/pkg/index.js"));
+        walk_touch(&root.join("target/debug/artifact.rs"));
+
+        let found = walked(&root);
+
+        assert!(found.contains(&"src/main.rs".to_string()), "project source must survive: {:?}", found);
+        assert!(
+            !found.iter().any(|p| p.starts_with("node_modules")),
+            "node_modules must be pruned, including its own node: {:?}",
+            found
+        );
+        assert!(
+            !found.iter().any(|p| p.starts_with("target")),
+            "target must be pruned, including its own node: {:?}",
+            found
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Searching for "dist" anywhere in the path took "redistributable" with
+    /// it. Naming the component does not.
+    #[test]
+    fn a_name_that_merely_contains_a_skipped_name_survives() {
+        let root = walk_temp_tree("substring");
+        walk_touch(&root.join("redistributable/thing.rs"));
+        walk_touch(&root.join("outer/keep.rs"));
+
+        let found = walked(&root);
+
+        assert!(found.contains(&"redistributable/thing.rs".to_string()), "{:?}", found);
+        assert!(found.contains(&"outer/keep.rs".to_string()), "{:?}", found);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Pruning on name alone would hand back an empty walk for a checkout that
+    /// happens to sit in a directory called "build".
+    #[test]
+    fn the_walk_root_is_never_pruned_by_its_own_name() {
+        let parent = walk_temp_tree("rootname");
+        let root = parent.join("build");
+        walk_touch(&root.join("main.rs"));
+
+        let found = walked(&root);
+
+        assert!(found.contains(&"main.rs".to_string()), "root must be walked: {:?}", found);
+
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// Only directories are pruned. A file called `out` is source like any
+    /// other, and the patterns this replaced did not skip one either.
+    #[test]
+    fn a_file_sharing_a_skipped_directory_name_is_still_walked() {
+        let root = walk_temp_tree("filename");
+        walk_touch(&root.join("out"));
+        walk_touch(&root.join("src/keep.rs"));
+
+        let found = walked(&root);
+
+        assert!(found.contains(&"out".to_string()), "{:?}", found);
+        assert!(found.contains(&"src/keep.rs".to_string()), "{:?}", found);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 /// Dry-run ingest: walk the tree and produce a report without writing or
 /// downloading anything.
@@ -2338,12 +2449,6 @@ pub async fn dry_run_directory(
     mode: &str,
 ) -> anyhow::Result<String> {
     let ext_to_lang = build_ext_map(schema);
-    let skipped_dirs = [
-        "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
-        "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt",
-        "__pycache__", ".fastembed_cache", ".idea", ".vscode", "coverage",
-    ];
-
     let mut files = 0usize;
     let mut parseable = 0usize;
     let mut symbols = 0usize;
@@ -2360,21 +2465,11 @@ pub async fn dry_run_directory(
     // Pattern: version suffixes in file stem; used after loop too.
     let v_pattern = regex::Regex::new(r"(_v[0-9]+|-v[0-9]+|\.bak$|\.old$|_old$|_copy$)").unwrap();
 
-    let walker = ignore::WalkBuilder::new(dir_path).build();
+    let walker = build_walker(dir_path);
     for result in walker {
         let entry = match result { Ok(e) => e, Err(e) => { tracing::warn!("dry_run walk entry error: {e}"); continue; } };
         let path = entry.path();
         let path_str = path.to_string_lossy();
-        let mut should_skip = false;
-        for skip_dir in &skipped_dirs {
-            let skip_pattern = format!("/{}/", skip_dir);
-            let skip_start = format!("{}/", skip_dir);
-            let skip_exact = format!("./{}", skip_dir);
-            if path_str.contains(&skip_pattern) || path_str.starts_with(&skip_start) || path_str == skip_exact {
-                should_skip = true; break;
-            }
-        }
-        if should_skip { continue; }
         let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
         if !is_file { continue; }
         files += 1;
