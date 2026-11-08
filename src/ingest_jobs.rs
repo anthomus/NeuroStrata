@@ -145,13 +145,26 @@ impl IngestJobs {
         Self::default()
     }
 
-    /// Runs the ingest and waits for it, or waits for the one already running.
+    /// What the last walk of this namespace is doing, or did.
     ///
-    /// Two walks over one namespace must never overlap: ingestion begins by
-    /// deleting every row it is about to rebuild, so the second would clear
-    /// what the first had done. A caller that gave up and retried used to
-    /// produce exactly that pair.
-    pub async fn run(
+    /// `None` when this daemon has not been asked to ingest that namespace
+    /// since it started -- which is not the same as never having ingested it,
+    /// since the registry lives in memory and the graph lives on disk.
+    pub fn progress(&self, namespace: &str) -> Option<IngestProgress> {
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(namespace)
+            .map(|rx| rx.borrow().clone())
+    }
+
+    /// Starts the walk without waiting for it, and reports what it is doing.
+    ///
+    /// The caller gets an answer in the time it takes to register a job rather
+    /// than in the time it takes to embed a repository, and reads `progress`
+    /// afterwards. Attaching to a walk already under way is the same operation:
+    /// what comes back describes the live one either way.
+    pub async fn start(
         self: &Arc<Self>,
         namespace: &str,
         dir: &str,
@@ -159,6 +172,29 @@ impl IngestJobs {
         embedder: Arc<dyn Embedder>,
         vector_store: Arc<dyn VectorStore>,
     ) -> anyhow::Result<IngestProgress> {
+        let rx = self
+            .start_or_attach(namespace, dir, schema, embedder, vector_store)
+            .await?;
+        let progress = rx.borrow().clone();
+        Ok(progress)
+    }
+
+    /// Registers a walk for this namespace, or hands back the one already
+    /// running. The single place a walk is spawned, so `start` and `run` cannot
+    /// disagree about when a second one is allowed.
+    ///
+    /// Two walks over one namespace must never overlap: they would each be
+    /// rewriting the same rows, and the orphan sweep at the end of one would
+    /// see the other's half-finished tree. A caller that gave up and retried
+    /// used to produce exactly that pair.
+    async fn start_or_attach(
+        self: &Arc<Self>,
+        namespace: &str,
+        dir: &str,
+        schema: ParserSchema,
+        embedder: Arc<dyn Embedder>,
+        vector_store: Arc<dyn VectorStore>,
+    ) -> anyhow::Result<watch::Receiver<IngestProgress>> {
         // Canonicalize the incoming root before acquiring the jobs registry
         // mutex. NFS mounts or slow filesystems would stall every other job
         // if this happened inside the critical section.
@@ -173,7 +209,7 @@ impl IngestJobs {
             .map_err(|e| anyhow::anyhow!("failed to resolve directory: {}", e))?
         };
 
-        let mut rx = {
+        let rx = {
             let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
 
             if let Some(running) = attach_to_running(&jobs, namespace, &canonical_dir)? {
@@ -218,6 +254,22 @@ impl IngestJobs {
                 rx
             }
         };
+
+        Ok(rx)
+    }
+
+    /// Runs the ingest and waits for it, or waits for the one already running.
+    pub async fn run(
+        self: &Arc<Self>,
+        namespace: &str,
+        dir: &str,
+        schema: ParserSchema,
+        embedder: Arc<dyn Embedder>,
+        vector_store: Arc<dyn VectorStore>,
+    ) -> anyhow::Result<IngestProgress> {
+        let mut rx = self
+            .start_or_attach(namespace, dir, schema, embedder, vector_store)
+            .await?;
 
         loop {
             // Cloned out rather than held: the borrow guard must not be alive
@@ -306,6 +358,42 @@ mod tests {
         // Finished, so the next caller starts a walk rather than attaching to
         // one that has already ended.
         assert!(!running(&jobs));
+    }
+
+    /// The registry lives in memory. A namespace this daemon has not been asked
+    /// to ingest has no job, which a caller must be able to tell apart from one
+    /// that is still running -- the route answers 404 on this.
+    #[test]
+    fn a_namespace_with_no_job_has_no_progress() {
+        let jobs = IngestJobs::new();
+
+        assert!(jobs.progress("never-ingested").is_none());
+    }
+
+    /// What a caller polls instead of holding the connection open: the live
+    /// counters, readable while the walk is still going.
+    #[test]
+    fn progress_reads_the_live_walk() {
+        let jobs = IngestJobs::new();
+        let (tx, rx) = watch::channel(progress(IngestState::Running));
+        jobs.jobs.lock().unwrap().insert("ns".to_string(), rx);
+
+        tx.send_modify(|progress| {
+            progress.files_ingested = 12;
+            progress.symbols_ingested = 340;
+        });
+
+        let seen = jobs.progress("ns").expect("the job was just inserted");
+        assert_eq!(seen.state, IngestState::Running);
+        assert_eq!(seen.files_ingested, 12);
+        assert_eq!(seen.symbols_ingested, 340);
+
+        // Still readable once it ends: that is how a poller learns it finished.
+        tx.send_modify(|progress| progress.state = IngestState::Finished);
+        assert_eq!(
+            jobs.progress("ns").expect("the entry outlives its walk").state,
+            IngestState::Finished
+        );
     }
 
     /// Progress is what a caller reads instead of waiting, so the counts have

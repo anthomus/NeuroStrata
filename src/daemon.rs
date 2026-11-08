@@ -386,6 +386,19 @@ struct AppState {
 struct IngestReq {
     dir: String,
     namespace: String,
+    /// Whether to hold the response until the walk finishes.
+    ///
+    /// Absent means yes, which is what the CLI wants: `neurostrata-mcp ingest`
+    /// is a command that should not return before it has done the thing. A GUI
+    /// passes false and polls `/ingest/status` instead, so its window is not
+    /// hostage to the size of the repository.
+    #[serde(default)]
+    wait: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct IngestStatusQuery {
+    namespace: String,
 }
 
 #[derive(Deserialize)]
@@ -1032,6 +1045,7 @@ pub(crate) async fn start_daemon_on(
         .route("/info", get(handle_info))
         .route("/graph", get(handle_get_graph))
         .route("/ingest", post(handle_ingest))
+        .route("/ingest/status", get(handle_ingest_status))
         .route("/delete", post(handle_delete))
         .route("/memory/archive", post(handle_memory_archive))
         .route("/edit", post(handle_edit))
@@ -1331,17 +1345,36 @@ async fn handle_ingest(
 
     // The walk belongs to the registry, not to this request: a client that
     // disconnects no longer takes it down half-finished (bead neurostrata-7ej).
-    let progress = state
-        .ingests
-        .run(
-            &namespace,
-            &dir,
-            schema,
-            state.embedder.clone(),
-            state.vector_store.clone(),
-        )
-        .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let progress = if req.wait.unwrap_or(true) {
+        state
+            .ingests
+            .run(
+                &namespace,
+                &dir,
+                schema,
+                state.embedder.clone(),
+                state.vector_store.clone(),
+            )
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        // Returns as soon as the job is registered. Every caller of the waiting
+        // form needs a timeout longer than the largest repository it will ever
+        // see, and those numbers exist only because the request could not come
+        // back early. Refused only when the namespace is already ingesting
+        // another directory.
+        state
+            .ingests
+            .start(
+                &namespace,
+                &dir,
+                schema,
+                state.embedder.clone(),
+                state.vector_store.clone(),
+            )
+            .await
+            .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))?
+    };
 
     let progress_value = serde_json::to_value(&progress).map_err(|e| {
         (
@@ -1350,6 +1383,31 @@ async fn handle_ingest(
         )
     })?;
     Ok(Json(progress_value))
+}
+
+/// What the last walk of a namespace is doing, for a caller that started one
+/// without waiting.
+///
+/// 404 rather than an empty body when nothing is known: the registry is in
+/// memory, so a namespace ingested by a previous daemon has a graph on disk and
+/// no job here, and a caller must be able to tell that from "still running".
+async fn handle_ingest_status(
+    State(state): State<AppState>,
+    Query(query): Query<IngestStatusQuery>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    // Matches the folded name the ingest itself resolved to, or a GUI asking
+    // about `pyworkflow` would never find the job it started.
+    let namespace = crate::server::resolve_namespace(&state.vector_store, &query.namespace).await;
+
+    match state.ingests.progress(&namespace) {
+        Some(progress) => Ok(Json(serde_json::to_value(progress).unwrap_or_else(
+            |_| serde_json::json!({ "state": "unknown" }),
+        ))),
+        None => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            format!("no ingest of namespace '{}' has run since this daemon started", namespace),
+        )),
+    }
 }
 
 /// Backup and restore run here rather than in the CLI so they work against a
@@ -3670,6 +3728,7 @@ impl crate::traits::AsAny for RecordingStore {
             Json(IngestReq {
                 dir: external_tree.display().to_string(),
                 namespace: "t2r-ingest-allow".to_string(),
+                wait: None,
             }),
         )
         .await
@@ -3679,6 +3738,49 @@ impl crate::traits::AsAny for RecordingStore {
             "the handler answers with the ingest progress: {}",
             out.0
         );
+    }
+
+    /// `wait: false` registers the job and answers at once, and the status
+    /// route then knows the namespace. A namespace nobody has ingested since the
+    /// daemon started answers 404, which a poller must be able to tell apart
+    /// from one that is still running.
+    #[tokio::test]
+    async fn a_nowait_ingest_registers_a_job_the_status_route_can_find() {
+        let root = scratch_root("nowait-ingest-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let tree = scratch_tree("nowait-ingest-tree");
+        let state = caller_path_state(&root, vec![tree.clone()]).await;
+
+        let (missing, _) = handle_ingest_status(
+            State(state.clone()),
+            Query(IngestStatusQuery { namespace: "nowait-never".to_string() }),
+        )
+        .await
+        .expect_err("a namespace with no job is 404");
+        assert_eq!(missing, axum::http::StatusCode::NOT_FOUND);
+
+        let started = handle_ingest(
+            State(state.clone()),
+            Json(IngestReq {
+                dir: tree.display().to_string(),
+                namespace: "nowait-ingest".to_string(),
+                wait: Some(false),
+            }),
+        )
+        .await
+        .expect("the job is registered");
+        assert!(started.0.get("state").is_some(), "progress comes back: {}", started.0);
+
+        let seen = handle_ingest_status(
+            State(state.clone()),
+            Query(IngestStatusQuery { namespace: "nowait-ingest".to_string() }),
+        )
+        .await
+        .expect("the status route finds the job it just started");
+        assert!(seen.0.get("state").is_some(), "status carries a state: {}", seen.0);
+
+        // Let the detached walk finish before the temp tree goes away.
+        state.ingests.wait_idle(std::time::Duration::from_secs(60)).await;
     }
 }
 
