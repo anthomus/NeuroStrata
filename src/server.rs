@@ -100,9 +100,12 @@ pub async fn process_mcp_request(
                 })
             })
         }
-        "notifications/initialized" => {
-            serde_json::json!({})
-        }
+        // A notification carries no id and gets no reply. The empty object this
+        // used to return was not nothing: it reached the client as a bare `{}`
+        // line, which is not a JSON-RPC message, and every session dropped its
+        // connection on it at 0s uptime. Callers must treat `Value::Null` as
+        // "write nothing" -- see `is_answer`.
+        "notifications/initialized" => serde_json::Value::Null,
         "tools/list" => {
             let mut result = serde_json::json!({
                 "tools": [
@@ -1810,6 +1813,29 @@ async fn answer_with_error(
     }
 }
 
+/// Whether a body from the daemon is a message to hand to the client.
+///
+/// Anything that is not a JSON-RPC message is not one, and writing it anyway is
+/// worse than writing nothing: the client validates every line it reads and
+/// closes the connection on one it cannot parse. Empty is the daemon declining
+/// to answer a notification; `{}` and `null` are the older ways it said the
+/// same thing, and both used to be forwarded.
+fn is_answer(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Object(fields)) => !fields.is_empty(),
+        Ok(Value::Null) => false,
+        // Not JSON at all, or not an object. Neither is a JSON-RPC message, but
+        // dropping it silently would hide a daemon returning something
+        // unexpected, so it goes on: the client's own error names what arrived.
+        _ => true,
+    }
+}
+
 /// The proxy's HTTP client. It is deliberately credential-free: it must
 /// not carry the daemon bearer token in its default headers, because a
 /// client built once, at proxy startup, would freeze whatever the token
@@ -1950,7 +1976,7 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
                     Ok(text) if status.is_success() => {
                         // A notification the daemon chose not to answer stays
                         // unanswered here too.
-                        if !text.is_empty() {
+                        if is_answer(&text) {
                             write_message(&mut writer, &text).await?;
                         }
                     }
@@ -11856,6 +11882,53 @@ mod tests {
             "expected the canonical no-mesh answer, got: {text}"
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The bug this guards: `{}` went down the pipe after every
+    /// notifications/initialized, the client could not parse it as a JSON-RPC
+    /// message, and the connection dropped at 0s uptime in every session.
+    #[test]
+    fn an_empty_object_is_not_an_answer() {
+        assert!(!is_answer("{}"));
+        assert!(!is_answer("  {}  \n"));
+        assert!(!is_answer(""));
+        assert!(!is_answer("null"));
+    }
+
+    /// The other half: a real reply must still be forwarded. A proxy that
+    /// swallows one leaves the client waiting on an id that never returns.
+    #[test]
+    fn a_real_reply_is_still_forwarded() {
+        assert!(is_answer(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#));
+        assert!(is_answer(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"x"}}"#));
+    }
+
+    /// Something unexpected is passed on rather than hidden: the client's own
+    /// error then names what actually arrived.
+    #[test]
+    fn an_unparseable_body_is_not_swallowed() {
+        assert!(is_answer("daemon panicked"));
+        assert!(is_answer("[1,2,3]"));
+    }
+
+    /// A notification is answered with nothing at all -- the source of the `{}`
+    /// that reached the client.
+    #[tokio::test]
+    async fn a_notification_produces_no_message() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: "notifications/initialized".to_string(),
+            params: None,
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+
+        assert!(response.is_null(), "a notification must produce nothing, got {response}");
+        assert!(!is_answer(&response.to_string()), "and nothing must not be written");
     }
 
     /// Every tool the surface exposes, in the order tools/list returns them.
