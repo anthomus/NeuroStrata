@@ -12,7 +12,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const MB: u64 = 1024 * 1024;
 const DEFAULT_THRESHOLD_MB: u64 = 50;
@@ -20,7 +20,12 @@ const DEFAULT_THRESHOLD_MB: u64 = 50;
 /// previous file as `memory-growth.log.1`.
 const MAX_LOG_BYTES: u64 = 4 * MB;
 
+/// Seconds between time-series rows when the environment does not say.
+const DEFAULT_SAMPLE_SECS: u64 = 600;
+
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Tool calls begun since the last time-series row.
+static CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sample {
@@ -164,10 +169,8 @@ fn grew(before: Option<u64>, after: Option<u64>, threshold_mb: u64) -> bool {
 
 fn line(tool: &str, namespace: Option<&str>, before: Sample, after: Sample, in_flight: usize) -> String {
     serde_json::json!({
-        "ts": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        "kind": "call",
+        "ts": now_secs(),
         "tool": tool,
         "namespace": namespace,
         "rss_before_mb": mb(before.rss_bytes),
@@ -180,6 +183,61 @@ fn line(tool: &str, namespace: Option<&str>, before: Sample, after: Sample, in_f
         "in_flight": in_flight,
     })
     .to_string()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One row of the time series: the process's memory at a moment, and how many
+/// tool calls ran since the previous row. Slow growth that no single call
+/// accounts for shows up here and nowhere else.
+fn sample_line(s: Sample, calls_since_last: u64, in_flight: usize) -> String {
+    serde_json::json!({
+        "kind": "sample",
+        "ts": now_secs(),
+        "rss_mb": mb(s.rss_bytes),
+        "peak_rss_mb": mb(s.peak_bytes),
+        "calls_since_last": calls_since_last,
+        "in_flight": in_flight,
+    })
+    .to_string()
+}
+
+fn sample_interval() -> Option<std::time::Duration> {
+    let secs = std::env::var("NEUROSTRATA_RSS_SAMPLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SAMPLE_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Starts the time series: one row now, then one every
+/// `NEUROSTRATA_RSS_SAMPLE_SECS` (default 600; 0 turns it off) until `stop`
+/// changes. The caller awaits the returned handle on shutdown.
+pub fn spawn_sampler(stop: tokio::sync::watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
+    match sample_interval() {
+        Some(every) => tokio::spawn(run_sampler(log_path(), every, stop)),
+        None => tokio::spawn(async {}),
+    }
+}
+
+async fn run_sampler(
+    path: PathBuf,
+    every: std::time::Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let calls = CALLS.swap(0, Ordering::Relaxed);
+        append(&path, &sample_line(sample(), calls, IN_FLIGHT.load(Ordering::SeqCst)));
+        tokio::select! {
+            _ = tokio::time::sleep(every) => {}
+            _ = stop.changed() => break,
+        }
+    }
 }
 
 fn append(path: &std::path::Path, line: &str) {
@@ -207,6 +265,7 @@ pub struct CallGuard {
 impl CallGuard {
     pub fn begin(tool: &str, namespace: Option<&str>) -> Self {
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        CALLS.fetch_add(1, Ordering::Relaxed);
         Self {
             tool: tool.to_string(),
             namespace: namespace.map(str::to_string),
@@ -295,6 +354,60 @@ mod tests {
         assert!(p.get("rss_mb").is_some() && p.get("peak_rss_mb").is_some());
         assert!(p["growth_log"].as_str().unwrap().ends_with("memory-growth.log"));
         assert!(p["growth_log_threshold_mb"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn a_sample_row_is_strict_json_with_the_call_count() {
+        let s = Sample { rss_bytes: Some(1800 * MB), peak_bytes: Some(2100 * MB) };
+        let v: serde_json::Value = serde_json::from_str(&sample_line(s, 7, 1)).unwrap();
+        assert_eq!(v["kind"], "sample");
+        assert_eq!(v["rss_mb"], 1800);
+        assert_eq!(v["peak_rss_mb"], 2100);
+        assert_eq!(v["calls_since_last"], 7);
+        let none: serde_json::Value = serde_json::from_str(&sample_line(Sample::default(), 0, 0)).unwrap();
+        assert!(none["rss_mb"].is_null(), "an unknown figure is null, not zero");
+    }
+
+    #[tokio::test]
+    async fn the_sampler_writes_rows_on_a_timer_and_stops_when_told() {
+        let dir = std::env::temp_dir().join(format!("procmem-sampler-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory-growth.log");
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_sampler(path.clone(), std::time::Duration::from_millis(40), rx));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("the sampler stops promptly")
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<serde_json::Value> =
+            text.lines().map(|l| serde_json::from_str(l).expect("strict JSON")).collect();
+        assert!(rows.len() >= 3, "a row at once and one per interval, got {}", rows.len());
+        assert!(rows.iter().all(|r| r["kind"] == "sample"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cost of the instrumentation itself, not a correctness test. Run:
+    ///   cargo test --bin neurostrata-mcp overhead_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn overhead_probe() {
+        let n = 20_000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(sample());
+        }
+        let per_sample = t.elapsed() / n;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let g = CallGuard::begin("neurostrata_search_memory", Some("example-project"));
+            std::hint::black_box(&g);
+        }
+        let per_guard = t.elapsed() / n;
+        println!("OVERHEAD sample() = {per_sample:?}, whole guard (begin + drop) = {per_guard:?}");
     }
 
     #[test]
