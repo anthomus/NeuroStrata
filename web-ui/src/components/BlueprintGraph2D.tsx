@@ -1,6 +1,7 @@
 import { useRef, useEffect } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import type { ForceGraphMethods, NodeObject, LinkObject } from 'react-force-graph-2d';
+import { useElementSize } from '../useElementSize';
 import type { GraphData, MemoryNode, MemoryLink } from '../types';
 
 interface Props {
@@ -33,6 +34,7 @@ if (typeof Path2D !== 'undefined') {
 
 export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeClick, onLinkClick }) => {
   const fgRef = useRef<ForceGraphMethods<NodeObject<MemoryNode>, LinkObject<MemoryNode, MemoryLink>> | undefined>(undefined);
+  const { ref: sizeRef, width, height } = useElementSize();
 
   useEffect(() => {
     if (fgRef.current) {
@@ -80,9 +82,12 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
   }, [selectedNode, data]);
 
   return (
-    <div className="absolute inset-0 bg-[#0a192f] z-0" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px)', backgroundSize: '20px 20px' }}>
+    <div ref={sizeRef} className="absolute inset-0 bg-[#0a192f] z-0" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px)', backgroundSize: '20px 20px' }}>
+      {width > 0 && height > 0 && (
       <ForceGraph2D
         ref={fgRef}
+        width={width}
+        height={height}
         graphData={data}
         backgroundColor="transparent"
         nodeCanvasObject={(node, ctx, globalScale) => {
@@ -142,6 +147,7 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
         onLinkClick={(l) => onLinkClick(l as MemoryLink)}
       />
+      )}
     </div>
   );
 };
