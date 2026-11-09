@@ -5601,6 +5601,28 @@ impl VectorStore for LadybugStore {
         Ok(outcome.results)
     }
 
+    /// # WARNING: do not "simplify" this into one Cypher distance query
+    ///
+    /// The obvious version, `MATCH (m:Memory) WHERE ... RETURN
+    /// array_distance(m.embedding, [..])`, or the same with
+    /// `WHERE m.id IN [...]`, makes the engine read the Memory table's whole
+    /// embedding column into the buffer pool, whatever filter it carries. On
+    /// the live 739 MB database that cost +296 MB for a namespace with three
+    /// matching rows and +120 MB for one with none, on every guard_validate,
+    /// which runs before every edit. (The cause is inferred from the
+    /// measurements; the engine's query plan was not inspected.)
+    ///
+    /// This version avoids it in three steps: list the qualifying ids without
+    /// touching the embedding column (and stop if there are none), read each
+    /// row by a keyed `m.id = '...'` lookup, rank the few rows here. Measured
+    /// on a copy of the live db: 225 to 223 MB and 119 ms, against 224 to
+    /// roughly 500-524 MB and 0.8 to 1.3 s for the single query.
+    ///
+    /// Ranking the keyed rows in the engine instead (`array_distance` in the
+    /// per-row query) also stays small (+34 MB) but took about 2 s for 48
+    /// rows against 191 ms here, and the Edit hook times out at 5 s.
+    ///
+    /// Full numbers, probes and how to rerun them: docs/ops/memory-footprint.md
     async fn search_by_types(
         &self,
         namespace: &str,
