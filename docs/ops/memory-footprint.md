@@ -179,6 +179,23 @@ The first-call figure is the buffer pool filling and is the same for every query
 
 Still listing the whole namespace, because each needs more than the task or pinned rows: `task_complete` (looks for an extraction edge among all memories), id allocation in `task_create`, `gate::run`, the `global` namespace in `collect_golden_rules`, and several `server.rs` handlers.
 
+### 3.10 Ingest read the whole namespace twice to use one generation (`task_list_variants_probe`)
+
+`ingest_directory` reads the previous generation twice: once to decide whether anything changed (file hashes, version stamps, node paths) and once to carry unchanged rows forward. Both reads called `list(ns, None, None)` and then threw away every row not in that generation. `list` returns each reachable row with its full text, and it also returns every row written before generations existed (their ids have no generation segment).
+
+Ingest now calls `VectorStore::generation_summary(ns, generation)`. `LadybugStore` narrows by id prefix in the engine and returns only `id`, `memory_type`, `location`, `file_sha256` and `ingest_version` per row (`GenerationRow`); it never fetches `content` and drops each row's metadata after reading those fields. It applies the same reachability rule as `list` (`ActiveGenerations::reaches`). The default implementation lists the namespace, as before, so other stores behave as they did.
+
+One process per variant, on a copy of the database, the namespace holding 7,190 rows in its active generation:
+
+| Read | Rows returned | First call | Each later call | Peak |
+|---|---|---|---|---|
+| `list(ns, None, None)` (what ingest did, per read) | 8,288 | +271 MB | +98 MB | 340 MB |
+| `generation_summary(ns, active generation)` | 7,190 | +133 to +135 MB | +1 to +3 MB | 188 to 206 MB |
+
+The first call is the buffer pool filling and is the same for every query. A second namespace of 34,382 rows was written before generations: none of its ids are generation-scoped. Ingest does not read it at all today (`prev_gen` is 0), and after its first generation ingest the old code would have listed those rows on every later ingest; the new read never fetches them because the id prefix excludes them. That part is reasoned from the ids, not measured end to end.
+
+Not measured: a whole `ingest_directory` run before and after. The per-read figures above are what changed. The embedder (about 1 GB to load) is still the larger share of an ingest (section 3.6).
+
 ---
 
 ## 4. Not fixed yet
@@ -242,7 +259,8 @@ NS_PROBE_DB=<dir> cargo test --release --bin neurostrata-mcp component_breakdown
 # how long the hygiene repair takes and how long a concurrent writer waits (NS_PROBE_NS is the namespace)
 NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> cargo test --release --bin neurostrata-mcp hygiene_writer_wait_probe -- --ignored --nocapture
 
-# whole-namespace listing against task-only listing: NS_PROBE_VARIANT is all, tasks or pinned
+# whole-namespace listing against narrower reads: NS_PROBE_VARIANT is all, tasks, pinned, ingest_nodes,
+# generation_summary (what ingest reads) or shape (row counts by type and generation, no content)
 NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> NS_PROBE_VARIANT=tasks cargo test --release --bin neurostrata-mcp task_list_variants_probe -- --ignored --nocapture
 ```
 

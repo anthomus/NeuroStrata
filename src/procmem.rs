@@ -1104,6 +1104,52 @@ mod tests {
                 Ok(Vec::new())
             } else if variant == "tasks" {
                 store.list(&ns, None, Some("task")).await
+            } else if variant == "shape" {
+                // Counts only: which row types a namespace holds, and how many
+                // carry a generation-scoped id.
+                let rows = store.list(&ns, None, None).await.expect("list");
+                let mut by_type: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
+                let mut gens: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+                for r in &rows {
+                    let scoped = crate::parser::ingest::split_scoped_id(&r.id);
+                    let e = by_type.entry(r.payload.memory_type.clone()).or_insert((0, 0));
+                    e.0 += 1;
+                    if let Some((_, g, _)) = scoped {
+                        e.1 += 1;
+                        *gens.entry(g).or_insert(0) += 1;
+                    }
+                }
+                for (t, (n, scoped)) in &by_type {
+                    println!("TASKLIST shape | type {t:<14} rows {n:>6} scoped {scoped:>6}");
+                }
+                println!("TASKLIST shape | scoped rows per generation {gens:?}");
+                Ok(Vec::new())
+            } else if variant == "generation_summary" {
+                // What ingest reads now: one generation, slim rows (bead
+                // neurostrata-lyrw). The generation is the highest one among
+                // the directory rows `list` returns.
+                let dirs = store.list(&ns, None, Some("directory")).await.expect("list dirs");
+                let Some(gen) = dirs
+                    .iter()
+                    .filter_map(|r| crate::parser::ingest::split_scoped_id(&r.id).map(|x| x.1))
+                    .max()
+                else {
+                    // Rows written before generations have no scoped ids, and
+                    // ingest never reads them through this path.
+                    println!("TASKLIST generation_summary | no generation-scoped directory rows");
+                    return;
+                };
+                let rows = store.generation_summary(&ns, gen).await.expect("summary");
+                println!("TASKLIST generation_summary | generation {gen} rows {}", rows.len());
+                Ok(Vec::new())
+            } else if variant == "ingest_nodes" {
+                // The rows ingest's first pass actually reads: directory, file
+                // and markdown nodes (bead neurostrata-lyrw).
+                let mut rows = Vec::new();
+                for t in ["directory", "file", "markdown"] {
+                    rows.extend(store.list(&ns, None, Some(t)).await.expect("list by type"));
+                }
+                Ok(rows)
             } else {
                 store.list(&ns, None, None).await
             }
