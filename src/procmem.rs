@@ -8,7 +8,10 @@
 //! of normal use that file names the calls that drive growth.
 //!
 //! Calls run concurrently, so a line records `in_flight`: when it is above 1,
-//! the growth may belong to a neighbouring call.
+//! the growth may belong to a neighboring call and the line says
+//! `"approximate": true`.
+//!
+//! On by default; `NEUROSTRATA_MEMLOG=0` turns off the log and the sampler.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -146,6 +149,16 @@ pub fn status_with_process_memory<T: serde::Serialize>(status: &T) -> String {
     value.to_string()
 }
 
+/// `NEUROSTRATA_MEMLOG=0` (or `off`/`false`) turns off the growth log and the
+/// sampler. The resident figure in `storage_status` stays: it is one syscall
+/// and has nothing to switch.
+fn log_enabled() -> bool {
+    !matches!(
+        std::env::var("NEUROSTRATA_MEMLOG").ok().as_deref().map(str::trim),
+        Some("0") | Some("off") | Some("false")
+    )
+}
+
 fn threshold_mb() -> u64 {
     std::env::var("NEUROSTRATA_RSS_LOG_MB")
         .ok()
@@ -181,6 +194,8 @@ fn line(tool: &str, namespace: Option<&str>, before: Sample, after: Sample, in_f
         },
         "peak_rss_mb": mb(after.peak_bytes),
         "in_flight": in_flight,
+        // Process-wide RSS: a neighboring call may own part of the delta.
+        "approximate": in_flight > 1,
     })
     .to_string()
 }
@@ -219,7 +234,7 @@ fn sample_interval() -> Option<std::time::Duration> {
 /// `NEUROSTRATA_RSS_SAMPLE_SECS` (default 600; 0 turns it off) until `stop`
 /// changes. The caller awaits the returned handle on shutdown.
 pub fn spawn_sampler(stop: tokio::sync::watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
-    match sample_interval() {
+    match sample_interval().filter(|_| log_enabled()) {
         Some(every) => tokio::spawn(run_sampler(log_path(), every, stop)),
         None => tokio::spawn(async {}),
     }
@@ -278,7 +293,7 @@ impl Drop for CallGuard {
     fn drop(&mut self) {
         let in_flight = IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
         let after = sample();
-        if grew(self.before.rss_bytes, after.rss_bytes, threshold_mb()) {
+        if log_enabled() && grew(self.before.rss_bytes, after.rss_bytes, threshold_mb()) {
             append(
                 &log_path(),
                 &line(&self.tool, self.namespace.as_deref(), self.before, after, in_flight),
@@ -321,6 +336,27 @@ mod tests {
         assert_eq!(v["namespace"], "example-project");
         assert_eq!(v["delta_mb"], 300);
         assert_eq!(v["in_flight"], 2);
+    }
+
+    #[test]
+    fn overlapping_calls_are_marked_approximate() {
+        let s = Sample { rss_bytes: Some(MB), peak_bytes: Some(MB) };
+        let solo: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 1)).unwrap();
+        let busy: serde_json::Value = serde_json::from_str(&line("t", None, s, s, 2)).unwrap();
+        assert_eq!(solo["approximate"], false);
+        assert_eq!(busy["approximate"], true);
+    }
+
+    #[test]
+    fn the_memlog_switch_reads_the_environment() {
+        std::env::set_var("NEUROSTRATA_MEMLOG", "0");
+        assert!(!log_enabled());
+        std::env::set_var("NEUROSTRATA_MEMLOG", "off");
+        assert!(!log_enabled());
+        std::env::set_var("NEUROSTRATA_MEMLOG", "1");
+        assert!(log_enabled());
+        std::env::remove_var("NEUROSTRATA_MEMLOG");
+        assert!(log_enabled(), "on by default");
     }
 
     #[test]
