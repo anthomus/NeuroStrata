@@ -541,6 +541,90 @@ mod tests {
         }
     }
 
+    /// Can the engine rank the guard's few rule rows without the memory cost?
+    /// One variant per process, since the page cache never shrinks. Run, once
+    /// per NS_PROBE_VARIANT in rust | eq | eq_ns | in:
+    ///   NS_PROBE_DB=<dir with a COPY of ladybug.db> NS_PROBE_VARIANT=eq \
+    ///   cargo test --release --bin neurostrata-mcp guard_db_rank_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn guard_db_rank_probe() {
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
+        let variant = std::env::var("NS_PROBE_VARIANT").expect("NS_PROBE_VARIANT");
+        let mut last = std::time::Instant::now();
+        let mut report = |step: &str, outcome: String| {
+            let s = sample();
+            println!(
+                "RANK {variant:<6} | {step:<24} | rss {:>5} MB peak {:>5} MB | {:>6} ms | {outcome}",
+                s.rss_bytes.unwrap_or(0) / MB,
+                s.peak_bytes.unwrap_or(0) / MB,
+                last.elapsed().as_millis()
+            );
+            last = std::time::Instant::now();
+        };
+        let store = crate::store::LadybugStore::new(&dir.join("ladybug.db"), 768).expect("open");
+        report("opened", String::new());
+        let query = vec![0.05_f32; 768];
+        let vec_str = format!("[{}]", query.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>().join(","));
+        let variant_c = variant.clone();
+        let outcome = store
+            .with_conn(move |conn| {
+                let mut ids: Vec<String> = Vec::new();
+                for row in conn.query(
+                    "MATCH (m:Memory) WHERE m.namespace = 'NeuroStrata' AND m.memory_type IN ['rule', 'guard_rule'] RETURN m.id",
+                )? {
+                    ids.push(format!("{}", row[0]));
+                }
+                let mut out = format!("{} ids;", ids.len());
+                let mut best: Option<(f32, String)> = None;
+                let mut note = |d: f32, id: &str| {
+                    if best.as_ref().map_or(true, |b| d < b.0) {
+                        best = Some((d, id.to_string()));
+                    }
+                };
+                match variant_c.as_str() {
+                    "in" => {
+                        let list = ids.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+                        let q = format!("MATCH (m:Memory) WHERE m.id IN [{list}] RETURN m.id, array_distance(m.embedding, {vec_str}) AS dist");
+                        for row in conn.query(&q)? {
+                            if let lbug::Value::Float(d) = &row[1] { note(*d, &format!("{}", row[0])); }
+                        }
+                    }
+                    "eq" | "eq_ns" => {
+                        for id in &ids {
+                            let filter = if variant_c == "eq_ns" {
+                                format!("m.namespace = 'NeuroStrata' AND m.id = '{id}'")
+                            } else {
+                                format!("m.id = '{id}'")
+                            };
+                            let q = format!("MATCH (m:Memory) WHERE {filter} RETURN m.id, array_distance(m.embedding, {vec_str}) AS dist");
+                            for row in conn.query(&q)? {
+                                if let lbug::Value::Float(d) = &row[1] { note(*d, &format!("{}", row[0])); }
+                            }
+                        }
+                    }
+                    "rust" => {
+                        for id in &ids {
+                            let q = format!("MATCH (m:Memory) WHERE m.id = '{id}' RETURN m.id, m.embedding");
+                            for row in conn.query(&q)? {
+                                if let lbug::Value::Array(_, v) | lbug::Value::List(_, v) = &row[1] {
+                                    let e: Vec<f32> = v.iter().filter_map(|x| if let lbug::Value::Float(f) = x { Some(*f) } else { None }).collect();
+                                    let d = e.iter().zip(&query).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+                                    note(d, &format!("{}", row[0]));
+                                }
+                            }
+                        }
+                    }
+                    other => panic!("unknown variant {other}"),
+                }
+                out.push_str(&format!(" nearest {:?}", best));
+                Ok(out)
+            })
+            .await
+            .unwrap_or_else(|e| format!("ERROR {e}"));
+        report("ranked", outcome);
+    }
+
     #[test]
     fn the_guard_counts_calls_in_flight() {
         let before = IN_FLIGHT.load(Ordering::SeqCst);
