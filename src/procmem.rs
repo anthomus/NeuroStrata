@@ -625,6 +625,61 @@ mod tests {
         report("ranked", outcome);
     }
 
+    /// How do peak memory and query time trade off against the buffer pool
+    /// cap, on the user-facing search path? One process per cap, on a COPY of
+    /// a database. NS_PROBE_POOL_MB=0 leaves the engine default. Run:
+    ///   NS_PROBE_DB=<dir with a copy of ladybug.db> NS_PROBE_POOL_MB=512 \
+    ///   cargo test --release --bin neurostrata-mcp pool_curve_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn pool_curve_probe() {
+        use crate::traits::VectorStore;
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
+        let pool_mb: u64 = std::env::var("NS_PROBE_POOL_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let path = dir.join("ladybug.db");
+        let store = if pool_mb == 0 {
+            crate::store::LadybugStore::new(&path, 768).expect("open")
+        } else {
+            let cfg = lbug::SystemConfig::default()
+                .buffer_pool_size(pool_mb * MB)
+                .throw_on_wal_replay_failure(true);
+            crate::store::LadybugStore::with_system_config(&path, 768, cfg).expect("open")
+        };
+        let namespaces = store.list_namespaces().await.expect("namespaces");
+        // Deterministic, varied unit-ish vectors so passes do not hit identical pages.
+        let query = |seed: u32| -> Vec<f32> {
+            let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(12_345);
+            (0..768)
+                .map(|_| {
+                    x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((x >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.1
+                })
+                .collect()
+        };
+        let types = vec!["rule".to_string(), "guard_rule".to_string()];
+        let mut errors = 0usize;
+        let mut pass_ms: Vec<u128> = Vec::new();
+        for pass in 0..3u32 {
+            let t = std::time::Instant::now();
+            for (i, ns) in namespaces.iter().enumerate() {
+                let q = query(pass * 31 + i as u32);
+                if store.search(ns, q.clone(), 5, false, false).await.is_err() { errors += 1; }
+                if store.list(ns, None, Some("task")).await.is_err() { errors += 1; }
+                if store.search_by_types(ns, q, 3, &types).await.is_err() { errors += 1; }
+            }
+            pass_ms.push(t.elapsed().as_millis());
+        }
+        let s = sample();
+        println!(
+            "POOLCURVE pool={:>4} MB | peak {:>5} MB rss {:>5} MB | pass ms {:?} | errors {}",
+            pool_mb,
+            s.peak_bytes.unwrap_or(0) / MB,
+            s.rss_bytes.unwrap_or(0) / MB,
+            pass_ms,
+            errors
+        );
+    }
+
     #[test]
     fn the_guard_counts_calls_in_flight() {
         let before = IN_FLIGHT.load(Ordering::SeqCst);

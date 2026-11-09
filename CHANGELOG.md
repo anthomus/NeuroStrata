@@ -12,12 +12,13 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ### Added
 
+- **Buffer pool cap, default 384 MB (`storage_hygiene.buffer_pool_mb`, `NEUROSTRATA_BUFFER_POOL_MB`).** The database engine sized its page cache to most of the machine's memory, so the daemon grew by about 1 GB after one large search and never gave it back. The pool is now capped at 384 MB, which measured as fast as the engine default on a 739 MB store (within noise) with about 100 MB lower peak memory. `0` restores engine sizing, values under 128 MB are raised to 128 MB with a warning, and a pool-full failure names the setting to raise. Older config files without the key get the default. See `docs/ops/memory-footprint.md`, section 3.5, for the full curve.
 - **Daemon memory reporting.** `neurostrata_storage_status` returns a `process` object (`rss_mb`, `peak_rss_mb`). The daemon appends to `~/.config/neurostrata/memory-growth.log` any tool call that grows it by `NEUROSTRATA_RSS_LOG_MB` (default 50) or more, marks lines `"approximate": true` when calls overlapped, and writes a sample row every `NEUROSTRATA_RSS_SAMPLE_SECS` (default 600). `NEUROSTRATA_MEMLOG=0` turns off the log and sampler (`src/procmem.rs`).
 - **Ignored memory probes** (`src/procmem.rs`): `guard_scan_probe`, `guard_db_rank_probe` and `embed_call_probe`, for measuring store reads and embedding cost against a copy of the database.
 
 ### Known
 
-- `neurostrata_task_list` (+197 MB) and `neurostrata_task_claim` (+107 MB) spike the daemon the same way on a fresh start. The engine's buffer pool is uncapped. Both are tracked in `docs/ops/memory-footprint.md`, section 4.
+- `neurostrata_task_list` (+197 MB) and `neurostrata_task_claim` (+107 MB) spike the daemon the same way on a fresh start. Both are tracked in `docs/ops/memory-footprint.md`, section 4.
 
 ---
 
