@@ -4,6 +4,23 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **The pre-edit guard no longer grows the daemon by 100 to 600 MB per call.** `guard_validate` runs before every edit. It listed every row of the namespace to look for tasks (`src/server.rs`), then ranked the whole namespace by vector distance to keep a few rule rows (`src/guard/semantic.rs`). On the live 739 MB database, solo calls grew the daemon by +104 to +286 MB after the first fix and by +239 to +615 MB before it, and the hook timed out at 5 s when the daemon was busy. Now it lists only task rows and calls the new `VectorStore::search_by_types`, which finds the rule ids without touching the embedding column, reads each row by key and ranks in Rust. Measured on the running daemon: +53 MB, then under 50 MB, under 50 MB. **Do not replace `search_by_types` with a single `array_distance` query or an `m.id IN [...]` filter: either one reads the whole embedding column again.** Details, numbers and how to rerun the probes: `docs/ops/memory-footprint.md`.
+
+### Added
+
+- **Daemon memory reporting.** `neurostrata_storage_status` returns a `process` object (`rss_mb`, `peak_rss_mb`). The daemon appends to `~/.config/neurostrata/memory-growth.log` any tool call that grows it by `NEUROSTRATA_RSS_LOG_MB` (default 50) or more, marks lines `"approximate": true` when calls overlapped, and writes a sample row every `NEUROSTRATA_RSS_SAMPLE_SECS` (default 600). `NEUROSTRATA_MEMLOG=0` turns off the log and sampler (`src/procmem.rs`).
+- **Ignored memory probes** (`src/procmem.rs`): `guard_scan_probe`, `guard_db_rank_probe` and `embed_call_probe`, for measuring store reads and embedding cost against a copy of the database.
+
+### Known
+
+- `neurostrata_task_list` (+197 MB) and `neurostrata_task_claim` (+107 MB) spike the daemon the same way on a fresh start. The engine's buffer pool is uncapped. Both are tracked in `docs/ops/memory-footprint.md`, section 4.
+
+---
+
 ## [1.17.2] - 2026-11-10
 
 > The changes below were first published as the **v1.17.1** pre-release (2026-11-10), a tag cut without a version bump, so its binary reports `1.17.0`. 1.17.2 carries the same code with the version and changelog corrected.
@@ -21,6 +38,7 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 - **`lbug` (LadybugDB) 0.20.4 → 0.22.3 (`Cargo.toml`, `Cargo.lock`, `src/store/ladybug.rs`, `src/traits.rs`, `scripts/backup.sh`, `#67`).** Only `lbug` changed version in the lockfile apart from eight Windows-only `windows-sys` edge re-points (0.59.0 → 0.61.2). The binding-layer diff is additive-only for the APIs NeuroStrata calls. This bump makes no claim about the engine abort tracked in LadybugDB #1536.
 - **CI and release builds pin the engine archive (`.github/workflows/ci.yml`, `nightly.yml`, `release.yml`, `#71`).** `LBUG_VERSION: "0.22.3"` is set on every build/test job so the engine downloaded by the lbug build script matches the crate version in `Cargo.lock`; move it whenever the crate version changes.
+
 
 ---
 

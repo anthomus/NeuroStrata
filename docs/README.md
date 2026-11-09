@@ -50,6 +50,7 @@ Welcome to the official documentation for **NeuroStrata** — the single-binary 
 | [**Security & OWASP Mitigations (`ops/security.md`)**](ops/security.md) | Loopback bearer auth, Caller-Path Authority (`J6`), fail-closed secret rejection, query escaping, and non-destructive MCP design. |
 | [**Obsidian & NeuroVault (`ops/obsidian.md`)**](ops/obsidian.md) | *Planned, not implemented.* No `neurostrata_sync_obsidian` tool or `obsidian-sync` command ships today — tracked by task `neurostrata-dlag`. |
 | [**Crash Recovery (`ops/crashes.md`)**](ops/crashes.md) | Crash breadcrumbs (`~/.config/NeuroStrata/data/db/crash/`), lock recovery, and checkpointed backups. |
+| [**Daemon Memory Footprint (`ops/memory-footprint.md`)**](ops/memory-footprint.md) | Why the daemon grew past 3 GB, what a distance query over the Memory table costs, the rule for writing store reads, the `memory-growth.log`, and the probes to measure it again. |
 | [**WAL Recovery Runbook (`runbooks/wal-recovery.md`)**](runbooks/wal-recovery.md) | Step-by-step runbook for inspecting and recovering quarantined LadybugDB write-ahead logs. |
 | [**Release Changelogs (`releases/changelog/`)**](releases/changelog/) | Per-version release notes and historical changelog archive. |
 
