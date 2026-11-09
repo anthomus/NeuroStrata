@@ -214,6 +214,10 @@ async fn search_inner(
                         } else { break; }
                     }
                     let safe_ns = escape_ladybug_string(&namespace);
+                    // MEASURED, NOT KEPT (docs/ops/memory-footprint.md 3.8):
+                    // narrowing this select with lower(location/content/metadata)
+                    // predicates was slower (3.8 s vs 3.1 s) and no lighter, so
+                    // it was reverted. Do not retry without new numbers.
                     let exact_q = format!(
                         "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
                         safe_ns
@@ -301,6 +305,12 @@ async fn search_inner(
                 .collect::<Vec<_>>()
                 .join(", ");
 
+            // MEASURED, NOT KEPT (docs/ops/memory-footprint.md 3.8): ranking on
+            // id and distance only and fetching the winners by id saved memory
+            // for one cold namespace but not across namespaces (the shared pool
+            // bounds the peak); paging embeddings into Rust and ranking there
+            // was ~40x slower. The first search's growth is the buffer pool
+            // filling, not a leak. Re-measure before changing this query.
             let search_query = format!(
                 "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC, m.id ASC LIMIT {}",
                 safe_ns, excluded_types_str, vec_str, fetch_limit
@@ -3954,6 +3964,11 @@ impl LadybugStore {
     ///   3. the namespace's existing edges are read once;
     ///   4. the repair is planned in Rust, and only rows that change and edges
     ///      that are missing are written, a few dozen statements per turn.
+    ///
+    /// Do not go back to one query per row or one turn for the whole pass: the
+    /// first took 193 s and the second blocks every writer past the 30 s
+    /// deadline (docs/ops/memory-footprint.md 3.7). Readers share the writer's
+    /// lock, so keep every turn short.
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         const PAGE: usize = 500;
         const RESOLVE_CHUNK: usize = 50;
