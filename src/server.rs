@@ -4583,11 +4583,28 @@ async fn handle_ingest_directory(
 
 /// What every successful ingest owes the graph afterwards, whether the caller
 /// waited for the walk or not.
-async fn finish_ingest(
+pub(crate) async fn finish_ingest(
     store: &dyn VectorStore,
     namespace: &str,
     bus: Option<Arc<ThalamicBus>>,
 ) {
+    // One pass per namespace at a time. Normalizing lists every row in the
+    // namespace and then rewrites the ones that change, which is a long read
+    // plus a run of writes on a single-writer engine. Two callers attached to
+    // the same walk (an MCP client and the GUI) would otherwise run two such
+    // passes at once, doubling the load for the same result.
+    static PASSES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let pass = {
+        let mut passes = PASSES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        passes.entry(namespace.to_string()).or_default().clone()
+    };
+    let _one_at_a_time = pass.lock().await;
+
     // AC4: normalize resolvable declared targets so every ingest run
     // leaves the namespace edge-canonical, not just bus subscribers.
     // A normalization failure is logged, never silently swallowed.
@@ -8649,6 +8666,23 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    /// Two callers attached to one walk both finish it, one after the other.
+    /// The per-namespace pass lock must serialize them without losing either
+    /// or deadlocking.
+    #[tokio::test]
+    async fn concurrent_finishes_of_one_namespace_both_complete() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::default());
+        let done = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                finish_ingest(&*store, "same-ns", None),
+                finish_ingest(&*store, "same-ns", None),
+                finish_ingest(&*store, "other-ns", None),
+            )
+        })
+        .await;
+        assert!(done.is_ok(), "finish_ingest deadlocked or stalled");
+    }
 
     /// The TriG converter groups canonical N-Quads by graph term, keeps
     /// literal objects (spaces, escapes) intact, and routes quadruples

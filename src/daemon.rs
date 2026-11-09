@@ -1345,8 +1345,13 @@ async fn handle_ingest(
 
     // The walk belongs to the registry, not to this request: a client that
     // disconnects no longer takes it down half-finished (bead neurostrata-7ej).
+    //
+    // Both forms owe the graph what the MCP tool gives it after a walk:
+    // normalized declared targets and the ingest_done pulse. This route
+    // skipped both, so a project ingested from the GUI or the CLI ended with
+    // un-normalized edges that an MCP-driven ingest of the same tree did not.
     let progress = if req.wait.unwrap_or(true) {
-        state
+        let progress = state
             .ingests
             .run(
                 &namespace,
@@ -1356,14 +1361,17 @@ async fn handle_ingest(
                 state.vector_store.clone(),
             )
             .await
-            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        crate::server::finish_ingest(&*state.vector_store, &namespace, Some(state.bus.clone()))
+            .await;
+        progress
     } else {
         // Returns as soon as the job is registered. Every caller of the waiting
         // form needs a timeout longer than the largest repository it will ever
         // see, and those numbers exist only because the request could not come
         // back early. Refused only when the namespace is already ingesting
         // another directory.
-        state
+        let progress = state
             .ingests
             .start(
                 &namespace,
@@ -1373,7 +1381,20 @@ async fn handle_ingest(
                 state.vector_store.clone(),
             )
             .await
-            .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))?
+            .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))?;
+
+        // A waiter attaches to the registered walk (it must not start one) and
+        // does the follow-up work when the walk ends.
+        let ingests = state.ingests.clone();
+        let store = state.vector_store.clone();
+        let bus = state.bus.clone();
+        let waiter_namespace = namespace.clone();
+        tokio::spawn(async move {
+            if let Some(Ok(_)) = ingests.wait_for(&waiter_namespace).await {
+                crate::server::finish_ingest(&*store, &waiter_namespace, Some(bus)).await;
+            }
+        });
+        progress
     };
 
     let progress_value = serde_json::to_value(&progress).map_err(|e| {
