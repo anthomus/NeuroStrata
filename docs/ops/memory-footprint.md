@@ -180,7 +180,7 @@ The daemon also appends JSON lines to `~/.config/neurostrata/memory-growth.log`:
 - `kind: "call"`: a tool call that left the process at least `NEUROSTRATA_RSS_LOG_MB` larger (default 50). It records the tool, the namespace, before and after, and `in_flight`. When another call was running, the line carries `"approximate": true` and the growth may belong to the neighbor.
 - `kind: "sample"`: one row every `NEUROSTRATA_RSS_SAMPLE_SECS` (default 600, 0 turns it off).
 
-`NEUROSTRATA_MEMLOG=0` turns off both the call log and the sampler. The `rss_mb` figure in `storage_status` stays. The log rolls over at 4 MB (`memory-growth.log.1`). The measured cost is about 210 ns per sample and 727 ns per call.
+The call log and the sampler are **off by default**. Turn them on with `neurostrata-mcp daemon --profile`, or with `NEUROSTRATA_PROFILE=1` (also `true` or `on`) for a daemon that an IDE starts on its own. The `rss_mb` figure in `storage_status` and the advice level are always on, because they are one syscall. The log rolls over at 4 MB (`memory-growth.log.1`). The measured cost is about 210 ns per sample and 727 ns per call.
 
 ---
 
