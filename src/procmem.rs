@@ -11,11 +11,13 @@
 //! the growth may belong to a neighboring call and the line says
 //! `"approximate": true`.
 //!
-//! On by default; `NEUROSTRATA_MEMLOG=0` turns off the log and the sampler.
+//! Opt-in: the log and the sampler run only with `neurostrata-mcp daemon
+//! --profile` or `NEUROSTRATA_PROFILE=1`. The resident figure in
+//! `storage_status` and the advice level are always on.
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const MB: u64 = 1024 * 1024;
 const DEFAULT_THRESHOLD_MB: u64 = 50;
@@ -233,7 +235,7 @@ fn advice_json(s: Sample) -> serde_json::Value {
     let (level, reason) = assess(rss, pool_full, watch, act);
     let previous = LAST_LEVEL.swap(level.index(), Ordering::Relaxed);
     // Not in tests: they must not write into the real growth log.
-    if !cfg!(test) && previous != level.index() && log_enabled() {
+    if !cfg!(test) && previous != level.index() && profile_enabled() {
         append(
             &log_path(),
             &serde_json::json!({
@@ -304,14 +306,24 @@ pub fn status_with_process_memory<T: serde::Serialize>(status: &T) -> String {
     value.to_string()
 }
 
-/// `NEUROSTRATA_MEMLOG=0` (or `off`/`false`) turns off the growth log and the
-/// sampler. The resident figure in `storage_status` stays: it is one syscall
-/// and has nothing to switch.
-fn log_enabled() -> bool {
-    !matches!(
-        std::env::var("NEUROSTRATA_MEMLOG").ok().as_deref().map(str::trim),
-        Some("0") | Some("off") | Some("false")
-    )
+/// Set by `neurostrata-mcp daemon --profile`.
+static PROFILE: AtomicBool = AtomicBool::new(false);
+
+/// Turns profiling on for this process: the growth log and the sampler.
+pub fn enable_profile() {
+    PROFILE.store(true, Ordering::Relaxed);
+}
+
+/// The growth log and the sampler are opt-in: `neurostrata-mcp daemon
+/// --profile`, or `NEUROSTRATA_PROFILE=1` (also `true`/`on`) for a daemon that
+/// an IDE starts. The resident figure in `storage_status` and the advice level
+/// stay on: they are one syscall and have nothing to switch.
+fn profile_enabled() -> bool {
+    PROFILE.load(Ordering::Relaxed)
+        || matches!(
+            std::env::var("NEUROSTRATA_PROFILE").ok().as_deref().map(str::trim),
+            Some("1") | Some("true") | Some("on")
+        )
 }
 
 fn threshold_mb() -> u64 {
@@ -389,7 +401,7 @@ fn sample_interval() -> Option<std::time::Duration> {
 /// `NEUROSTRATA_RSS_SAMPLE_SECS` (default 600; 0 turns it off) until `stop`
 /// changes. The caller awaits the returned handle on shutdown.
 pub fn spawn_sampler(stop: tokio::sync::watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
-    match sample_interval().filter(|_| log_enabled()) {
+    match sample_interval().filter(|_| profile_enabled()) {
         Some(every) => tokio::spawn(run_sampler(log_path(), every, stop)),
         None => tokio::spawn(async {}),
     }
@@ -451,7 +463,7 @@ impl Drop for CallGuard {
     fn drop(&mut self) {
         let in_flight = IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
         let after = sample();
-        if log_enabled() && grew(self.before.rss_bytes, after.rss_bytes, threshold_mb()) {
+        if profile_enabled() && grew(self.before.rss_bytes, after.rss_bytes, threshold_mb()) {
             append(
                 &log_path(),
                 &line(&self.tool, self.namespace.as_deref(), self.before, after, in_flight),
@@ -555,15 +567,21 @@ mod tests {
     }
 
     #[test]
-    fn the_memlog_switch_reads_the_environment() {
-        std::env::set_var("NEUROSTRATA_MEMLOG", "0");
-        assert!(!log_enabled());
-        std::env::set_var("NEUROSTRATA_MEMLOG", "off");
-        assert!(!log_enabled());
-        std::env::set_var("NEUROSTRATA_MEMLOG", "1");
-        assert!(log_enabled());
-        std::env::remove_var("NEUROSTRATA_MEMLOG");
-        assert!(log_enabled(), "on by default");
+    fn profiling_is_off_unless_asked_for() {
+        std::env::remove_var("NEUROSTRATA_PROFILE");
+        assert!(!profile_enabled(), "off by default");
+        for off in ["0", "off", "false", ""] {
+            std::env::set_var("NEUROSTRATA_PROFILE", off);
+            assert!(!profile_enabled(), "{off:?} is not a yes");
+        }
+        for on in ["1", "true", "on"] {
+            std::env::set_var("NEUROSTRATA_PROFILE", on);
+            assert!(profile_enabled(), "{on:?} turns it on");
+        }
+        std::env::remove_var("NEUROSTRATA_PROFILE");
+        assert!(!profile_enabled());
+        // `enable_profile()` is process-wide and one-way, so it is not
+        // exercised here: it would leave profiling on for every other test.
     }
 
     #[test]
