@@ -2327,6 +2327,34 @@ use super::x;"#;
         assert!(ts_deps.contains(&"src/utils.ts".to_string()) || ts_deps.contains(&"src/helper.js".to_string()));
     }
 
+    /// Memory probe, not a correctness test: ingests `NS_PROBE_DIR` twice into a
+    /// store opened the way the daemon opens it (default engine config, no
+    /// capped buffer pool) so peak working set can be read from outside the
+    /// process. Run:
+    ///   NS_PROBE_DIR=<dir> cargo test --bin neurostrata-mcp ingest_memory_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn ingest_memory_probe() {
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DIR").expect("NS_PROBE_DIR"));
+        let db = std::env::temp_dir().join(format!("ns-probe-db-{}", std::process::id()));
+        // NS_PROBE_REAL=1 loads the daemon's embedder, so the model and its
+        // runtime memory are part of what is measured.
+        let embedder: Arc<dyn Embedder> = if std::env::var("NS_PROBE_REAL").is_ok() {
+            Arc::new(crate::embed::FastEmbedder::new().expect("embedder"))
+        } else {
+            Arc::new(ZeroEmbedder)
+        };
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::new(&db, embedder.dimensions()).expect("open"));
+        store.init("probe").await.unwrap();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        for pass in 1..=2 {
+            let t = std::time::Instant::now();
+            ingest_directory(&dir, &schema, embedder.clone(), store.clone(), "probe", None, &[]).await.expect("ingest");
+            println!("PROBE pass {pass} done in {:?}", t.elapsed());
+        }
+    }
+
     /// F2 incremental ingest + F12 watermark.
     #[tokio::test]
     async fn test_f2_f12_incremental_ingest_and_watermark() {
