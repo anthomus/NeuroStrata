@@ -194,7 +194,19 @@ One process per variant, on a copy of the database, the namespace holding 7,190 
 
 The first call is the buffer pool filling and is the same for every query. A second namespace of 34,382 rows was written before generations: none of its ids are generation-scoped. Ingest does not read it at all today (`prev_gen` is 0), and after its first generation ingest the old code would have listed those rows on every later ingest; the new read never fetches them because the id prefix excludes them. That part is reasoned from the ids, not measured end to end.
 
-Not measured: a whole `ingest_directory` run before and after. The per-read figures above are what changed. The embedder (about 1 GB to load) is still the larger share of an ingest (section 3.6).
+The whole run barely moves (`ingest_reads_probe`, this repo's `src` directory copied to a temp tree, 166 files, zero embedder, 384 MB pool, one file added before each pass from the second on; one run per code state). Highest resident set inside each pass:
+
+| Pass | `list` (before) | `generation_summary` (after) |
+|---|---|---|
+| 1 (first ingest, nothing to read) | 380 MB | 375 MB |
+| 2 | 421 MB | 394 MB |
+| 3 | 518 MB | 487 MB |
+| 4 | 543 MB | 535 MB |
+| Process peak | 562 MB | 567 MB |
+
+So in a real ingest the saving is about 10 to 30 MB at this size and the process peak is the same within noise. The isolated read figures above overstate it: during an ingest the buffer pool is already full from the writes, so the listing does not add its 100 MB on top. Passes 3 and 4 also ran 25 to 35 s faster (146 to 162 s against 163 to 192 s), from one run each. Not measured: a larger tree, where the listing grows with the row count, or the real embedder.
+
+What does grow is the peak itself, by roughly 50 to 100 MB per pass in both columns (380, 421, 518, 543 MB before). The reads are not the cause. Older generations stay in the store and each changed pass copies every unchanged row forward (task `neurostrata-bcui`), which is the likelier source. The embedder (about 1 GB to load) is still the larger share of an ingest (section 3.6).
 
 ---
 
@@ -261,6 +273,8 @@ NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> cargo test --release --bin neurostrata
 
 # whole-namespace listing against narrower reads: NS_PROBE_VARIANT is all, tasks, pinned, ingest_nodes,
 # generation_summary (what ingest reads) or shape (row counts by type and generation, no content)
+# a whole ingest with a generation already in the store, highest resident set per pass (NS_PROBE_DIR is copied; ~10 min for 4 passes):
+#   NS_PROBE_DIR=<dir> NS_PROBE_PASSES=4 cargo test --release --bin neurostrata-mcp ingest_reads_probe -- --ignored --nocapture
 NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> NS_PROBE_VARIANT=tasks cargo test --release --bin neurostrata-mcp task_list_variants_probe -- --ignored --nocapture
 ```
 
