@@ -446,6 +446,101 @@ mod tests {
         println!("OVERHEAD sample() = {per_sample:?}, whole guard (begin + drop) = {per_guard:?}");
     }
 
+    /// What does one embed call cost in resident memory, with the real model?
+    /// Run (needs the model in the shared cache):
+    ///   cargo test --release --bin neurostrata-mcp embed_call_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn embed_call_probe() {
+        use crate::traits::Embedder;
+        let mut last = std::time::Instant::now();
+        let mut report = |step: &str| {
+            let s = sample();
+            println!(
+                "EMBED | {step:<22} | rss {:>5} MB peak {:>5} MB | {:>6} ms",
+                s.rss_bytes.unwrap_or(0) / MB,
+                s.peak_bytes.unwrap_or(0) / MB,
+                last.elapsed().as_millis()
+            );
+            last = std::time::Instant::now();
+        };
+        report("start");
+        let embedder = crate::embed::FastEmbedder::new().expect("model");
+        report("model loaded");
+        let short = "fn probe() { let x = 1; }";
+        let long = "let value = compute(input); ".repeat(80);
+        let long = &long[..2000];
+        for i in 1..=4 {
+            embedder.embed(short).await.unwrap();
+            report(&format!("short embed {i}"));
+        }
+        for i in 1..=4 {
+            embedder.embed(long).await.unwrap();
+            report(&format!("2000-char embed {i}"));
+        }
+    }
+
+    /// What do the guard's store reads cost, on a COPY of the database? Run:
+    ///   NS_PROBE_DB=<dir holding a copy of ladybug.db> \
+    ///   cargo test --release --bin neurostrata-mcp guard_scan_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn guard_scan_probe() {
+        use crate::traits::VectorStore;
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
+        let mut last = std::time::Instant::now();
+        let mut report = |step: &str, outcome: String| {
+            let s = sample();
+            println!(
+                "SCAN | {step:<34} | rss {:>5} MB peak {:>5} MB | {:>6} ms | {outcome}",
+                s.rss_bytes.unwrap_or(0) / MB,
+                s.peak_bytes.unwrap_or(0) / MB,
+                last.elapsed().as_millis()
+            );
+            last = std::time::Instant::now();
+        };
+        let store = crate::store::LadybugStore::new(&dir.join("ladybug.db"), 768).expect("open");
+        report("opened", String::new());
+        let types = vec!["rule".to_string(), "guard_rule".to_string()];
+        let query = vec![0.05_f32; 768];
+        for ns in ["NeuroStrata", "global"] {
+            for pass in 1..=3 {
+                let r = store.list(ns, None, Some("task")).await;
+                report(&format!("{ns} list task p{pass}"), format!("{} rows", r.map(|v| v.len()).unwrap_or(0)));
+            }
+            for pass in 1..=3 {
+                let r = store.search_by_types(ns, query.clone(), 3, &types).await;
+                report(&format!("{ns} search_by_types p{pass}"), format!("{} rows", r.map(|v| v.len()).unwrap_or(0)));
+            }
+            // Does the Rust distance match the engine's array_distance?
+            if let Ok(rows) = store.search_by_types(ns, query.clone(), 1, &types).await {
+                if let Some(first) = rows.first() {
+                    let vec_str = format!(
+                        "[{}]",
+                        query.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>().join(",")
+                    );
+                    let q = format!(
+                        "MATCH (m:Memory) WHERE m.id = '{}' RETURN array_distance(m.embedding, {})",
+                        first.id.replace('\'', "''"),
+                        vec_str
+                    );
+                    let engine = store
+                        .with_conn(move |conn| Ok(conn.query(&q)?.next().map(|r| format!("{}", r[0]))))
+                        .await;
+                    println!("CHECK {ns}: rust {} vs engine {:?} for {}", first.score, engine, first.id);
+                }
+            }
+            for pass in 1..=3 {
+                let r = store.list(ns, None, Some("guard_rule")).await;
+                report(&format!("{ns} list guard_rule p{pass}"), format!("{} rows", r.map(|v| v.len()).unwrap_or(0)));
+            }
+            for pass in 1..=2 {
+                let r = store.search(ns, query.clone(), 3, true, true).await;
+                report(&format!("{ns} OLD search p{pass}"), format!("{} rows", r.map(|v| v.len()).unwrap_or(0)));
+            }
+        }
+    }
+
     #[test]
     fn the_guard_counts_calls_in_flight() {
         let before = IN_FLIGHT.load(Ordering::SeqCst);
