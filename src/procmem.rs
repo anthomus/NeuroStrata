@@ -887,6 +887,100 @@ mod tests {
         );
     }
 
+    /// Where does a daemon-shaped process put its memory? One process, on a
+    /// COPY of a database, resident memory after each stage with the real
+    /// embedder and the default pool cap (bead neurostrata-bo32). Run:
+    ///   NS_PROBE_DB=<dir with a copy of ladybug.db> NS_PROBE_POOL_MB=384 \
+    ///   cargo test --release --bin neurostrata-mcp component_breakdown_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn component_breakdown_probe() {
+        use crate::traits::{Embedder, VectorStore};
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
+        let pool_mb: u64 = std::env::var("NS_PROBE_POOL_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(384);
+        let mut last = std::time::Instant::now();
+        let mut report = |step: &str| {
+            let s = sample();
+            println!(
+                "BREAKDOWN | {step:<34} | rss {:>5} MB peak {:>5} MB | {:>6} ms",
+                s.rss_bytes.unwrap_or(0) / MB,
+                s.peak_bytes.unwrap_or(0) / MB,
+                last.elapsed().as_millis()
+            );
+            last = std::time::Instant::now();
+        };
+        report("start");
+        let cfg = lbug::SystemConfig::default()
+            .buffer_pool_size(pool_mb * MB)
+            .throw_on_wal_replay_failure(true);
+        let store = crate::store::LadybugStore::with_system_config(&dir.join("ladybug.db"), 768, cfg).expect("open");
+        report("store opened");
+        let namespaces = store.list_namespaces().await.expect("namespaces");
+        report("namespaces listed");
+        let query = |seed: u32| -> Vec<f32> {
+            let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(12_345);
+            (0..768)
+                .map(|_| {
+                    x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((x >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.1
+                })
+                .collect()
+        };
+        for (i, ns) in namespaces.iter().enumerate() {
+            let _ = store.search(ns, query(i as u32), 5, false, false).await;
+        }
+        report("vector search, every namespace");
+        for (i, ns) in namespaces.iter().enumerate() {
+            let _ = store
+                .search_with_domain(ns, query(i as u32 + 99), 5, false, false, &[], Some("needle_not_present"), true)
+                .await;
+        }
+        report("exact-name search, every namespace");
+        for ns in &namespaces {
+            let _ = store.list(ns, None, Some("task")).await;
+        }
+        report("task list, every namespace");
+        let embedder = crate::embed::FastEmbedder::new().expect("model");
+        report("embedder loaded");
+        for i in 0..4 {
+            embedder.embed(&format!("probe text number {i}")).await.unwrap();
+        }
+        report("4 embeds");
+        for (i, ns) in namespaces.iter().enumerate() {
+            let _ = store.search(ns, query(i as u32 + 7), 5, false, false).await;
+        }
+        report("second vector search pass");
+        // Separate "freed but kept by the allocator" from "still live".
+        // HeapCompact asks every process heap to decommit free pages;
+        // EmptyWorkingSet then trims what is resident but idle. The pages
+        // EmptyWorkingSet drops come back on touch, so the pass after it
+        // shows what is genuinely in use.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn GetProcessHeaps(count: u32, heaps: *mut isize) -> u32;
+            fn HeapCompact(heap: isize, flags: u32) -> usize;
+            fn K32EmptyWorkingSet(process: isize) -> i32;
+        }
+        let mut heaps = [0isize; 256];
+        // SAFETY: `heaps` holds 256 writable slots and the count passed says so.
+        let n = unsafe { GetProcessHeaps(heaps.len() as u32, heaps.as_mut_ptr()) } as usize;
+        for h in heaps.iter().take(n.min(heaps.len())) {
+            // SAFETY: each handle was just returned by GetProcessHeaps.
+            unsafe { HeapCompact(*h, 0) };
+        }
+        report(&format!("after HeapCompact ({n} heaps)"));
+        // SAFETY: the pseudo-handle from GetCurrentProcess needs no closing.
+        let ok = unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
+        report(&format!("after EmptyWorkingSet (ok={ok})"));
+        for (i, ns) in namespaces.iter().enumerate() {
+            let _ = store.search(ns, query(i as u32 + 13), 5, false, false).await;
+        }
+        report("search pass after trimming");
+        let dbf = std::fs::metadata(dir.join("ladybug.db")).map(|m| m.len() / MB).unwrap_or(0);
+        println!("BREAKDOWN | db file {dbf} MB, pool cap {pool_mb} MB, namespaces {}", namespaces.len());
+    }
+
     #[test]
     fn the_guard_counts_calls_in_flight() {
         let before = IN_FLIGHT.load(Ordering::SeqCst);
