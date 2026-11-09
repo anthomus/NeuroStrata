@@ -13,6 +13,7 @@ mod digital_twin;
 mod domain;
 mod embed;
 mod fts;
+mod procmem;
 mod gliner;
 mod graphql;
 mod kge;
