@@ -4449,6 +4449,11 @@ async fn handle_get_snapshot(
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
     }
+    // Only when memory is high or a query failed for lack of buffer pool; an
+    // agent reads the snapshot first, so this is where it learns of it.
+    if let Some(advisory) = crate::procmem::snapshot_notice() {
+        parts.push(advisory);
+    }
     if !golden_section.is_empty() {
         parts.push(golden_section);
     }
