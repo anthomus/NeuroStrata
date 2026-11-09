@@ -8182,8 +8182,12 @@ async fn handle_guard_validate(
             | "grep" | "glob"
     );
     if mutating {
-        // Determine whether this namespace is task-enabled.
-        let memories = match store.list(&namespace, None, None).await {
+        // Determine whether this namespace is task-enabled. Only task rows
+        // matter here, so the type filter goes into the query: listing the
+        // whole namespace (every AST symbol and doc section, with vectors)
+        // on each mutating call grew the daemon by hundreds of MB and made
+        // the pre-edit hook time out.
+        let memories = match store.list(&namespace, None, Some("task")).await {
             Ok(memories) => memories,
             Err(e) => {
                 // Fail closed: a store read error must never silently
