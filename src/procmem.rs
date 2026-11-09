@@ -1043,6 +1043,65 @@ mod tests {
         );
     }
 
+    /// What does listing a namespace cost against listing only its task rows
+    /// (bead neurostrata-zoz2)? `handle_task_list` calls `list(ns, None, None)`
+    /// and filters tasks in Rust. One process per variant, on a COPY of a
+    /// database. NS_PROBE_VARIANT is `all` or `tasks`. Run:
+    ///   NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> NS_PROBE_VARIANT=all \
+    ///   cargo test --release --bin neurostrata-mcp task_list_variants_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn task_list_variants_probe() {
+        use crate::traits::VectorStore;
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
+        let ns = std::env::var("NS_PROBE_NS").expect("NS_PROBE_NS");
+        let variant = std::env::var("NS_PROBE_VARIANT").unwrap_or_else(|_| "all".to_string());
+        let cfg = lbug::SystemConfig::default()
+            .buffer_pool_size(384 * MB)
+            .throw_on_wal_replay_failure(true);
+        let store = crate::store::LadybugStore::with_system_config(&dir.join("ladybug.db"), 768, cfg).expect("open");
+        println!("TASKLIST {variant} | start rss {} MB", sample().rss_bytes.unwrap_or(0) / MB);
+        for pass in 1..=3 {
+            let before = sample().rss_bytes.unwrap_or(0) / MB;
+            let t = std::time::Instant::now();
+            let rows = if variant == "pinned" {
+                // Only rows whose metadata mentions `pinned`, as the golden-rule
+                // collector needs (bead neurostrata-zoz2).
+                let ns2 = ns.clone();
+                let n = store
+                    .with_conn(move |conn| {
+                        let q = format!(
+                            "MATCH (m:Memory) WHERE m.namespace = '{ns2}' AND m.metadata CONTAINS 'pinned' RETURN m.id, m.content, m.metadata"
+                        );
+                        let mut res = conn.query(&q)?;
+                        let mut n = 0usize;
+                        while let Some(_row) = res.next() {
+                            n += 1;
+                        }
+                        Ok(n)
+                    })
+                    .await
+                    .expect("pinned query");
+                println!("TASKLIST pinned | matched {n}");
+                Ok(Vec::new())
+            } else if variant == "tasks" {
+                store.list(&ns, None, Some("task")).await
+            } else {
+                store.list(&ns, None, None).await
+            }
+            .expect("list");
+            let tasks = rows.iter().filter(|r| r.payload.memory_type == "task").count();
+            let after = sample().rss_bytes.unwrap_or(0) / MB;
+            println!(
+                "TASKLIST {variant} | pass {pass} | rows {} tasks {tasks} | rss {before} -> {after} MB (+{}) | {} ms",
+                rows.len(),
+                after.saturating_sub(before),
+                t.elapsed().as_millis()
+            );
+        }
+        println!("TASKLIST {variant} | peak {} MB", sample().peak_bytes.unwrap_or(0) / MB);
+    }
+
     #[test]
     fn the_guard_counts_calls_in_flight() {
         let before = IN_FLIGHT.load(Ordering::SeqCst);
