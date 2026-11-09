@@ -159,6 +159,26 @@ All measured on a copy of the database with one process per variant.
 - **Page the embeddings into Rust and rank there** for `search_memory` (1,000 rows per page). +447 MB and 7.8 s per pass against 0.2 to 0.6 s: about 40 times slower, no memory saved. This works for the guard, which ranks a handful of rules. It does not work for search.
 - **Judging a search by its first call.** A cold search includes the pool filling to its cap. Measure the second call, or growth beyond the pool cap.
 
+### 3.9 Listing the whole namespace to find a few rows (`task_list_variants_probe`)
+
+`list(ns, None, None)` reads every row of a namespace, content and metadata included, and a handler that then keeps a handful of them pays for all of it on every call. One process per variant, on a copy of the database:
+
+| Query | Rows | First call | Each later call | Time | Peak |
+|---|---|---|---|---|---|
+| Whole namespace (8,140 rows) | 8,140 | +272 MB | +93 to +99 MB | 324 to 509 ms | 325 MB |
+| `memory_type = 'task'` | 47 | +127 MB | +1 to +4 MB | 48 to 202 ms | 177 MB |
+| Whole namespace (34,374 rows) | 34,374 | +278 MB | +108 to +116 MB | 287 to 424 ms | 351 MB |
+| `memory_type = 'task'` | 0 | +123 MB | +2 MB | 47 to 196 ms | 190 MB |
+| `metadata CONTAINS 'pinned'` (22 rows) | 22 | +119 MB | +3 to +6 MB | 48 ms | 194 MB |
+
+The first-call figure is the buffer pool filling and is the same for every query. The difference is what each later call costs. Three callers used the whole-namespace listing and now ask for what they use:
+
+- `neurostrata_task_list` lists task rows only (blocker statuses read tasks and nothing else).
+- `record_graph_query`, which runs on every graph-first lookup (`memories_for_file` and the related tools), lists task rows, reads the registry row by its fixed id, and lists directory rows only when the registry row has no `project_root`. When both a registry root and a git directory exist, the registry root now wins; before, it was whichever row came first.
+- `collect_golden_rules` asks for `VectorStore::list_pinned` for the project namespace. The default implementation lists everything, so other stores behave as before; `LadybugStore` narrows with `metadata CONTAINS 'pinned'` and returns a superset that the caller still filters.
+
+Still listing the whole namespace, because each needs more than the task or pinned rows: `task_complete` (looks for an extraction edge among all memories), id allocation in `task_create`, `gate::run`, the `global` namespace in `collect_golden_rules`, and several `server.rs` handlers.
+
 ---
 
 ## 4. Not fixed yet
@@ -221,6 +241,9 @@ NS_PROBE_DB=<dir> cargo test --release --bin neurostrata-mcp component_breakdown
 
 # how long the hygiene repair takes and how long a concurrent writer waits (NS_PROBE_NS is the namespace)
 NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> cargo test --release --bin neurostrata-mcp hygiene_writer_wait_probe -- --ignored --nocapture
+
+# whole-namespace listing against task-only listing: NS_PROBE_VARIANT is all, tasks or pinned
+NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> NS_PROBE_VARIANT=tasks cargo test --release --bin neurostrata-mcp task_list_variants_probe -- --ignored --nocapture
 ```
 
 On a live daemon, call a tool once with nothing else running, then read the last lines of `memory-growth.log`. A call under the threshold writes no line.
