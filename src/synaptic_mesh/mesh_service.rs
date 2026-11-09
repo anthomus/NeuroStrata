@@ -855,7 +855,7 @@ pub fn handle_mesh_tool_call(name: &str, arguments: &Value) -> String {
 /// about which project a rootless call means.
 pub fn resolve_mesh_project_root(arguments: &Value) -> Result<PathBuf, String> {
     match arguments.get("project_root").and_then(|v| v.as_str()) {
-        Some(raw) => std::fs::canonicalize(raw).map_err(|e| {
+        Some(raw) => dunce::canonicalize(raw).map_err(|e| {
             format!(
                 "error: project_root {raw} cannot be resolved ({e}); the mesh \
                  tools act on the canonical project root, so pass a project \
@@ -864,7 +864,7 @@ pub fn resolve_mesh_project_root(arguments: &Value) -> Result<PathBuf, String> {
         }),
         None => {
             let resolved = crate::daemon::resolve_project_root();
-            Ok(std::fs::canonicalize(&resolved).unwrap_or(resolved))
+            Ok(dunce::canonicalize(&resolved).unwrap_or(resolved))
         }
     }
 }
@@ -938,6 +938,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ns-mesh-svc-{}-{}", label, Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn resolved_mesh_project_root_carries_no_verbatim_prefix() {
+        let project = scratch("noverbatim");
+        let resolved = resolve_mesh_project_root(
+            &json!({ "project_root": project.to_string_lossy() }),
+        )
+        .expect("an existing root resolves");
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "plain spelling expected: {}",
+            resolved.display()
+        );
+        assert_eq!(resolved, dunce::simplified(&project));
     }
 
     #[test]

@@ -68,7 +68,7 @@ pub fn normalize_node_path(path: &str) -> String {
 /// pointer. It doubles as `SourceIdentity.worktree_id` until Task 2's
 /// `source::resolve` fills repo/revision from a real checkout.
 pub fn source_key_for(dir_path: &Path) -> String {
-    std::fs::canonicalize(dir_path)
+    dunce::canonicalize(dir_path)
         .unwrap_or_else(|_| dir_path.to_path_buf())
         .to_string_lossy()
         .to_string()

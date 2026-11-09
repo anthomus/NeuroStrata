@@ -6,7 +6,6 @@
 //! flow, not just manual instructions.
 
 use anyhow::{Context, Result};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Result of a successful setup run.
@@ -21,7 +20,7 @@ pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
     let bin_path = std::env::current_exe().context("cannot determine current_exe")?;
     // systemd ExecStart and launchd ProgramArguments require absolute paths;
     // a relative repo_path (e.g. `./`) would otherwise leak into the units.
-    let canonical_repo = std::fs::canonicalize(repo_path).unwrap_or_else(|e| {
+    let canonical_repo = dunce::canonicalize(repo_path).unwrap_or_else(|e| {
         tracing::debug!("failed to canonicalize {}: {e}", repo_path.display());
         repo_path.to_path_buf()
     });

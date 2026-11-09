@@ -1543,7 +1543,7 @@ mod tests {
             &config_path,
         )
         .unwrap();
-        let canonical = std::fs::canonicalize(&marker).unwrap();
+        let canonical = dunce::canonicalize(&marker).unwrap();
         assert_eq!(bound, format!("Bound source-a to {}", canonical.display()));
         assert_eq!(
             Config::load_from(&config_path)

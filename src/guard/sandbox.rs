@@ -71,7 +71,7 @@ impl SandboxEvaluator {
 
         // Validate and canonicalize cwd to prevent host path exfiltration
         let canonical_cwd =
-            std::fs::canonicalize(cwd).map_err(|_| anyhow::anyhow!("Invalid cwd path"))?;
+            dunce::canonicalize(cwd).map_err(|_| anyhow::anyhow!("Invalid cwd path"))?;
         let cwd_str = canonical_cwd.to_string_lossy().to_string();
 
         let forbidden_prefixes = [

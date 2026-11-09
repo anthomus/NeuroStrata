@@ -302,7 +302,7 @@ impl Config {
             );
         }
 
-        let canonical_path = fs::canonicalize(marker_path)
+        let canonical_path = dunce::canonicalize(marker_path)
             .with_context(|| format!("Could not canonicalize {}", marker_path.display()))?;
         if canonical_path.file_name().and_then(|name| name.to_str()) != Some(".NeuroStrata") {
             anyhow::bail!(
@@ -383,6 +383,25 @@ mod tests {
     }
 
     #[test]
+    fn bound_marker_carries_no_verbatim_prefix() {
+        let root = temp_dir("no-verbatim");
+        let marker = root.join("project/.NeuroStrata");
+        fs::create_dir_all(&marker).unwrap();
+        let config_path = write_config_with(&root, "{}");
+        let mut config = Config::load_from(&config_path).unwrap();
+
+        config.bind_project_context("source", &marker).unwrap();
+
+        let stored = config.project_contexts.get("source").unwrap();
+        assert!(
+            !stored.to_string_lossy().starts_with(r"\\?\"),
+            "the stored marker must be the plain spelling: {}",
+            stored.display()
+        );
+        assert_eq!(stored.as_path(), dunce::simplified(&marker));
+    }
+
+    #[test]
     fn bind_project_context_stores_canonical_marker_and_preserves_other_config() {
         let root = temp_dir("canonical");
         let marker = root.join("project/.NeuroStrata");
@@ -397,7 +416,7 @@ mod tests {
 
         assert_eq!(
             config.project_contexts.get("source"),
-            Some(&fs::canonicalize(&marker).unwrap())
+            Some(&dunce::canonicalize(&marker).unwrap())
         );
         assert_eq!(config.db_path, PathBuf::from("custom.db"));
         assert_eq!(
@@ -461,7 +480,7 @@ mod tests {
         assert!(!config.project_contexts.contains_key("first"));
         assert_eq!(
             config.project_contexts.get("second"),
-            Some(&fs::canonicalize(&second).unwrap())
+            Some(&dunce::canonicalize(&second).unwrap())
         );
     }
 

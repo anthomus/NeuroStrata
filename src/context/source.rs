@@ -6,7 +6,6 @@
 //! about (concurrent worktrees must not conflate source identity).
 
 use super::model::SourceIdentity;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -20,7 +19,7 @@ pub fn normalize_node_path(path: &str) -> String {
 
 /// Canonical absolute form of a path, falling back to the input on failure.
 pub fn canonical(path: &str) -> String {
-    fs::canonicalize(path)
+    dunce::canonicalize(path)
         .unwrap_or_else(|_| PathBuf::from(path))
         .to_string_lossy()
         .to_string()
@@ -139,5 +138,20 @@ mod tests {
         let root_str = root.to_string_lossy().to_string();
         let id = resolve(r"src\lib.rs", &root_str);
         assert_eq!(id.relative_path, "src/lib.rs");
+    }
+
+    /// `SourceIdentity.worktree_id` and the generation-pointer key must stay
+    /// byte-identical, and neither may carry the Windows verbatim prefix.
+    #[test]
+    fn worktree_id_matches_the_generation_source_key_without_a_verbatim_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key = crate::parser::ingest::source_key_for(tmp.path());
+        let canonical = canonical(&tmp.path().to_string_lossy());
+        assert_eq!(key, canonical, "the two derivations must not diverge");
+        assert!(!key.starts_with(r"\\?\"), "plain spelling expected: {key}");
+        assert_eq!(
+            resolve("src/lib.rs", &tmp.path().to_string_lossy()).worktree_id,
+            key
+        );
     }
 }
