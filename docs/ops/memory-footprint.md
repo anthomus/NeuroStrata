@@ -133,6 +133,26 @@ The daemon also appends JSON lines to `~/.config/neurostrata/memory-growth.log`:
 
 ---
 
+## 5b. Telling the agent (and through it, you)
+
+The daemon tells the agent when memory needs a human decision. The agent is never told to restart anything itself.
+
+- **`neurostrata_storage_status`** returns `process.advice`: `level` (`ok`, `watch` or `act`), the `reason`, the pool-full failures counted so far, the thresholds, and `suggestions` (empty at `ok`).
+- **`neurostrata_get_snapshot`**, which agents read first, starts with a `DAEMON MEMORY ADVISORY` block when the level is `watch` or `act`, and nothing when it is `ok`.
+- **A pool-full failure** now starts with `NEUROSTRATA_ADVICE[buffer_pool]`, counts toward the level, and tells the agent to ask you first. The plugin core (OpenCode, Claude Code, Codex, GitHub Copilot CLI) adds a short reminder to such a result, at most once per session every ten minutes.
+
+| Level | When | What the agent is told |
+|---|---|---|
+| `ok` | memory under the watch threshold, no pool failures | nothing |
+| `watch` | resident memory at or above `NEUROSTRATA_RSS_WATCH_MB` (default 1536) | mention it if it matters; nothing is failing |
+| `act` | at or above `NEUROSTRATA_RSS_ACT_MB` (default 2560), or any pool-full failure | tell the user, ask before acting, offer the config or env change and the restart steps |
+
+The restart is always yours: `neurostrata-mcp shutdown` (graceful, can take minutes), after which the next MCP connection starts a new daemon. It disconnects every IDE sharing the daemon, and killing the process loses memories that are not yet checkpointed, so the agent is told never to do either.
+
+The thresholds are starting points: the daemon idles near 860 MB and, before the pool cap, climbed to about 1.9 GB after one large search. Each change of level also writes an `advice` line to `memory-growth.log`, so you can see when it fired and tune the two numbers.
+
+---
+
 ## 6. Measure it again
 
 The probes are ignored tests in `src/procmem.rs`. Run them against a **copy** of the database, never the live one, and run each variant in its own process because the page cache does not shrink.
