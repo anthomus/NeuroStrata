@@ -981,6 +981,68 @@ mod tests {
         println!("BREAKDOWN | db file {dbf} MB, pool cap {pool_mb} MB, namespaces {}", namespaces.len());
     }
 
+    /// How long does a writer wait while `repair_namespace_hygiene` runs, and
+    /// how long does the repair take? On a COPY of a database; a second task
+    /// writes one small row every 50 ms and records each write's latency
+    /// (bead neurostrata-w9pr). Run:
+    ///   NS_PROBE_DB=<dir with a copy of ladybug.db> NS_PROBE_NS=NeuroStrata \
+    ///   cargo test --release --bin neurostrata-mcp hygiene_writer_wait_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn hygiene_writer_wait_probe() {
+        use crate::traits::{MemoryPayload, VectorStore};
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
+        let ns = std::env::var("NS_PROBE_NS").unwrap_or_else(|_| "NeuroStrata".to_string());
+        let cfg = lbug::SystemConfig::default()
+            .buffer_pool_size(384 * MB)
+            .throw_on_wal_replay_failure(true);
+        let store = std::sync::Arc::new(
+            crate::store::LadybugStore::with_system_config(&dir.join("ladybug.db"), 768, cfg).expect("open"),
+        );
+        store.init("hygiene_probe_ns").await.expect("init");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (store, stop) = (store.clone(), stop.clone());
+            tokio::spawn(async move {
+                let mut lat: Vec<u128> = Vec::new();
+                let mut i = 0u32;
+                while !stop.load(Ordering::SeqCst) {
+                    let payload = MemoryPayload {
+                        content: format!("writer probe {i}"),
+                        user_id: "probe".to_string(),
+                        memory_type: "fact".to_string(),
+                        agent_name: Some("probe".to_string()),
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({}),
+                    };
+                    let t = std::time::Instant::now();
+                    let r = store.upsert("hygiene_probe_ns", &format!("w-{i}"), vec![0.0; 768], payload).await;
+                    lat.push(if r.is_ok() { t.elapsed().as_millis() } else { u128::MAX });
+                    i += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                lat
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let t = std::time::Instant::now();
+        let result = store.repair_namespace_hygiene(&ns).await;
+        let repair_ms = t.elapsed().as_millis();
+        stop.store(true, Ordering::SeqCst);
+        let mut lat = writer.await.expect("writer");
+        lat.sort_unstable();
+        let pct = |p: usize| lat.get((lat.len().saturating_sub(1)) * p / 100).copied().unwrap_or(0);
+        println!(
+            "HYGIENE | repair {repair_ms} ms result {:?} | writer n={} p50 {} ms p95 {} ms max {} ms (u128::MAX = failed)",
+            result.map_err(|e| e.to_string()),
+            lat.len(),
+            pct(50),
+            pct(95),
+            lat.last().copied().unwrap_or(0)
+        );
+    }
+
     #[test]
     fn the_guard_counts_calls_in_flight() {
         let before = IN_FLIGHT.load(Ordering::SeqCst);

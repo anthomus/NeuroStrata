@@ -2684,6 +2684,209 @@ fn emit_write_shape_warning(namespace: &str, id: &str, warning: &WriteShapeWarni
     );
 }
 
+/// Edge-array metadata keys the namespace hygiene repair checks.
+const HYGIENE_EDGE_KEYS: [&str; 6] = ["governs", "related_to", "relates_to", "contained_by", "extracted_from", "depends_on"];
+
+/// What `repair_namespace_hygiene` needs to know about one row. Content is
+/// reduced to "is it blank", the only thing the repair asks of it.
+struct HygieneRow {
+    id: String,
+    mtype: String,
+    loc: String,
+    content_empty: bool,
+    meta_str: String,
+}
+
+/// What the database said about an edge target that is not a known row id.
+#[derive(Clone, Copy)]
+struct HygieneTarget {
+    /// A row with exactly this id exists (any namespace).
+    exact: bool,
+    /// The target resolves to a row in this namespace's active generation.
+    resolved: bool,
+}
+
+/// One statement the hygiene repair will run.
+#[derive(Clone)]
+enum HygieneWrite {
+    Edge(String),
+    Row {
+        id: String,
+        /// Refs this row will archive; each is re-checked in the write turn,
+        /// because the row that owns one may have been created since the read.
+        recheck: Vec<String>,
+        /// Sets the metadata only while it is still what the plan was made
+        /// from, so a concurrent edit is never overwritten with a stale copy.
+        meta_q: String,
+        content_q: Option<String>,
+        shape: bool,
+        dangling: bool,
+    },
+}
+
+/// Plans the repair of one row from data already in memory, and appends the
+/// statements it needs to `out`. Nothing here touches the database.
+fn plan_hygiene_row(
+    row: &HygieneRow,
+    namespace: &str,
+    known_ids: &std::collections::BTreeSet<String>,
+    targets: &HashMap<String, HygieneTarget>,
+    existing_edges: &HashSet<(String, String, &'static str)>,
+    out: &mut Vec<HygieneWrite>,
+) {
+    let (id, mtype, loc) = (&row.id, &row.mtype, &row.loc);
+    let safe = escape_ladybug_string(namespace);
+    let mut meta: Value = serde_json::from_str(&row.meta_str).unwrap_or(serde_json::json!({}));
+    if !meta.is_object() { meta = serde_json::json!({}); }
+    let mut shape_changed = false;
+    let mut dangling_changed = false;
+    // (a) rule source. A usable source is a non-empty string or object
+    // (`crate::traits::has_source`); "N/A" is a placeholder. Reading it as a
+    // string alone used to overwrite structured origins with the location.
+    if mtype == "rule" {
+        let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let usable = crate::traits::has_source(&meta) && src != "N/A";
+        if !usable {
+            let val = if !loc.is_empty() && loc != "N/A" { loc.clone() } else { "legacy-rule".to_string() };
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("source".to_string(), Value::String(val));
+                shape_changed = true;
+            }
+        }
+    }
+    // (a2) procedure trigger repair
+    if mtype == "procedure" {
+        let trigger = meta.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
+        let is_valid = !trigger.is_empty() && (trigger == "session-start" || trigger == "before-edit" || trigger == "after-mutation" || trigger.starts_with("every-n-sessions:") || trigger.starts_with("every-n-days:"));
+        if !is_valid {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("trigger".to_string(), Value::String("session-start".to_string()));
+                shape_changed = true;
+            }
+        }
+        if meta.get("remaining_fires").and_then(|v| v.as_u64()).is_none() {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("remaining_fires".to_string(), Value::Number(serde_json::Number::from(5)));
+                shape_changed = true;
+            }
+        }
+    }
+    // (a3) task memory repair: backfill metadata.task defaults
+    if mtype == "task" {
+        let task_meta = meta.get("task").cloned();
+        let mut task_obj = if let Some(Value::Object(obj)) = task_meta { obj.clone() } else { serde_json::Map::new() };
+        let mut task_changed = false;
+        if !task_obj.contains_key("status") || task_obj.get("status").and_then(|v| v.as_str()).map_or(true, |s| !(s == "open" || s == "in_progress" || s == "blocked" || s == "done")) {
+            task_obj.insert("status".to_string(), Value::String("open".to_string()));
+            task_changed = true;
+        }
+        if task_obj.get("priority").is_none() || !task_obj.get("priority").map_or(false, |v| v.as_u64().map_or(false, |_| true)) {
+            task_obj.insert("priority".to_string(), Value::Number(serde_json::Number::from(2)));
+            task_changed = true;
+        }
+        if !task_obj.contains_key("task_type") {
+            task_obj.insert("task_type".to_string(), Value::String("task".to_string()));
+            task_changed = true;
+        }
+        if task_changed || meta.get("task").is_none() || !meta.get("task").map_or(false, |v| v.is_object()) {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("task".to_string(), Value::Object(task_obj));
+                shape_changed = true;
+            }
+        }
+    }
+    // (a4) blank content: backfill from title, then location, then "legacy"
+    let mut content_backfill: Option<String> = None;
+    let structural = matches!(mtype.as_str(), "file" | "directory" | "markdown" | "symbol" | "code_ast" | "doc_section" | "freshness_flag" | "guard_event");
+    let backfill_text = |meta: &Value| {
+        meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
+            .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
+            .unwrap_or_else(|| "legacy".to_string())
+    };
+    if row.content_empty && !structural {
+        content_backfill = Some(backfill_text(&meta));
+    }
+    if (row.content_empty && mtype == "fact") || (row.content_empty && !mtype.is_empty() && mtype != "rule" && mtype != "procedure" && mtype != "task") {
+        content_backfill = Some(backfill_text(&meta));
+    }
+    // (b) dangling refs in edge arrays, and edges that should exist
+    let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+    let mut unresolvable = Vec::new();
+    let mut edges: Vec<String> = Vec::new();
+    for k in &HYGIENE_EDGE_KEYS {
+        let Some(arr) = meta.get(*k).and_then(|v| v.as_array()).cloned() else { continue };
+        let mut kept = Vec::new();
+        for item in &arr {
+            let Some(t) = item.as_str() else { kept.push(item.clone()); continue };
+            if t == "samples" || t == "total" {
+                unresolvable.push(t.to_string());
+                continue;
+            }
+            let known = known_ids.contains(t);
+            let info = targets.get(t).copied().unwrap_or(HygieneTarget { exact: false, resolved: false });
+            let exists = known
+                || info.exact
+                || info.resolved
+                || (t.len() >= 7 && known_ids.range(t.to_string()..).take_while(|x| x.starts_with(t)).take(2).count() == 1);
+            if !exists {
+                unresolvable.push(t.to_string());
+                continue;
+            }
+            kept.push(item.clone());
+            if known || info.exact {
+                let rel_table = match *k {
+                    "governs" => "GOVERNS",
+                    "related_to" | "relates_to" => "RELATES_TO",
+                    "contained_by" => "CONTAINS",
+                    "extracted_from" => "EXTRACTED_FROM",
+                    "depends_on" => "DEPENDS_ON",
+                    _ => "RELATES_TO",
+                };
+                let (from_id, to_id) = if *k == "contained_by" { (t, id.as_str()) } else { (id.as_str(), t) };
+                if !existing_edges.contains(&(from_id.to_string(), to_id.to_string(), rel_table)) {
+                    let safe_self = escape_ladybug_string(id);
+                    edges.push(format!(
+                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.confidence = 1.0, r.evidence_id = '{}', r.origin = 'local'",
+                        escape_ladybug_string(from_id), escape_ladybug_string(to_id), rel_table, safe, safe_self
+                    ));
+                }
+            }
+        }
+        if kept.len() != arr.len() {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert(k.to_string(), Value::Array(kept));
+                dangling_changed = true;
+            }
+        }
+    }
+    let recheck: Vec<String> = unresolvable.iter().filter(|t| *t != "samples" && *t != "total").cloned().collect();
+    if !unresolvable.is_empty() {
+        archived_refs.extend(unresolvable);
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("archived_refs".to_string(), Value::Array(archived_refs.iter().map(|s| Value::String(s.clone())).collect()));
+        }
+        dangling_changed = true;
+    }
+    out.extend(edges.into_iter().map(HygieneWrite::Edge));
+    if shape_changed || dangling_changed || content_backfill.is_some() {
+        let has_backfill = content_backfill.is_some();
+        out.push(HygieneWrite::Row {
+            id: id.clone(),
+            recheck,
+            meta_q: format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' AND m.metadata = '{}' SET m.metadata = '{}' RETURN m.id",
+                safe, escape_ladybug_string(id), escape_ladybug_string(&row.meta_str), escape_ladybug_string(&meta.to_string())
+            ),
+            content_q: content_backfill.map(|text| format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.content = '{}'",
+                safe, escape_ladybug_string(id), escape_ladybug_string(&text)
+            )),
+            shape: shape_changed || has_backfill,
+            dangling: dangling_changed,
+        });
+    }
+}
+
 /// Exact ID lookup for qualified target resolution.
 fn exact_target_exists(conn: &Connection, id: &str) -> Result<bool> {
     let safe_id = escape_ladybug_string(id);
@@ -3468,197 +3671,187 @@ impl LadybugStore {
         .await
     }
 
+    /// Repairs row shape and dangling refs without holding the writer for long
+    /// and without a query per row (beads neurostrata-w9pr).
+    ///
+    /// It used to scan the namespace and repair every row inside ONE write
+    /// turn. On a large namespace that outlived the write deadline ("gave up
+    /// waiting on repairing namespace hygiene") and every other writer queued
+    /// behind it. A first per-row-turn version fixed the queueing but took
+    /// three minutes: a keyed read per row, and a lookup per edge target per
+    /// row. Now:
+    ///   1. rows are read in id-ordered pages (short read turns);
+    ///   2. each distinct edge target that is not a known id is resolved once;
+    ///   3. the namespace's existing edges are read once;
+    ///   4. the repair is planned in Rust, and only rows that change and edges
+    ///      that are missing are written, a few dozen statements per turn.
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
+        const PAGE: usize = 500;
+        const RESOLVE_CHUNK: usize = 50;
+        const WRITE_CHUNK: usize = 40;
         let namespace = namespace.to_string();
-        self.write_with_deadline("repairing namespace hygiene", move |conn| {
-            let safe = crate::store::ladybug::escape_ladybug_string(&namespace);
-            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata", safe);
-            let mut res = conn.query(&query)?;
-            let mut known_ids = std::collections::HashSet::new();
-            let mut rows = Vec::new();
-            while let Some(row) = res.next() {
-                let id = format!("{}", row[0]);
-                let mtype = format!("{}", row[1]);
-                let loc = format!("{}", row[2]);
-                let content_str = format!("{}", row[3]);
-                let meta_str = format!("{}", row[4]);
-                let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap_or(serde_json::json!({}));
-                if meta.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
-                known_ids.insert(id.clone());
-                rows.push((id, mtype, loc, content_str, meta_str));
+
+        // 1. Pages of rows, ordered by id.
+        let mut rows: Vec<HygieneRow> = Vec::new();
+        let mut known_ids = std::collections::BTreeSet::new();
+        let mut last = String::new();
+        loop {
+            let (ns, after) = (namespace.clone(), last.clone());
+            let page: Vec<(HygieneRow, bool)> = self
+                .with_conn(move |conn| {
+                    let query = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id > '{}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata ORDER BY m.id LIMIT {}",
+                        escape_ladybug_string(&ns),
+                        escape_ladybug_string(&after),
+                        PAGE
+                    );
+                    let mut res = conn.query(&query)?;
+                    let mut out = Vec::new();
+                    while let Some(row) = res.next() {
+                        let meta_str = format!("{}", row[4]);
+                        let meta: Value = serde_json::from_str(&meta_str).unwrap_or(serde_json::json!({}));
+                        let archived = meta.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
+                        out.push((
+                            HygieneRow {
+                                id: format!("{}", row[0]),
+                                mtype: format!("{}", row[1]),
+                                loc: format!("{}", row[2]),
+                                content_empty: format!("{}", row[3]).trim().is_empty(),
+                                meta_str,
+                            },
+                            archived,
+                        ));
+                    }
+                    Ok(out)
+                })
+                .await?;
+            let Some((tail, _)) = page.last() else { break };
+            last = tail.id.clone();
+            let full = page.len() == PAGE;
+            for (row, archived) in page {
+                if archived {
+                    continue;
+                }
+                known_ids.insert(row.id.clone());
+                rows.push(row);
             }
-            let mut shape_updates = 0usize;
-            let mut dangling_updates = 0usize;
-            for (id, mtype, loc, content_str, meta_str) in &rows {
-                let mut meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
-                if !meta.is_object() { meta = serde_json::json!({}); }
-                let mut shape_changed = false;
-                let mut dangling_changed = false;
-                // (a) rule source
-                if mtype == "rule" {
-                    // A source is usable provenance when it is a non-empty string
-                    // or a non-empty object -- `crate::traits::has_source` is the
-                    // canonical predicate for that, and the task gate and the
-                    // SHACL checker both ask it. Reading the field as a string
-                    // alone made an object source look blank, and this repair
-                    // would then OVERWRITE the structured origin with the row's
-                    // location: the repair destroyed the provenance it was
-                    // supposed to preserve. "N/A" stays a placeholder, not a
-                    // source, so it is still repaired.
-                    let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                    let usable = crate::traits::has_source(&meta) && src != "N/A";
-                    if !usable {
-                        let val = if !loc.is_empty() && loc != "N/A" { loc.clone() } else { "legacy-rule".to_string() };
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.insert("source".to_string(), serde_json::Value::String(val));
-                            shape_changed = true;
+            if !full {
+                break;
+            }
+        }
+
+        // 2. Each distinct unknown edge target, resolved once.
+        let mut unknown: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for row in &rows {
+            let meta: Value = serde_json::from_str(&row.meta_str).unwrap_or(serde_json::json!({}));
+            for k in HYGIENE_EDGE_KEYS {
+                if let Some(arr) = meta.get(k).and_then(|v| v.as_array()) {
+                    for t in arr.iter().filter_map(|v| v.as_str()) {
+                        if t != "samples" && t != "total" && !known_ids.contains(t) {
+                            unknown.insert(t.to_string());
                         }
                     }
                 }
-                // (a2) procedure trigger repair
-                if mtype == "procedure" {
-                    let trigger = meta.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
-                    let is_valid = !trigger.is_empty() && (trigger == "session-start" || trigger == "before-edit" || trigger == "after-mutation" || trigger.starts_with("every-n-sessions:") || trigger.starts_with("every-n-days:"));
-                    if !is_valid {
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.insert("trigger".to_string(), serde_json::Value::String("session-start".to_string()));
-                            shape_changed = true;
+            }
+        }
+        let unknown: Vec<String> = unknown.into_iter().collect();
+        let mut targets: HashMap<String, HygieneTarget> = HashMap::new();
+        for chunk in unknown.chunks(RESOLVE_CHUNK) {
+            let (ns, chunk) = (namespace.clone(), chunk.to_vec());
+            let resolved = self
+                .with_conn(move |conn| {
+                    let ns_prefix = format!("{}{}", ns, crate::parser::ingest::NAMESPACE_SEPARATOR);
+                    let mut out = Vec::new();
+                    for t in chunk {
+                        let exact = exact_target_exists(conn, &t).unwrap_or(false);
+                        let resolved = !exact
+                            && if let Some(stripped) = t.strip_prefix(&ns_prefix) {
+                                matches!(resolve_target_on_write(conn, &ns, stripped), crate::traits::TargetResolution::Resolved(_))
+                            } else if !t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                                matches!(resolve_target_on_write(conn, &ns, &t), crate::traits::TargetResolution::Resolved(_))
+                            } else {
+                                false
+                            };
+                        out.push((t, HygieneTarget { exact, resolved }));
+                    }
+                    Ok(out)
+                })
+                .await?;
+            targets.extend(resolved);
+        }
+
+        // 3. Edges that already exist, so only missing ones are merged.
+        let ns_edges = namespace.clone();
+        let existing: HashSet<(String, String, &'static str)> = self
+            .with_conn(move |conn| {
+                let safe = escape_ladybug_string(&ns_edges);
+                let mut out = HashSet::new();
+                for rel in ["GOVERNS", "RELATES_TO", "CONTAINS", "EXTRACTED_FROM", "DEPENDS_ON"] {
+                    let q = format!(
+                        "MATCH (a:Memory)-[r:{rel}]->(b:Memory) WHERE a.namespace = '{safe}' OR b.namespace = '{safe}' RETURN a.id, b.id"
+                    );
+                    if let Ok(mut res) = conn.query(&q) {
+                        while let Some(row) = res.next() {
+                            out.insert((format!("{}", row[0]), format!("{}", row[1]), rel));
                         }
                     }
-                    let remaining_missing = meta.get("remaining_fires").and_then(|v| v.as_u64()).is_none();
-                    if remaining_missing {
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.insert("remaining_fires".to_string(), serde_json::Value::Number(serde_json::Number::from(5)));
-                            shape_changed = true;
-                        }
-                    }
                 }
-                // (a3) task memory repair: backfill metadata.task defaults
-                if mtype == "task" {
-                    let task_meta = meta.get("task").cloned();
-                    let mut task_obj = if let Some(Value::Object(obj)) = task_meta { obj.clone() } else { serde_json::Map::new() };
-                    let mut task_changed = false;
-                    if !task_obj.contains_key("status") || task_obj.get("status").and_then(|v| v.as_str()).map_or(true, |s| !(s == "open" || s == "in_progress" || s == "blocked" || s == "done")) {
-                        task_obj.insert("status".to_string(), serde_json::Value::String("open".to_string()));
-                        task_changed = true;
-                    }
-                    if task_obj.get("priority").is_none() || !task_obj.get("priority").map_or(false, |v| v.as_u64().map_or(false, |_| true)) {
-                        task_obj.insert("priority".to_string(), serde_json::Value::Number(serde_json::Number::from(2)));
-                        task_changed = true;
-                    }
-                    if !task_obj.contains_key("task_type") {
-                        task_obj.insert("task_type".to_string(), serde_json::Value::String("task".to_string()));
-                        task_changed = true;
-                    }
-                    if task_changed || meta.get("task").is_none() || !meta.get("task").map_or(false, |v| v.is_object()) {
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.insert("task".to_string(), serde_json::Value::Object(task_obj));
-                            shape_changed = true;
-                        }
-                    }
-                }
-                // (a4) content / fact and generic repair: backfill blank content and missing required fields from title/location/legacy
-                let content_empty = content_str.trim().is_empty();
-                let mut content_backfill: Option<String> = None;
-                let structural = matches!(mtype.as_str(), "file" | "directory" | "markdown" | "symbol" | "code_ast" | "doc_section" | "freshness_flag" | "guard_event");
-                if content_empty && !structural {
-                    content_backfill = Some(meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
-                        .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
-                        .unwrap_or_else(|| "legacy".to_string()));
-                }
-                if (content_empty && mtype == "fact") || (content_empty && !mtype.is_empty() && mtype != "rule" && mtype != "procedure" && mtype != "task") {
-                    content_backfill = Some(meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
-                        .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
-                        .unwrap_or_else(|| "legacy".to_string()));
-                }
-                // (b) dangling refs in edge arrays
-                let keys = ["governs","related_to","relates_to","contained_by","extracted_from","depends_on"];
-                let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
-                let mut unresolvable = Vec::new();
-                for k in &keys {
-                    if let Some(arr) = meta.get(k).and_then(|v| v.as_array()).cloned() {
-                        let mut kept = Vec::new();
-                        for item in &arr {
-                            if let Some(t) = item.as_str() {
-                                // Remove residual unresolved string targets (samples/total) and check existence
-                                if t == "samples" || t == "total" {
-                                    unresolvable.push(t.to_string());
-                                    continue;
+                Ok(out)
+            })
+            .await?;
+
+        // 4. Plan in Rust, write only what changes.
+        let mut writes: Vec<HygieneWrite> = Vec::new();
+        for row in &rows {
+            plan_hygiene_row(row, &namespace, &known_ids, &targets, &existing, &mut writes);
+        }
+        let mut shape_updates = 0usize;
+        let mut dangling_updates = 0usize;
+        for chunk in writes.chunks(WRITE_CHUNK) {
+            let chunk = chunk.to_vec();
+            let (shape, dangling) = self
+                .write_with_deadline("repairing namespace hygiene", move |conn| {
+                    let (mut shape_n, mut dangling_n) = (0usize, 0usize);
+                    for w in &chunk {
+                        match w {
+                            HygieneWrite::Edge(q) => {
+                                if let Err(e) = conn.query(q) {
+                                    tracing::debug!("hygiene edge merge note: {e}");
                                 }
-                                // Check existence against known_ids, resolved targets, and prefix-unqualified resolution
-                                let ns_prefix = format!("{}{}", namespace, crate::parser::ingest::NAMESPACE_SEPARATOR);
-                                let exists = known_ids.contains(t)
-                                    || exact_target_exists(conn, t).unwrap_or(false)
-                                    || if let Some(stripped) = t.strip_prefix(&ns_prefix) {
-                                        matches!(resolve_target_on_write(conn, &namespace, stripped), crate::traits::TargetResolution::Resolved(_))
-                                    } else if !t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
-                                        matches!(resolve_target_on_write(conn, &namespace, t), crate::traits::TargetResolution::Resolved(_))
-                                    } else {
-                                        false
+                            }
+                            HygieneWrite::Row { id, recheck, meta_q, content_q, shape, dangling } => {
+                                if recheck.iter().any(|t| exact_target_exists(conn, t).unwrap_or(false)) {
+                                    continue; // a target appeared since the read; the next run decides
+                                }
+                                match conn.query(meta_q) {
+                                    Err(e) => {
+                                        tracing::warn!("hygiene repair: metadata write failed for {id}: {e}");
+                                        continue;
                                     }
-                                    || (t.len() >= 7 && known_ids.iter().filter(|k| k.starts_with(t)).count() == 1);
-                                if exists { kept.push(item.clone()); } else { unresolvable.push(t.to_string()); }
-                            } else { kept.push(item.clone()); }
-                        }
-                        // Materialize missing graph edges for kept targets (borrow; move happens below)
-                        for item in &kept {
-                            if let Some(t) = item.as_str() {
-                                if known_ids.contains(t) || exact_target_exists(conn, t).unwrap_or(false) {
-                                    let rel_table = match *k {
-                                        "governs" => "GOVERNS",
-                                        "related_to" | "relates_to" => "RELATES_TO",
-                                        "contained_by" => "CONTAINS",
-                                        "extracted_from" => "EXTRACTED_FROM",
-                                        "depends_on" => "DEPENDS_ON",
-                                        _ => "RELATES_TO",
-                                    };
-                                    let safe_self = crate::store::ladybug::escape_ladybug_string(id);
-                                    let safe_target = crate::store::ladybug::escape_ladybug_string(t);
-                                    let (from_id, to_id) = if *k == "contained_by" {
-                                        (safe_target.as_str(), safe_self.as_str())
-                                    } else {
-                                        (safe_self.as_str(), safe_target.as_str())
-                                    };
-                                    let merge_edge_q = format!(
-                                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.confidence = 1.0, r.evidence_id = '{}', r.origin = 'local'",
-                                        from_id, to_id, rel_table, safe, safe_self
-                                    );
-                                    if let Err(e) = conn.query(&merge_edge_q) {
-                                         tracing::debug!("hygiene edge merge note: {e}");
-                                     }
+                                    Ok(mut res) => {
+                                        // Nothing matched: the row changed since the read.
+                                        if res.next().is_none() {
+                                            continue;
+                                        }
+                                    }
                                 }
-                            }
-                        } // end for item in &kept
-                        if kept.len() != arr.len() { if let Some(obj) = meta.as_object_mut() { obj.insert(k.to_string(), serde_json::Value::Array(kept)); dangling_changed = true; } }
-                    }
-                }
-                if !unresolvable.is_empty() {
-                    archived_refs.extend(unresolvable);
-                    if let Some(obj) = meta.as_object_mut() {
-                        obj.insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
-                    }
-                    dangling_changed = true;
-                }
-                if shape_changed || dangling_changed || content_backfill.is_some() {
-                    let has_backfill = content_backfill.is_some();
-                    let q_meta = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
-                    if let Err(e) = conn.query(&q_meta) {
-                        tracing::warn!("hygiene repair: metadata write failed for {id}: {e}");
-                    } else {
-                        if let Some(backfill_text) = content_backfill {
-                            let safe_back = crate::store::ladybug::escape_ladybug_string(&backfill_text);
-                            let q_content = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.content = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), safe_back);
-                            if let Err(e) = conn.query(&q_content) {
-                                tracing::warn!("hygiene repair: content write failed for {id}: {e}");
+                                if let Some(q) = content_q {
+                                    if let Err(e) = conn.query(q) {
+                                        tracing::warn!("hygiene repair: content write failed for {id}: {e}");
+                                    }
+                                }
+                                shape_n += *shape as usize;
+                                dangling_n += *dangling as usize;
                             }
                         }
-                        if shape_changed || has_backfill { shape_updates += 1; }
-                        if dangling_changed { dangling_updates += 1; }
                     }
-                }
-            }
-            Ok((shape_updates, dangling_updates))
-        }).await
+                    Ok((shape_n, dangling_n))
+                })
+                .await?;
+            shape_updates += shape;
+            dangling_updates += dangling;
+        }
+        Ok((shape_updates, dangling_updates))
     }
 
     /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
@@ -14977,6 +15170,83 @@ eurostrata\src\daemon.rs",
             Some(&json!({ "kind": "release-run", "ref": "v1.16.0" })),
             "the repair must not overwrite an object source with a string"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The batched repair must do what the per-row one did: archive refs that
+    /// resolve to nothing, keep ones that do, make the missing edge, and then
+    /// find nothing left to do.
+    #[tokio::test]
+    async fn repair_hygiene_archives_dangling_refs_makes_edges_and_settles() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-dangling-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        let target = retired_test_payload("fact", "agent", json!({}));
+        store.upsert("probe", "target-row", v.clone(), target).await.unwrap();
+        let declarer = retired_test_payload("fact", "agent", json!({
+            "related_to": ["target-row", "no-such-row", "samples"],
+        }));
+        store.upsert("probe", "declarer", v.clone(), declarer).await.unwrap();
+
+        let (_, dangling) = store.repair_namespace_hygiene("probe").await.unwrap();
+        assert_eq!(dangling, 1, "one row had refs that resolve to nothing");
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
+        assert_eq!(row.payload.metadata["related_to"], json!(["target-row"]));
+        let archived = row.payload.metadata["archived_refs"].as_array().unwrap();
+        assert!(archived.contains(&json!("no-such-row")) && archived.contains(&json!("samples")));
+
+        let edge_targets = store
+            .with_conn(|conn| {
+                let mut res = conn.query(
+                    "MATCH (a:Memory {id: 'declarer'})-[r:RELATES_TO]->(b:Memory) RETURN b.id",
+                )?;
+                let mut out = Vec::new();
+                while let Some(row) = res.next() {
+                    out.push(format!("{}", row[0]));
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap();
+        assert!(edge_targets.contains(&"target-row".to_string()), "edges: {edge_targets:?}");
+
+        let again = store.repair_namespace_hygiene("probe").await.unwrap();
+        assert_eq!(again, (0, 0), "a second pass has nothing left to repair");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repair planned from an old copy of a row must not overwrite the row
+    /// after someone else changed it.
+    #[tokio::test]
+    async fn repair_hygiene_write_is_skipped_when_the_row_changed_since_the_read() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-cas-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let rule = retired_test_payload("rule", "agent", json!({ "source": "N/A" }));
+        store.upsert("probe", "r1", vec![0.1, 0.2, 0.3, 0.4], rule).await.unwrap();
+
+        // The plan was made from metadata that is no longer what is stored.
+        let stale = HygieneRow {
+            id: "r1".to_string(),
+            mtype: "rule".to_string(),
+            loc: "src/x.rs".to_string(),
+            content_empty: false,
+            meta_str: r#"{"source":"N/A","an_older_field":1}"#.to_string(),
+        };
+        let mut writes = Vec::new();
+        plan_hygiene_row(&stale, "probe", &Default::default(), &HashMap::new(), &HashSet::new(), &mut writes);
+        let HygieneWrite::Row { meta_q, .. } = writes.pop().expect("a repair was planned") else {
+            panic!("expected a row write")
+        };
+        let matched = store
+            .with_conn(move |conn| Ok(conn.query(&meta_q)?.next().is_some()))
+            .await
+            .unwrap();
+        assert!(!matched, "a stale plan must not match the changed row");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
