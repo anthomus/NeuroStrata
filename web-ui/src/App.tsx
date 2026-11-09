@@ -6,7 +6,7 @@ import { GalaxyGraph3D } from './components/GalaxyGraph3D';
 import { BlueprintGraph2D } from './components/BlueprintGraph2D';
 import { UIPanel } from './components/UIPanel';
 import { FileExplorer } from './components/FileExplorer';
-import type { GraphData, MemoryNode, MemoryLink } from './types';
+import type { GraphData, MemoryNode, MemoryLink, IngestProgress } from './types';
 
 function App() {
   const [graphData, setGraphData] = useState<GraphData>({ nodes: [], links: [] });
@@ -18,6 +18,7 @@ function App() {
   const [typeFilters, setTypeFilters] = useState<Record<string, boolean>>({});
   const [projectPath, setProjectPath] = useState<string | null>(null);
   const [isIngesting, setIsIngesting] = useState(false);
+  const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(null);
 
   // Context Menu State
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; node: MemoryNode } | null>(null);
@@ -78,6 +79,59 @@ function App() {
     }
   };
 
+  // How often to ask the daemon how the walk is going. Long enough not to
+  // matter next to embedding a file, short enough that the counter moves.
+  const INGEST_POLL_MS = 1000;
+
+  // Starts a walk and watches it, without ever blocking the window on it.
+  //
+  // The graph on screen stays usable throughout: it is whatever the last
+  // ingest left, which for an unchanged project is already the right answer.
+  // It is reloaded once at the end rather than on every poll, so the layout is
+  // not restarted underneath someone who is reading it.
+  const runIngest = async (path: string) => {
+    setIsIngesting(true);
+    setIngestProgress(null);
+
+    try {
+      const started = await invoke<IngestProgress>('start_ingest', { projectPath: path });
+      setIngestProgress(started);
+
+      // Already over: a re-ingest of an unchanged project can finish between
+      // the two calls, since unchanged files are skipped by hash.
+      if (started.state !== 'running') {
+        await loadGraph(path);
+        return;
+      }
+
+      while (true) {
+        await new Promise(resolve => setTimeout(resolve, INGEST_POLL_MS));
+
+        const progress = await invoke<IngestProgress | null>('ingest_status', { projectPath: path });
+        // The daemon has no job for this namespace. It restarted, or something
+        // else cleared it; either way there is nothing left to wait for.
+        if (!progress) break;
+
+        setIngestProgress(progress);
+        if (progress.state === 'running') continue;
+
+        if (progress.state === 'failed') {
+          invoke('log_message', { msg: `AST ingestion failed: ${progress.error ?? 'no reason given'}` }).catch(() => {});
+        }
+        break;
+      }
+
+      await loadGraph(path);
+    } catch (e) {
+      // A failed ingest leaves the graph that is already on screen alone. It is
+      // stale, not wrong, and it is more use than an empty canvas.
+      invoke('log_message', { msg: `Could not run the ingest: ${e}` }).catch(() => {});
+    } finally {
+      setIsIngesting(false);
+      setIngestProgress(null);
+    }
+  };
+
   // Single source of truth for opening the project dialog, used by both the
   // native Tauri menu (listen('open-project-dialog')) and the UIPanel button,
   // so the two entry points cannot drift apart.
@@ -92,17 +146,11 @@ function App() {
         setProjectPath(selected);
         await invoke('save_project_path', { path: selected });
 
-        // Trigger AST ingest automatically on load
-        setIsIngesting(true);
-        try {
-          await invoke('ingest_ast', { projectPath: selected });
-          invoke('log_message', { msg: "AST ingestion completed successfully." }).catch(() => {});
-        } catch (e) {
-          invoke('log_message', { msg: `AST Ingestion failed: ${e}` }).catch(() => {});
-        } finally {
-          setIsIngesting(false);
-        }
+        // Whatever this project already has, on screen straight away. A
+        // project that has never been ingested shows nothing until the walk
+        // below starts filling it in.
         await loadGraph(selected);
+        await runIngest(selected);
       }
     } catch (e) {
       invoke('log_message', { msg: `Failed to open project dialog: ${e}` }).catch(() => {});
@@ -130,16 +178,12 @@ function App() {
         const path: string | null = await invoke('get_last_project_path');
         if (path) {
           setProjectPath(path);
-          setIsIngesting(true);
-          try {
-            await invoke('ingest_ast', { projectPath: path });
-            console.log("AST ingestion completed successfully.");
-          } catch (e) {
-            console.error("AST Ingestion failed", e);
-          } finally {
-            setIsIngesting(false);
-          }
+          // The graph first, always. This used to await the ingest before
+          // drawing anything, so reopening the window on an already-ingested
+          // project meant minutes of empty canvas while the daemon rebuilt a
+          // graph that was already on disk.
           await loadGraph(path);
+          await runIngest(path);
         } else {
           await loadGraph(null);
         }
@@ -242,7 +286,9 @@ function App() {
       {isIngesting && (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 bg-indigo-500/20 backdrop-blur-md border border-indigo-500/30 text-indigo-200 px-4 py-2 rounded-full font-mono text-sm flex items-center gap-2">
           <div className="w-4 h-4 rounded-full border-2 border-indigo-400 border-t-transparent animate-spin" />
-          Ingesting AST & refreshing Graph...
+          {ingestProgress
+            ? `Ingesting AST: ${ingestProgress.files_seen} files read, ${ingestProgress.symbols_ingested} symbols`
+            : 'Working...'}
         </div>
       )}
       

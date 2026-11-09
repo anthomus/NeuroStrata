@@ -27,3 +27,20 @@ export interface GraphData {
   nodes: MemoryNode[];
   links: MemoryLink[];
 }
+
+/// What the daemon reports for a walk started without waiting for it.
+/// Mirrors IngestProgress in src/ingest_jobs.rs; the optional fields are the
+/// ones it omits until they have a value.
+export interface IngestProgress {
+  namespace: string;
+  dir: string;
+  state: 'running' | 'finished' | 'failed';
+  error?: string;
+  files_seen: number;
+  files_ingested: number;
+  symbols_ingested: number;
+  last_file?: string;
+  relinked_edges?: number;
+  started_unix: number;
+  finished_unix?: number;
+}

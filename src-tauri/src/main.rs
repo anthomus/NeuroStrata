@@ -95,8 +95,7 @@ fn daemon_token_file(name: &str) -> Option<String> {
 /// stopped mid-walk without ever reaching relink_edges. What the user saw was a
 /// graph frozen half-built with no GOVERNS edges, a daemon still answering
 /// /health, and no error anywhere (bead neurostrata-zbw). The caller states
-/// the timeout it needs (`daemon_client(INGEST_TIMEOUT)` for the long walk)
-/// instead of silently inheriting the 30-second default.
+/// the timeout it needs instead of silently inheriting the 30-second default.
 fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Client, String> {
     // The daemon requires its bearer on every route but /health; attach
     // it as a default header so every backend call authenticates.
@@ -131,13 +130,12 @@ fn daemon_base_url() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-/// Ingestion walks and embeds a whole repository, which is minutes of work on a
-/// large one.
-const INGEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
-
-/// Everything else is a single query, but not necessarily a fast one: /graph
-/// has been measured at 28s while a write was in flight, so the old 30s left
-/// nothing spare.
+/// There used to be an INGEST_TIMEOUT of 1800s here, because the GUI held a
+/// request open for the whole walk. Nothing waits on a walk from this process
+/// any more: it starts one and polls, so every call is an ordinary query.
+///
+/// Not necessarily a fast one: /graph has been measured at 28s while a write
+/// was in flight, so the old 30s left nothing spare.
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn ensure_daemon() -> Result<(), String> {
@@ -247,25 +245,62 @@ fn open_external(url: String) -> Result<(), String> {
     open::that(&url).map_err(|e| format!("Could not open '{}': {}", url, e))
 }
 
+/// Asks the daemon to begin a walk and returns as soon as it is registered.
+///
+/// The window used to await a full ingest before drawing anything, so opening
+/// it on an already-ingested project meant minutes of blank screen. The graph
+/// is loaded first now and this runs behind it.
 #[tauri::command]
-fn ingest_ast(project_path: String) -> Result<String, String> {
+fn start_ingest(project_path: String) -> Result<serde_json::Value, String> {
     ensure_daemon()?;
-    
+
     let namespace = namespace_for(&project_path);
 
-    let client = daemon_client(INGEST_TIMEOUT)?;
+    // This call does not wait for the walk, so anything longer than an
+    // ordinary request means the daemon is wedged.
+    let client = daemon_client(QUERY_TIMEOUT)?;
     let resp = client.post(format!("{}/ingest", daemon_base_url()))
         .json(&serde_json::json!({
             "dir": project_path,
-            "namespace": namespace
+            "namespace": namespace,
+            "wait": false
         }))
         .send()
         .map_err(|e| e.to_string())?;
 
     if resp.status().is_success() {
-        Ok("AST ingested successfully".to_string())
+        resp.json().map_err(|e| e.to_string())
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to ingest".to_string()))
+        Err(resp.text().unwrap_or_else(|_| "Failed to start the ingest".to_string()))
+    }
+}
+
+/// How the walk started by `start_ingest` is getting on.
+///
+/// `None` when the daemon has no job for this namespace, which is what a
+/// restarted daemon reports for a project whose graph is already on disk. The
+/// caller treats that as "nothing running", not as an error.
+#[tauri::command]
+fn ingest_status(project_path: String) -> Result<Option<serde_json::Value>, String> {
+    ensure_daemon()?;
+
+    let namespace = namespace_for(&project_path);
+
+    let client = daemon_client(QUERY_TIMEOUT)?;
+    let resp = client
+        .get(format!("{}/ingest/status", daemon_base_url()))
+        .query(&[("namespace", namespace.as_str())])
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    if resp.status().is_success() {
+        resp.json().map(Some).map_err(|e| e.to_string())
+    } else {
+        Err(resp.text().unwrap_or_else(|_| "Failed to read the ingest status".to_string()))
     }
 }
 
@@ -360,7 +395,8 @@ fn main() {
             get_graph,
             get_last_project_path,
             save_project_path,
-            ingest_ast,
+            start_ingest,
+            ingest_status,
             open_external,
             delete_memory,
             edit_memory,
