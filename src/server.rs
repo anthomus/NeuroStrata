@@ -180,7 +180,9 @@ pub async fn process_mcp_request(
                                 "dir_path": { "type": "string", "description": "Absolute path to the project directory to ingest. Usually the current working directory." },
                                 "namespace": { "type": "string", "description": "The project namespace." },
                                 "dry_run": { "type": "boolean", "description": "If true, produce a preview report without writing or downloading. Default false." },
-                                "dry_run_mode": { "type": "string", "enum": ["estimate", "presort"], "description": "Dry-run mode. estimate: counts/embeddings/cost/secrets. presort: adds junk/duplicate/PII/group analysis." }
+                                "dry_run_mode": { "type": "string", "enum": ["estimate", "presort"], "description": "Dry-run mode. estimate: counts/embeddings/cost/secrets. presort: adds junk/duplicate/PII/group analysis." },
+                                "wait": { "type": "boolean", "description": "Default true: block until the walk ends. A first ingest of a large repository can take hours, so pass false there: the walk starts, this call returns at once, and you read progress later with status: true." },
+                                "status": { "type": "boolean", "description": "If true, report how the namespace's most recent ingest in this daemon is going (state, files_seen, files_ingested, symbols_ingested, last_file) and start nothing." }
                             },
                             "required": ["dir_path", "namespace"]
                         }
@@ -4487,8 +4489,23 @@ async fn handle_ingest_directory(
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
+    if arguments.get("status").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return match ingests.progress(namespace) {
+            Some(progress) => serde_json::to_string(&progress)
+                .unwrap_or_else(|e| format!("ERROR: could not serialize progress: {e}")),
+            // The registry is in memory: a namespace ingested before this daemon
+            // started has a graph on disk and no job here. Say so, so it is not
+            // mistaken for "still running" or "never ingested".
+            None => format!(
+                "No ingest of namespace '{}' has run since this daemon started. Its graph may still exist from an earlier run.",
+                namespace
+            ),
+        };
+    }
+
     let dry_run = arguments.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
     let dry_run_mode = arguments.get("dry_run_mode").and_then(|v| v.as_str()).unwrap_or("estimate").to_string();
+    let wait = arguments.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let schema_str = include_str!("schema.json");
     let schema = match crate::parser::schema::ParserSchema::load(schema_str) {
@@ -4506,35 +4523,48 @@ async fn handle_ingest_directory(
         }
     }
 
+    if !wait {
+        // The walk is registered and runs on its own; this call returns at
+        // once. The work that follows a walk (normalizing targets, announcing
+        // it on the bus) still has to happen, so a waiter attaches to the
+        // registered walk and does it when the walk ends. It attaches rather
+        // than calling `run`, which would start a second walk if the first had
+        // already finished.
+        return match ingests
+            .start(namespace, dir_path, schema, emb.clone(), store.clone())
+            .await
+        {
+            Ok(progress) => {
+                let waiter_ingests = ingests.clone();
+                let waiter_store = store.clone();
+                let waiter_namespace = namespace.to_string();
+                tokio::spawn(async move {
+                    match waiter_ingests.wait_for(&waiter_namespace).await {
+                        Some(Ok(_)) => {
+                            finish_ingest(&*waiter_store, &waiter_namespace, bus).await
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("background ingest of '{}' failed: {e}", waiter_namespace)
+                        }
+                        None => {}
+                    }
+                });
+                format!(
+                    "Ingest of '{}' started in the background (state: {:?}). It keeps running if this call or the session ends. Call neurostrata_ingest_directory with status: true and the same namespace to read progress; files_seen counts every file the walk has passed, and the first ingest of a large repository can take hours.",
+                    namespace, progress.state
+                )
+            }
+            Err(e) => format!("Failed to start ingest of {}: {}", dir_path, e),
+        };
+    }
+
     // Handed to the registry so the walk survives this call: an MCP client that
     // times out and disconnects no longer leaves the graph half-built (bead
     // neurostrata-7ej). Ingestion upserts thousands of rows, and checkpointing
     // each one would dominate the run, so that happens once at the end.
     match ingests.run(namespace, dir_path, schema, emb.clone(), store.clone()).await {
         Ok(progress) => {
-            // AC4: normalize resolvable declared targets so every ingest run
-            // leaves the namespace edge-canonical, not just bus subscribers.
-            // A normalization failure is logged, never silently swallowed.
-            if let Err(e) = crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
-                &*store,
-                namespace,
-            )
-            .await
-            {
-                tracing::warn!("post-ingest normalize failed: {e}");
-            }
-            // Genuinely trigger the live-bus PostIngestNormalize subscriber on
-            // top of the AC4 direct normalize above.
-            if let Some(bus) = bus {
-                bus.emit(
-                    ThalamicPulse::Created {
-                        id: format!("ingest:{namespace}"),
-                        namespace: namespace.to_string(),
-                        kind: "ingest_done".to_string(),
-                    },
-                    &RecursionToken::root(),
-                );
-            }
+            finish_ingest(&*store, namespace, bus).await;
             format!(
                 "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols, {} declared edges relinked.",
                 dir_path,
@@ -4548,6 +4578,37 @@ async fn handle_ingest_directory(
             )
         }
         Err(e) => format!("Failed to ingest directory {}: {}", dir_path, e),
+    }
+}
+
+/// What every successful ingest owes the graph afterwards, whether the caller
+/// waited for the walk or not.
+async fn finish_ingest(
+    store: &dyn VectorStore,
+    namespace: &str,
+    bus: Option<Arc<ThalamicBus>>,
+) {
+    // AC4: normalize resolvable declared targets so every ingest run
+    // leaves the namespace edge-canonical, not just bus subscribers.
+    // A normalization failure is logged, never silently swallowed.
+    if let Err(e) = crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
+        store, namespace,
+    )
+    .await
+    {
+        tracing::warn!("post-ingest normalize failed: {e}");
+    }
+    // Genuinely trigger the live-bus PostIngestNormalize subscriber on
+    // top of the AC4 direct normalize above.
+    if let Some(bus) = bus {
+        bus.emit(
+            ThalamicPulse::Created {
+                id: format!("ingest:{namespace}"),
+                namespace: namespace.to_string(),
+                kind: "ingest_done".to_string(),
+            },
+            &RecursionToken::root(),
+        );
     }
 }
 

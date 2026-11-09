@@ -2329,6 +2329,78 @@ use super::x;"#;
         std::fs::write(tmp.join("hello.rs"), "pub fn hello_new() {}").unwrap();
         ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("modified");
     }
+
+    /// Counts embed calls, which is the cost an ingest is really paying: on a
+    /// CPU embedder each one is real work, and a first ingest of a large
+    /// repository is dominated by them.
+    struct CountingEmbedder {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbedder {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for CountingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![0.0; 4])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    /// The claim a second ingest is cheap rests on this: with no file changed,
+    /// walking the tree again must not embed anything, and changing one file
+    /// must embed only that file's content. Source and markdown are both
+    /// covered, since a docs-heavy repository is mostly the latter.
+    #[tokio::test]
+    async fn an_unchanged_tree_is_not_embedded_again() {
+        let tmp = std::env::temp_dir().join(format!("ns-rehash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(tmp.join("docs")).expect("create");
+        std::fs::write(tmp.join("a.rs"), "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
+        std::fs::write(tmp.join("b.rs"), "pub fn gamma() {}\n").unwrap();
+        std::fs::write(tmp.join("docs/guide.md"), "# Guide\n\nSome prose.\n\n## Next\n\nMore prose.\n").unwrap();
+
+        let db = std::env::temp_dir().join(format!("ns-rehash-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open"));
+        store.init("rehash").await.unwrap();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        let embedder = Arc::new(CountingEmbedder { calls: std::sync::atomic::AtomicUsize::new(0) });
+
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "rehash", None, &[])
+            .await
+            .expect("first");
+        let first = embedder.calls();
+        assert!(first > 0, "the first ingest has to embed something");
+
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "rehash", None, &[])
+            .await
+            .expect("second");
+        assert_eq!(
+            embedder.calls(),
+            first,
+            "an unchanged tree was embedded again: {} new embed call(s)",
+            embedder.calls() - first
+        );
+
+        std::fs::write(tmp.join("b.rs"), "pub fn gamma() {}\npub fn delta() {}\n").unwrap();
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "rehash", None, &[])
+            .await
+            .expect("third");
+        let after_edit = embedder.calls() - first;
+        assert!(after_edit > 0, "a changed file has to be embedded");
+        assert!(
+            after_edit < first,
+            "one changed file cost {after_edit} embed call(s), as much as the whole tree's {first}"
+        );
+    }
 }
 /// Dry-run ingest: walk the tree and produce a report without writing or
 /// downloading anything.

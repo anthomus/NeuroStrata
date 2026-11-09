@@ -267,10 +267,31 @@ impl IngestJobs {
         embedder: Arc<dyn Embedder>,
         vector_store: Arc<dyn VectorStore>,
     ) -> anyhow::Result<IngestProgress> {
-        let mut rx = self
+        let rx = self
             .start_or_attach(namespace, dir, schema, embedder, vector_store)
             .await?;
 
+        Self::await_end(rx, namespace).await
+    }
+
+    /// Waits for the walk already registered under this name, without starting
+    /// one. `None` when there is none.
+    ///
+    /// For a caller that started the walk with `start` and needs to do
+    /// something once it ends. Calling `run` for that would start a second walk
+    /// if the first had already finished.
+    pub async fn wait_for(&self, namespace: &str) -> Option<anyhow::Result<IngestProgress>> {
+        let rx = {
+            let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            jobs.get(namespace).cloned()
+        }?;
+        Some(Self::await_end(rx, namespace).await)
+    }
+
+    async fn await_end(
+        mut rx: watch::Receiver<IngestProgress>,
+        namespace: &str,
+    ) -> anyhow::Result<IngestProgress> {
         loop {
             // Cloned out rather than held: the borrow guard must not be alive
             // across the await below.
@@ -434,6 +455,25 @@ mod tests {
             "and is waited for until it finishes"
         );
         finish.await.expect("the walk reports its end");
+    }
+
+    /// Waiting on a walk must attach to the one registered, never start one:
+    /// the caller is a waiter that wants to act when the walk ends.
+    #[tokio::test]
+    async fn waiting_attaches_to_a_registered_walk_and_starts_none() {
+        let jobs = IngestJobs::new();
+        assert!(jobs.wait_for("none").await.is_none(), "nothing registered, nothing to wait on");
+
+        let (tx, rx) = watch::channel(progress(IngestState::Running));
+        jobs.jobs.lock().unwrap().insert("ns".to_string(), rx);
+
+        let finish = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tx.send_modify(|progress| progress.state = IngestState::Finished);
+        });
+        let outcome = jobs.wait_for("ns").await.expect("registered");
+        assert_eq!(outcome.expect("finished").state, IngestState::Finished);
+        finish.await.unwrap();
     }
 
     #[test]
