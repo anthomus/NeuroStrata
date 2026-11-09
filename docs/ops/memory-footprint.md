@@ -87,12 +87,35 @@ The Rust distance is Euclidean and agrees with the engine's `array_distance` to 
 
 Not the cause. With the real model loaded (574 MB), repeated short and 2000-character embeds moved resident memory by 0 to 2 MB each. Loading the model once peaks at 1094 MB.
 
+### 3.5 The buffer pool cap (`pool_curve_probe`)
+
+The engine's buffer pool caches database pages and, left alone, is sized to most of the machine's memory. After one big search the running daemon went from about 860 MB to about 1.9 GB and stayed there. We capped the pool and measured peak memory and query time on a copy of the database. Each cap ran in its own process: three passes over every namespace, each pass a general search, a task list and a typed search per namespace. No cap produced an error.
+
+| Pool cap | Peak memory | Resident at the end | Warm pass time |
+|---|---|---|---|
+| engine default | about 700 MB | about 580 MB | 3.2 to 4.5 s |
+| 384 MB | 583 to 607 MB | 450 to 475 MB | 3.4 to 4.2 s |
+| 320 MB | 565 to 575 MB | 380 to 455 MB | 4.1 to 4.5 s |
+| 256 MB | 506 MB | 373 MB | 4.8 to 5.0 s |
+| 192 MB | 449 MB | 324 MB | 5.6 to 5.9 s |
+
+Run-to-run noise is large: the default alone ranged from 3.2 to 4.5 s per warm pass across runs, so differences under about 20% are not real. Memory figures were stable. In an earlier run at 64 MB, 8 of 12 queries failed with "The buffer pool is full".
+
+The default is **384 MB**: its speed is indistinguishable from the engine default and it saves about 100 MB of peak memory on this database. Below 320 MB the slowdown is real. A bigger database or a heavier workload needs more pool for the same speed, so the cap is a setting:
+
+- `storage_hygiene.buffer_pool_mb` in `~/.config/neurostrata/config.json`. Default 384. `0` hands the sizing back to the engine.
+- `NEUROSTRATA_BUFFER_POOL_MB` overrides the file when it parses.
+- Anything under 128 MB is raised to 128 MB and a warning is printed, because a pool too small for one query fails that query.
+- A pool-full failure now says which setting to raise.
+
+The daemon prints the pool size it runs with when it starts.
+
 ---
 
 ## 4. Not fixed yet
 
 - `neurostrata_task_list` (+197 MB) and `neurostrata_task_claim` (+107 MB) spike the same way on a fresh daemon. Task `neurostrata-zoz2`.
-- The engine's buffer pool is uncapped by default. A cap of 256 MB cut peak memory by about a quarter in a probe and slowed queries by about half. Task `neurostrata-3q9t`.
+- Whether the 384 MB cap brings the running daemon's steady state down as much as the probe suggests is not measured on a live daemon yet. Compare `memory-growth.log` before and after the restart.
 - `rules_from_rows` in `src/guard/semantic.rs` keeps rows whose score is at least 0.25 and calls that a similarity floor, but store scores are distances. Task `neurostrata-rhnz`. Behavior is unchanged.
 
 ---
