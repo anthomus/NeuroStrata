@@ -1395,9 +1395,17 @@ async fn handle_ingest_status(
     State(state): State<AppState>,
     Query(query): Query<IngestStatusQuery>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    // Matches the folded name the ingest itself resolved to, or a GUI asking
-    // about `pyworkflow` would never find the job it started.
-    let namespace = crate::server::resolve_namespace(&state.vector_store, &query.namespace).await;
+    // Answered from memory wherever possible: this route is polled once a
+    // second while a walk runs, so it should not need the database to answer.
+    //
+    // The fallback still resolves, because the ingest folds the name it was
+    // given and a GUI asking about `pyworkflow` has to find the job it started.
+    // It only runs when the name as given is not already a key.
+    let namespace = if state.ingests.knows(&query.namespace) {
+        query.namespace.clone()
+    } else {
+        crate::server::resolve_namespace(&state.vector_store, &query.namespace).await
+    };
 
     match state.ingests.progress(&namespace) {
         Some(progress) => Ok(Json(serde_json::to_value(progress).unwrap_or_else(
