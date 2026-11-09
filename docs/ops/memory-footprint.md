@@ -110,6 +110,55 @@ The default is **384 MB**: its speed is indistinguishable from the engine defaul
 
 The daemon prints the pool size it runs with when it starts.
 
+### 3.6 Where a fresh process puts its memory (`component_breakdown_probe`)
+
+One process on a copy of a 759 MB database, pool cap 384 MB, real embedder, four namespaces:
+
+| Step | Resident memory |
+|---|---|
+| Process start | 12 MB |
+| Store open | 47 to 59 MB |
+| First vector search, every namespace | 517 to 567 MB |
+| Exact-name search, every namespace | +4 to +45 MB |
+| Embedder loaded | 1,017 to 1,036 MB (peak 1,540 to 1,558 MB while loading) |
+| Second search pass | 1,137 to 1,150 MB |
+| After `HeapCompact` on all 4 process heaps | no change |
+| After `EmptyWorkingSet` | 0 MB |
+| One search pass after that | 553 MB |
+
+- The first search fills the buffer pool (about 320 to 440 MB), then stays flat. Growth on a first search is the pool filling, not a leak.
+- `HeapCompact` freed nothing, so the retained memory is not allocator slack.
+- About 590 MB of the 1.14 GB is resident but idle: the embedder weights, which only embed calls touch, and cold pool pages. A search pass after trimming brought back only 553 MB, and took about 12% longer.
+- A long-running daemon sits roughly 500 MB above this (1.66 GB against 1.14 GB after a similar search). That gap is not explained yet. Task `neurostrata-yl3o`.
+- Trimming the idle working set lowers resident memory, not committed memory: the pages move to the standby list. Unloading the embedder is what lowers committed memory. Tasks `neurostrata-chhm` and `neurostrata-00kg`.
+
+### 3.7 The hygiene repair (`hygiene_writer_wait_probe`)
+
+`repair_namespace_hygiene` used to scan and repair the whole namespace in one write turn. On a large namespace it outlived the 30 second write deadline (the daemon logged `gave up waiting on repairing namespace hygiene`) and every other writer queued behind it.
+
+| Version | Repair time on the 759 MB copy |
+|---|---|
+| One write turn for the whole namespace | over 30 s, deadline hit on the live daemon |
+| One write turn per row (a keyed read per row, a lookup per edge target) | 193 s; the writer waited at most 460 ms |
+| Id-ordered pages, targets resolved once, existing edges read once, plan in Rust, only changes written in chunks of 40 | 2.5 s; live runs took about 3 s and 4 s on two namespaces, and a rerun found nothing to fix |
+
+Things to keep when changing it:
+
+- Readers and writers share one lock (`with_conn` takes the writer's turn), so a long read blocks writers too. Keep every turn short.
+- Do not use `m.id IN [...]` or an `OR` across `id` and `namespace` for lookups. They read the whole embedding column or scan the table.
+- Each metadata write is conditional on the row still holding the metadata that was read, and each ref about to be archived is checked again inside the write turn. Without that, a concurrent edit is overwritten with a stale copy.
+- The repair archives refs that resolve to nothing into `metadata.archived_refs`. It does not relink them.
+- The automatic run fires only when `CARGO_PKG_VERSION` changes (the doctor check in `src/server.rs`). Redeploying the same version does not run it. Use `neurostrata-mcp repair-hygiene <namespace>`, which needs the daemon stopped.
+
+### 3.8 Tried and not kept (do not retry without new evidence)
+
+All measured on a copy of the database with one process per variant.
+
+- **Push the exact-name match into the query** (`lower(location) = t OR lower(content) = t OR lower(metadata) CONTAINS t`, Rust checks kept on the survivors). Exact-name stage: 3.8 s and +42 MB with it, 3.1 s and +4 MB without. A live `search_memory` on the largest namespace grew +615 MB with it deployed, against +649 MB before. The exact-name pass was not the cost. Reverted.
+- **Rank on id and distance only, then fetch the winners by id** (`ids_first`). For one cold namespace: +318 MB and a peak of 397 MB, against +440 MB and 547 MB for the current query, at the same warm latency. Across all namespaces the peak was 555 to 570 MB either way, because the shared pool bounds it. Not kept.
+- **Page the embeddings into Rust and rank there** for `search_memory` (1,000 rows per page). +447 MB and 7.8 s per pass against 0.2 to 0.6 s: about 40 times slower, no memory saved. This works for the guard, which ranks a handful of rules. It does not work for search.
+- **Judging a search by its first call.** A cold search includes the pool filling to its cap. Measure the second call, or growth beyond the pool cap.
+
 ---
 
 ## 4. Not fixed yet
@@ -166,6 +215,12 @@ NS_PROBE_DB=<dir> NS_PROBE_VARIANT=eq cargo test --release --bin neurostrata-mcp
 
 # cost of one embed call with the real model (needs the model in the shared cache)
 cargo test --release --bin neurostrata-mcp embed_call_probe -- --ignored --nocapture
+
+# where a fresh process puts its memory, with trimming stages (NS_PROBE_POOL_MB defaults to 384)
+NS_PROBE_DB=<dir> cargo test --release --bin neurostrata-mcp component_breakdown_probe -- --ignored --nocapture
+
+# how long the hygiene repair takes and how long a concurrent writer waits (NS_PROBE_NS is the namespace)
+NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> cargo test --release --bin neurostrata-mcp hygiene_writer_wait_probe -- --ignored --nocapture
 ```
 
 On a live daemon, call a tool once with nothing else running, then read the last lines of `memory-growth.log`. A call under the threshold writes no line.
