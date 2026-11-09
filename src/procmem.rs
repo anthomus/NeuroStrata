@@ -1104,6 +1104,107 @@ mod tests {
         println!("TASKLIST {variant} | peak {} MB", sample().peak_bytes.unwrap_or(0) / MB);
     }
 
+    /// What a whole `ingest_directory` run costs when a generation already
+    /// exists (bead neurostrata-va1y, for neurostrata-lyrw). Copies
+    /// NS_PROBE_DIR to a temp tree, ingests it, then adds one file and ingests
+    /// again NS_PROBE_PASSES-1 times, so every later pass reads the previous
+    /// generation twice (hash/stamp map, then carry-forward) with older
+    /// generations still in the store. Zero embedder: the reads do not depend on
+    /// it. Prints the highest resident set seen inside each pass. One process
+    /// per code state. Run:
+    ///   NS_PROBE_DIR=<dir> NS_PROBE_PASSES=4 \
+    ///   cargo test --release --bin neurostrata-mcp ingest_reads_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn ingest_reads_probe() {
+        use crate::traits::{Embedder, VectorStore};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        struct Zero;
+        #[async_trait::async_trait]
+        impl Embedder for Zero {
+            async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0; 4])
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+        }
+
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> usize {
+            std::fs::create_dir_all(to).expect("create dir");
+            let mut files = 0;
+            for entry in std::fs::read_dir(from).expect("read dir").flatten() {
+                let name = entry.file_name();
+                let (src, dst) = (entry.path(), to.join(&name));
+                if src.is_dir() {
+                    if matches!(name.to_string_lossy().as_ref(), "target" | ".git" | "node_modules") {
+                        continue;
+                    }
+                    files += copy_tree(&src, &dst);
+                } else if std::fs::copy(&src, &dst).is_ok() {
+                    files += 1;
+                }
+            }
+            files
+        }
+
+        let source = std::path::PathBuf::from(std::env::var("NS_PROBE_DIR").expect("NS_PROBE_DIR"));
+        let passes: usize = std::env::var("NS_PROBE_PASSES").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let pid = std::process::id();
+        let tree = std::env::temp_dir().join(format!("ns-reads-probe-tree-{pid}"));
+        let db = std::env::temp_dir().join(format!("ns-reads-probe-db-{pid}"));
+        std::fs::create_dir_all(&db).expect("create db dir");
+        let files = copy_tree(&source, &tree);
+        println!("READS | tree copied: {files} files");
+
+        let cfg = lbug::SystemConfig::default()
+            .buffer_pool_size(384 * MB)
+            .throw_on_wal_replay_failure(true);
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::with_system_config(&db.join("ladybug.db"), 4, cfg).expect("open"));
+        store.init("probe").await.expect("init");
+        let schema = crate::parser::schema::ParserSchema::load(include_str!("schema.json")).expect("schema");
+        let embedder: Arc<dyn Embedder> = Arc::new(Zero);
+
+        println!("READS | start rss {} MB", sample().rss_bytes.unwrap_or(0) / MB);
+        for pass in 1..=passes {
+            if pass > 1 {
+                std::fs::write(tree.join(format!("probe_added_{pass}.rs")), format!("pub fn probe_{pass}() {{}}\n"))
+                    .expect("add a file");
+            }
+            let max = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let watcher = {
+                let (max, stop) = (max.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        max.fetch_max(sample().rss_bytes.unwrap_or(0) / MB, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                })
+            };
+            let before = sample().rss_bytes.unwrap_or(0) / MB;
+            let t = std::time::Instant::now();
+            crate::parser::ingest::ingest_directory(&tree, &schema, embedder.clone(), store.clone(), "probe", None, &[])
+                .await
+                .expect("ingest");
+            let elapsed = t.elapsed();
+            stop.store(true, Ordering::SeqCst);
+            watcher.join().expect("watcher");
+            let after = sample().rss_bytes.unwrap_or(0) / MB;
+            println!(
+                "READS | pass {pass} | rss {before} -> {after} MB | highest in pass {} MB | {} ms",
+                max.load(Ordering::SeqCst),
+                elapsed.as_millis()
+            );
+        }
+        println!("READS | process peak {} MB", sample().peak_bytes.unwrap_or(0) / MB);
+        std::fs::remove_dir_all(&tree).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
     #[test]
     fn the_guard_counts_calls_in_flight() {
         let before = IN_FLIGHT.load(Ordering::SeqCst);

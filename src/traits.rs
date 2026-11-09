@@ -501,10 +501,12 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// Ingest reads the previous generation twice (to decide whether anything
     /// changed, and to carry unchanged rows forward). It used to call `list`,
     /// which hands back every reachable row with its full text, and keep only
-    /// the rows of one generation. That cost ~100 MB per call on a large
-    /// namespace against ~10 MB for the part ingest uses (bead neurostrata-lyrw).
-    /// Stores that can narrow in the engine override this; the default lists
-    /// the whole namespace, as ingest did before.
+    /// the rows of one generation. In isolation one such read cost ~100 MB on a
+    /// large namespace against a few MB for the part ingest uses; across a whole
+    /// ingest the saving measured only 10 to 30 MB, because the buffer pool is
+    /// already full from the writes (docs/ops/memory-footprint.md section 3.10,
+    /// bead neurostrata-lyrw). Stores that can narrow in the engine override
+    /// this; the default lists the whole namespace, as ingest did before.
     async fn generation_summary(&self, namespace: &str, generation: u64) -> Result<Vec<GenerationRow>> {
         let rows = self.list(namespace, None, None).await?;
         Ok(rows
