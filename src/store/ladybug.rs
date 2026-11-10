@@ -5172,7 +5172,9 @@ impl VectorStore for LadybugStore {
         if payload.user_id != "auto-ingestor" {
             let ids = self.mention_symbol_ids(&namespace).await;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
-            let mut mentions = crate::mention::detect_mentions(&payload.content, &payload.location, &known);
+            let found = crate::mention::detect_mentions_report(&payload.content, &payload.location, &known);
+            let mentions_dropped = found.dropped;
+            let mut mentions = found.ids;
             mentions.retain(|m| m != &id);
             // Skip symbols already declared via related_to (declared intent wins).
             if let Some(arr) = payload.metadata.get("related_to").and_then(|v| v.as_array()) {
@@ -5187,6 +5189,16 @@ impl VectorStore for LadybugStore {
             } else {
                 if let Some(obj) = payload.metadata.as_object_mut() {
                     obj.remove("mentions");
+                }
+            }
+            // A memory that named more symbols than the detector keeps says
+            // so on its row (how many it left out); otherwise the key is not
+            // there, as before.
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                if mentions_dropped > 0 {
+                    obj.insert("mentions_truncated".to_string(), serde_json::json!(mentions_dropped));
+                } else {
+                    obj.remove("mentions_truncated");
                 }
             }
             mentions_for_write = mentions;
@@ -6509,11 +6521,13 @@ impl VectorStore for LadybugStore {
 
             // Mention linking (OxiRS §1.8): rediscover mentions against new index.
             if memory.payload.user_id != "auto-ingestor" {
-                let mut mentions = crate::mention::detect_mentions(
+                let found = crate::mention::detect_mentions_report(
                     &memory.payload.content,
                     &memory.payload.location,
                     &known,
                 );
+                let mentions_dropped = found.dropped;
+                let mut mentions = found.ids;
                 mentions.retain(|m| m != &memory.id);
                 if let Some(arr) = memory.payload.metadata.get("related_to").and_then(|v| v.as_array()) {
                     let declared: std::collections::HashSet<String> =
@@ -6531,6 +6545,13 @@ impl VectorStore for LadybugStore {
                     }
                     for m in &mentions {
                         mention_pairs.push((memory.id.clone(), m.clone()));
+                    }
+                }
+                if let Some(obj) = meta.as_object_mut() {
+                    if mentions_dropped > 0 {
+                        obj.insert("mentions_truncated".to_string(), serde_json::json!(mentions_dropped));
+                    } else {
+                        obj.remove("mentions_truncated");
                     }
                 }
                 mention_updates.push((memory.id.clone(), meta.to_string()));
@@ -10389,6 +10410,46 @@ eurostrata\src\daemon.rs",
             err.contains("does not refer to an existing task"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A memory that names more symbols than the detector keeps says how many
+    /// it left out on its row; one that names few has no such key.
+    #[tokio::test]
+    async fn a_memory_over_the_mention_cap_records_how_many_were_dropped() {
+        let store = retired_test_store().await;
+        for i in 0..40 {
+            let mut p = retired_test_payload("code_ast", "auto-ingestor", json!({}));
+            p.content = format!("fn sym{i}() {{}}");
+            store
+                .upsert("ns-m", &format!("ns-m::1::src/f{i}.rs#functions:sym{i}@h{i}"), vec![0.0; 4], p)
+                .await
+                .expect("symbol row");
+        }
+        // The symbol index is cached per generation set; with no generation
+        // table entries it was filled while the store was still empty.
+        *store.mention_symbol_ids.write().await = None;
+        let write = |id: &'static str, count: usize| {
+            let store = &store;
+            async move {
+                let mut p = retired_test_payload("fact", "agent", json!({}));
+                p.content = (0..count)
+                    .map(|i| format!("src/f{i}.rs#functions:sym{i}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                store.upsert("ns-m", id, vec![0.0; 4], p).await.expect("memory");
+                let (_, got) = store.get("ns-m", id).await.expect("read").expect("row");
+                got.metadata
+            }
+        };
+        let many = write("mem-many", 40).await;
+        assert_eq!(many["mentions"].as_array().unwrap().len(), 32);
+        assert_eq!(many["mentions_truncated"], json!(8));
+        let few = write("mem-few", 5).await;
+        assert_eq!(few["mentions"].as_array().unwrap().len(), 5);
+        assert!(few.get("mentions_truncated").is_none(), "no key when nothing was dropped");
+        // Rewriting the many-mentions memory with fewer clears the count.
+        let fewer = write("mem-many", 3).await;
+        assert!(fewer.get("mentions_truncated").is_none());
     }
 
     /// R14: a memory id is globally unique, so upserting the same id into a

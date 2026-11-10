@@ -146,20 +146,51 @@ pub trait SymbolIndex {
     }
 }
 
+/// What the detector found: the ids it keeps, and how many distinct matches it
+/// had to leave out because of [`MENTION_CAP`].
+pub struct Mentions {
+    pub ids: Vec<String>,
+    pub dropped: usize,
+}
+
+/// How specific the text that matched a symbol was. Lower is more specific:
+/// a full symbol path (`src/a.rs#functions:f`) over a file path or a
+/// `kind:name` form over a bare short alias, which any prose can contain.
+fn specificity(candidate: &str) -> u8 {
+    if candidate.contains('#') {
+        0
+    } else if candidate.contains('/') || candidate.contains(':') {
+        1
+    } else {
+        2
+    }
+}
+
 /// Detect mention symbol ids in `content` and `location`.
 pub fn detect_mentions(content: &str, location: &str, index: &KnownIds) -> Vec<String> {
+    detect_mentions_report(content, location, index).ids
+}
+
+/// Same detection, reporting how many distinct matches the cap left out.
+///
+/// With [`MENTION_CAP`] or fewer matches the result is the matches in text
+/// order, as it always was. With more, the cap keeps the most specific
+/// matches (see [`specificity`]; ties keep text order) instead of the first
+/// ones in the text, and the kept ids are still returned in text order.
+pub fn detect_mentions_report(content: &str, location: &str, index: &KnownIds) -> Mentions {
     if content.len() > 1_048_576 {
         eprintln!("[neurostrata:mention] content exceeds 1 MiB; skipping detection");
-        return Vec::new();
+        return Mentions { ids: Vec::new(), dropped: 0 };
     }
     let candidates = index
         .cached_candidates()
         .unwrap_or_else(|| build_candidates(index));
     if candidates.is_empty() {
-        return Vec::new();
+        return Mentions { ids: Vec::new(), dropped: 0 };
     }
 
-    let mut resolved: Vec<String> = Vec::new();
+    // (id, best specificity seen for it), in order of first appearance.
+    let mut found: Vec<(String, u8)> = Vec::new();
     // We need neighbor checks; process content and location with positions.
     let inputs = [content, location];
     for text in inputs {
@@ -177,17 +208,26 @@ pub fn detect_mentions(content: &str, location: &str, index: &KnownIds) -> Vec<S
                 if is_short_alias(&stripped) && !has_unattached_occurrence(text, &stripped) {
                     continue;
                 }
-                if !resolved.contains(id) {
-                    resolved.push(id.clone());
-                }
-                if resolved.len() >= MENTION_CAP {
-                    eprintln!("[neurostrata:mention] mention cap reached");
-                    return resolved;
+                let class = specificity(&stripped);
+                match found.iter_mut().find(|(seen, _)| seen == id) {
+                    Some((_, best)) => *best = (*best).min(class),
+                    None => found.push((id.clone(), class)),
                 }
             }
         }
     }
-    resolved
+
+    if found.len() <= MENTION_CAP {
+        return Mentions { ids: found.into_iter().map(|(id, _)| id).collect(), dropped: 0 };
+    }
+    let dropped = found.len() - MENTION_CAP;
+    eprintln!("[neurostrata:mention] mention cap reached: kept {MENTION_CAP}, dropped {dropped}");
+    // Stable sort: equally specific matches keep the order they appeared in.
+    let mut by_specificity: Vec<usize> = (0..found.len()).collect();
+    by_specificity.sort_by_key(|&i| found[i].1);
+    let mut keep: Vec<usize> = by_specificity.into_iter().take(MENTION_CAP).collect();
+    keep.sort_unstable();
+    Mentions { ids: keep.into_iter().map(|i| found[i].0.clone()).collect(), dropped }
 }
 
 // Expose KnownIds ids via trait-like method added in ladybug.rs.
@@ -239,5 +279,60 @@ mod tests {
             .join(" ");
         let got = detect_mentions(&content, "", &index);
         assert_eq!(got.len(), MENTION_CAP);
+    }
+
+    fn ids_of(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|i| format!("ns::1::src/f{}.rs#functions:sym{}@h{}", i, i, i))
+            .collect()
+    }
+
+    #[test]
+    fn at_or_under_the_cap_nothing_is_dropped_and_text_order_holds() {
+        let ids = ids_of(40);
+        let index = KnownIds::new(ids.iter().map(|s| s.as_str()));
+        let content = (0..MENTION_CAP)
+            .rev()
+            .map(|i| format!("src/f{}.rs#functions:sym{}", i, i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let got = detect_mentions_report(&content, "", &index);
+        assert_eq!(got.dropped, 0);
+        assert_eq!(got.ids.len(), MENTION_CAP);
+        assert!(got.ids[0].contains("f31.rs"), "text order, not sorted: {:?}", got.ids[0]);
+    }
+
+    #[test]
+    fn over_the_cap_the_count_dropped_is_reported() {
+        let ids = ids_of(40);
+        let index = KnownIds::new(ids.iter().map(|s| s.as_str()));
+        let content = (0..40)
+            .map(|i| format!("src/f{}.rs#functions:sym{}", i, i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let got = detect_mentions_report(&content, "", &index);
+        assert_eq!(got.ids.len(), MENTION_CAP);
+        assert_eq!(got.dropped, 8);
+    }
+
+    #[test]
+    fn over_the_cap_specific_matches_beat_earlier_short_aliases() {
+        // 32 symbols mentioned first by their bare name (short alias), then 8
+        // mentioned by full path. The old cut kept the first 32 in text order
+        // (all aliases); the cut now keeps the 8 full paths and 24 aliases.
+        let ids = ids_of(40);
+        let index = KnownIds::new(ids.iter().map(|s| s.as_str()));
+        let aliases = (0..32).map(|i| format!("sym{}", i));
+        let paths = (32..40).map(|i| format!("src/f{}.rs#functions:sym{}", i, i));
+        let content = aliases.chain(paths).collect::<Vec<_>>().join(" ");
+        let got = detect_mentions_report(&content, "", &index);
+        assert_eq!(got.ids.len(), MENTION_CAP);
+        assert_eq!(got.dropped, 8);
+        for i in 32..40 {
+            assert!(got.ids.contains(&ids[i]), "full-path mention {i} is kept");
+        }
+        let kept_aliases: Vec<&String> = got.ids.iter().filter(|id| !ids[32..].contains(id)).collect();
+        assert_eq!(kept_aliases.len(), 24);
+        assert!(kept_aliases.iter().all(|id| ids[..24].contains(id)), "ties keep text order");
     }
 }
