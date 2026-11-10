@@ -23,6 +23,7 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ### Known
 
+- Superseded ingest generations are never pruned, and each changed ingest copies every unchanged row forward. On a copy of the live database 52% of one namespace's rows (9,170 of 17,458) were superseded copies. In a probe of repeated changed ingests the highest memory kept rising for five passes (362 to 602 MB, zero embedder), each pass took about 140 s (99% in the copy), and the sixth hit write timeouts. The probe does not run the daemon's periodic checkpoint, so the stall may not reproduce in a daemon; that is untested. `docs/ops/memory-footprint.md` section 3.11. Task `neurostrata-bcui`.
 - `neurostrata_task_list` (+197 MB) and `neurostrata_task_claim` (+107 MB) spike the daemon the same way on a fresh start. Both are tracked in `docs/ops/memory-footprint.md`, section 4.
 
 ---

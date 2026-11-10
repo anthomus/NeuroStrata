@@ -1104,6 +1104,70 @@ mod tests {
                 Ok(Vec::new())
             } else if variant == "tasks" {
                 store.list(&ns, None, Some("task")).await
+            } else if variant == "generations" {
+                // Rows per generation, ids only (bead neurostrata-ef8h): how
+                // much of a namespace is superseded generations that `list`
+                // hides. Counts only; no content.
+                let ns2 = ns.clone();
+                let (total, by_gen, unscoped) = store
+                    .with_conn(move |conn| {
+                        let q = format!("MATCH (m:Memory) WHERE m.namespace = '{ns2}' RETURN m.id");
+                        let mut res = conn.query(&q)?;
+                        let mut by_gen: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+                        let (mut total, mut unscoped) = (0usize, 0usize);
+                        while let Some(row) = res.next() {
+                            total += 1;
+                            match crate::parser::ingest::split_scoped_id(&format!("{}", row[0])) {
+                                Some((_, g, _)) => *by_gen.entry(g).or_insert(0) += 1,
+                                None => unscoped += 1,
+                            }
+                        }
+                        Ok((total, by_gen, unscoped))
+                    })
+                    .await
+                    .expect("ids");
+                println!("TASKLIST generations | rows in the store {total} | unscoped {unscoped} | rows per generation {by_gen:?}");
+                let live = store.list(&ns, None, None).await.expect("list").len();
+                println!("TASKLIST generations | rows `list` returns (reachable) {live}");
+                Ok(Vec::new())
+            } else if variant == "relink_full" || variant == "relink_lean" {
+                // The rows `relink_edges` reads (bead neurostrata-ef8h): all of
+                // them with content (`full`), or content only for rows that
+                // are not auto-ingested (`lean`). Same columns as list_rows,
+                // without its generation filter, so this over-reads slightly
+                // for both variants alike.
+                let lean = variant == "relink_lean";
+                let ns2 = ns.clone();
+                let n = store
+                    .with_conn(move |conn| {
+                        let mut n = 0usize;
+                        let mut bytes = 0usize;
+                        let queries = if lean {
+                            vec![
+                                format!("MATCH (m:Memory) WHERE m.namespace = '{ns2}' AND m.user_id = 'auto-ingestor' RETURN m.id, '', m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata"),
+                                format!("MATCH (m:Memory) WHERE m.namespace = '{ns2}' AND m.user_id <> 'auto-ingestor' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata"),
+                            ]
+                        } else {
+                            vec![format!("MATCH (m:Memory) WHERE m.namespace = '{ns2}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata")]
+                        };
+                        let mut held: Vec<Vec<String>> = Vec::new();
+                        for q in queries {
+                            let mut res = conn.query(&q)?;
+                            while let Some(row) = res.next() {
+                                let cells: Vec<String> = (0..8).map(|i| format!("{}", row[i])).collect();
+                                bytes += cells.iter().map(|c| c.len()).sum::<usize>();
+                                held.push(cells);
+                                n += 1;
+                            }
+                        }
+                        println!("TASKLIST {} | rows {n} | text held {} MB", if lean { "relink_lean" } else { "relink_full" }, bytes / (1024 * 1024));
+                        drop(held);
+                        Ok(n)
+                    })
+                    .await
+                    .expect("relink query");
+                let _ = n;
+                Ok(Vec::new())
             } else if variant == "shape" {
                 // Counts only: which row types a namespace holds, and how many
                 // carry a generation-scoped id.
