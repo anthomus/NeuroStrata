@@ -141,6 +141,39 @@ fn allocate_task_id(key: &str, existing: &HashSet<String>) -> Option<String> {
     None
 }
 
+/// The task's work lineage (itself plus every id it supersedes, breadth-first,
+/// bounded and cycle-safe) read with keyed gets. Matches `gate::work_lineage`
+/// over a full listing; a row that cannot be found ends that branch.
+async fn work_lineage_via_store(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    id: &str,
+) -> Result<Vec<String>, String> {
+    let mut lineage: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    queue.push_back(id.to_string());
+    while lineage.len() < gate::MAX_CHAIN {
+        let Some(current) = queue.pop_front() else {
+            break;
+        };
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        let row = store
+            .get(namespace, &current)
+            .await
+            .map_err(|e| format!("Failed to read task '{}' for its lineage: {}", current, e))?;
+        if let Some((_, payload)) = row {
+            for next in gate::superseded_ids(&payload.metadata) {
+                queue.push_back(next.to_string());
+            }
+        }
+        lineage.push(current);
+    }
+    Ok(lineage)
+}
+
 /// Allocates an unused id with one keyed `get` per candidate. It used to list
 /// the whole namespace to build a HashSet (neurostrata-evcp): that read every
 /// row, embeddings included, to answer "is this 4-character suffix free?".
@@ -2051,9 +2084,15 @@ pub async fn handle_task_complete(
         .unwrap_or("unknown")
         .to_string();
 
+    // Lock 2 only needs the rows that mention this task's work lineage, not the
+    // namespace: the lineage is walked with keyed gets and the rows come from
+    // one narrowed read (bead neurostrata-qb06; this used to list the whole
+    // namespace up to three times). Same answer as `extraction_exists` over a
+    // full listing; do not widen it back.
+    let lineage = work_lineage_via_store(&store, &namespace, &id).await?;
     let list_now = || async {
         store
-            .list(&namespace, None, None)
+            .list_mentioning(&namespace, &lineage)
             .await
             .map_err(|e| format!("Failed to list memories in '{}': {}", namespace, e))
     };
@@ -2061,7 +2100,7 @@ pub async fn handle_task_complete(
     // Path 1: the edge already exists (a memory written earlier with
     // `extracted_from: [id]`).
     let mut memories = list_now().await?;
-    let mut edge = gate::extraction_exists(&memories, &id, now);
+    let mut edge = gate::extraction_exists_in_lineage(&memories, &lineage, &id, now);
 
     // Path 2: bind an already-written memory. Its existing vector is reused
     // verbatim -- linking must never change what the memory ranks for.
@@ -2119,7 +2158,7 @@ pub async fn handle_task_complete(
                 })?;
             // Verified after the write: the rule is an edge *after the call*.
             memories = list_now().await?;
-            edge = gate::extraction_exists(&memories, &id, now);
+            edge = gate::extraction_exists_in_lineage(&memories, &lineage, &id, now);
         }
     }
 
@@ -2291,7 +2330,7 @@ pub async fn handle_task_complete(
                 }
             }
             memories = list_now().await?;
-            edge = gate::extraction_exists(&memories, &id, now);
+            edge = gate::extraction_exists_in_lineage(&memories, &lineage, &id, now);
             let lesson_id = report
                 .upsert
                 .as_ref()
@@ -5361,6 +5400,46 @@ mod tests {
         assert_eq!(ns_key("NeuroStrata"), "neurostrata");
         assert_eq!(ns_key("my project"), "my-project");
         assert_eq!(ns_key("..."), "ns", "a keyless namespace still gets an id");
+    }
+
+    /// The keyed lineage walk and the narrowed extraction read must agree with
+    /// the full-listing gate (bead neurostrata-qb06): a lesson that names the
+    /// task a row superseded still discharges the row, and an unrelated row
+    /// does not.
+    #[tokio::test]
+    async fn the_narrowed_lock_2_read_agrees_with_the_full_listing() {
+        let store = temp_store().await;
+        let row = |content: &str, meta: Value| MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: meta,
+        };
+        let v = vec![0.0f32; 4];
+        for (id, meta) in [
+            ("ns-new", json!({ "supersedes": "ns-old" })),
+            ("ns-old", json!({})),
+            ("ns-lesson", json!({ "extracted_from": ["ns-old"] })),
+            ("ns-other", json!({ "extracted_from": ["ns-zzzz"] })),
+        ] {
+            store.upsert("global", id, v.clone(), row(id, meta)).await.unwrap();
+        }
+        let lineage = work_lineage_via_store(&store, "global", "ns-new").await.unwrap();
+        assert_eq!(lineage, vec!["ns-new".to_string(), "ns-old".to_string()]);
+        let narrowed = store.list_mentioning("global", &lineage).await.unwrap();
+        let full = store.list("global", None, None).await.unwrap();
+        assert!(narrowed.len() < full.len(), "the read is narrowed");
+        assert_eq!(
+            gate::extraction_exists_in_lineage(&narrowed, &lineage, "ns-new", 0),
+            gate::extraction_exists(&full, "ns-new", 0)
+        );
+        assert!(gate::extraction_exists_in_lineage(&narrowed, &lineage, "ns-new", 0));
+        let unrelated = work_lineage_via_store(&store, "global", "ns-other").await.unwrap();
+        let narrowed = store.list_mentioning("global", &unrelated).await.unwrap();
+        assert!(!gate::extraction_exists_in_lineage(&narrowed, &unrelated, "ns-other", 0));
     }
 
     #[test]

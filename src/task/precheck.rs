@@ -8,17 +8,21 @@ pub async fn normalize_and_precheck_namespace(
     store: &dyn crate::traits::VectorStore,
     namespace: &str,
 ) -> Result<(), String> {
-    crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
-        store, namespace,
-    )
-    .await
-    .inspect_err(|e| {
-        tracing::warn!("precheck normalize_namespace_targets failed for '{namespace}': {e}");
-    })?;
-    let memories = store
+    // One whole-namespace read serves both steps: normalize hands back the
+    // rows with its rewrites applied, which is what a relist would return.
+    // This used to list twice (bead neurostrata-qb06).
+    let listed = store
         .list(namespace, None, None)
         .await
         .map_err(|e| e.to_string())?;
+    let (memories, _updated) =
+        crate::events::subscribers::post_ingest_normalize::normalize_listed_targets(
+            store, namespace, listed,
+        )
+        .await
+        .inspect_err(|e| {
+            tracing::warn!("precheck normalize_namespace_targets failed for '{namespace}': {e}");
+        })?;
     let summary = crate::diagnostic::classify::classify_namespace_targets(&memories);
     match crate::diagnostic::classify::classify_unmatched(
         summary.materialized,

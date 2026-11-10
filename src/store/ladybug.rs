@@ -6790,6 +6790,19 @@ impl VectorStore for LadybugStore {
         self.list_rows(namespace, None, None, Some("pinned")).await
     }
 
+    async fn list_mentioning(&self, namespace: &str, needles: &[String]) -> Result<Vec<SearchResult>> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        for needle in needles {
+            for row in self.list_rows(namespace, None, None, Some(needle)).await? {
+                if seen.insert(row.id.clone()) {
+                    out.push(row);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
         let namespace = namespace.to_string();
         let id = id.to_string();

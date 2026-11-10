@@ -77,10 +77,24 @@ pub async fn normalize_namespace_targets(
         .list(namespace, None, None)
         .await
         .map_err(|e| e.to_string())?;
+    let (rows, updated) = normalize_listed_targets(store, namespace, all).await?;
+    Ok((rows.len(), updated))
+}
+
+/// [`normalize_namespace_targets`] over a listing the caller already holds.
+/// Returns the rows with every rewrite applied in memory, so a caller that
+/// needs the post-normalize state (the AC4 precheck) does not list the
+/// namespace a second time (bead neurostrata-qb06).
+pub async fn normalize_listed_targets(
+    store: &dyn crate::traits::VectorStore,
+    namespace: &str,
+    mut all: Vec<crate::traits::SearchResult>,
+) -> Result<(Vec<crate::traits::SearchResult>, usize), String> {
     let known = crate::store::ladybug::KnownIds::new(all.iter().map(|m| m.id.as_str()));
     let mut updated = 0usize;
+    let mut rewritten: Vec<(usize, serde_json::Value)> = Vec::new();
 
-    for mem in &all {
+    for (idx, mem) in all.iter().enumerate() {
         // Ingest-derived and namespace-qualified rows are the target side of
         // the graph (they are what resolution points AT, not declarations).
         if mem.payload.user_id == "auto-ingestor"
@@ -98,15 +112,19 @@ pub async fn normalize_namespace_targets(
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("normalize: row {} vanished mid-pass", mem.id))?;
-        fresh.metadata = payload.metadata;
+        fresh.metadata = payload.metadata.clone();
         store
             .upsert(namespace, &mem.id, vector, fresh)
             .await
             .map_err(|e| e.to_string())?;
+        rewritten.push((idx, payload.metadata));
         updated += 1;
     }
 
-    Ok((all.len(), updated))
+    for (idx, metadata) in rewritten {
+        all[idx].payload.metadata = metadata;
+    }
+    Ok((all, updated))
 }
 
 #[cfg(test)]

@@ -126,7 +126,7 @@ pub(crate) fn is_retired(metadata: &Value, now: i64) -> bool {
 
 /// The chain bound: a namespace is written by many hands, so a loop in the
 /// lineage is data, not a hang.
-const MAX_CHAIN: usize = 32;
+pub(crate) const MAX_CHAIN: usize = 32;
 
 /// The rows a row replaced, as borrowed ids. `supersedes` is written as one
 /// id, but a hand-edited row may carry a list, and a list is read as a list.
@@ -214,6 +214,18 @@ pub(crate) fn work_lineage(memories: &[SearchResult], id: &str) -> Vec<String> {
 /// store hides it from search. The store hides; the gate refuses to forgive.
 pub fn extraction_exists(memories: &[SearchResult], task_id: &str, now: i64) -> bool {
     let lineage = work_lineage(memories, task_id);
+    extraction_exists_in_lineage(memories, &lineage, task_id, now)
+}
+
+/// [`extraction_exists`] with the work lineage already resolved, so a caller
+/// holding only the rows that mention the lineage's ids (not the whole
+/// namespace) gets the same answer.
+pub(crate) fn extraction_exists_in_lineage(
+    memories: &[SearchResult],
+    lineage: &[String],
+    task_id: &str,
+    now: i64,
+) -> bool {
     memories.iter().any(|m| {
         m.id != task_id
             && !is_retired(&m.payload.metadata, now)

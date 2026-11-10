@@ -495,6 +495,17 @@ pub trait VectorStore: Send + Sync + AsAny {
         self.list(namespace, None, None).await
     }
 
+    /// Rows whose metadata text mentions any of `needles`: a superset of the
+    /// rows that declare `extracted_from` one of those ids, for the Lock 2
+    /// check in `task_complete`, which would discard every other row. Stores
+    /// that can narrow in the engine override this; the default lists the whole
+    /// namespace. `task_complete` listed the namespace up to three times
+    /// (bead neurostrata-qb06).
+    async fn list_mentioning(&self, namespace: &str, needles: &[String]) -> Result<Vec<SearchResult>> {
+        let _ = needles;
+        self.list(namespace, None, None).await
+    }
+
     /// What ingest needs to know about each row of one generation, without the
     /// row's content or full metadata.
     ///
