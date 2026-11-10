@@ -295,6 +295,19 @@ An ingest with a changed file copies every unchanged row into the new generation
 - What did change: `IngestObserver::carry_forward(carried, total)` reports progress while the copy runs, and `IngestProgress` carries `carried_nodes` and `carry_total` (task `neurostrata-wt2r`). The GUI banner was not changed: no GUI file in this repository reads `relinked_edges` or the other progress fields.
 - Not measured: the commit share of the 6.4 ms `MERGE`, or a single-transaction version.
 
+#### First-ingest write throughput, release build (task `neurostrata-ok2q`)
+
+The same probe times its own first ingest (zero embedder, 384 MB pool, no periodic checkpoint, one run each):
+
+| Tree | Rows written | Time | Per row |
+|---|---|---|---|
+| the repository | 7,502 | 182.1 s | 24.3 ms |
+| `src` only | 4,423 | 139.8 s | 31.6 ms |
+
+- The store write path is slow with no embedder involved, in a release build: about 32 to 41 rows per second.
+- A first-ingest row goes through the same `upsert` as a carried row, so the same split applies (edge materialization and the provenance stamp are most of it, section 3.12). The probe timed the upsert call, not the ingest's per-item loop, so the split is borrowed from the carried-row run.
+- Batching the per-item upserts would need a write that runs many rows through the same checks and edge queries in one transaction. That does not exist, and writing one that leaves rows and edges identical to today's is a change to `upsert` itself, not to the ingest loop. Not done; the tree sizes differ between rows, so the per-row figures are not a controlled comparison.
+
 ---
 
 ## 4. Not fixed yet
