@@ -132,6 +132,25 @@ One process on a copy of a 759 MB database, pool cap 384 MB, real embedder, four
 - A long-running daemon sits roughly 500 MB above this (1.66 GB against 1.14 GB after a similar search). That gap is not explained yet. Task `neurostrata-yl3o`.
 - Trimming the idle working set lowers resident memory, not committed memory: the pages move to the standby list. Unloading the embedder is what lowers committed memory. Tasks `neurostrata-chhm` and `neurostrata-00kg`.
 
+### 3.7 The hygiene repair (`hygiene_writer_wait_probe`)
+
+`repair_namespace_hygiene` used to scan and repair the whole namespace in one write turn. On a large namespace it outlived the 30 second write deadline (the daemon logged `gave up waiting on repairing namespace hygiene`) and every other writer queued behind it.
+
+| Version | Repair time on the 759 MB copy |
+|---|---|
+| One write turn for the whole namespace | over 30 s, deadline hit on the live daemon |
+| One write turn per row (a keyed read per row, a lookup per edge target) | 193 s; the writer waited at most 460 ms |
+| Id-ordered pages, targets resolved once, existing edges read once, plan in Rust, only changes written in chunks of 40 | 2.5 s; live runs took about 3 s and 4 s on two namespaces, and a rerun found nothing to fix |
+
+Things to keep when changing it:
+
+- Readers and writers share one lock (`with_conn` takes the writer's turn), so a long read blocks writers too. Keep every turn short.
+- Look rows up by `m.id = '...'`: it is a hash-indexed primary-key lookup (about 0.4 ms in a 20,000-row probe). `m.id IN [...]`, an `OR` across `id` and `namespace`, and `STARTS WITH` do not use that index; `EXPLAIN` shows a full `SCAN_NODE_TABLE` with a filter (1.6 to 2 ms there). A scan is cheap while the query returns small columns. The large memory cost in section 1 comes from also reading `m.embedding`, which the repair never does.
+- The candidate pass only chooses rows and writes nothing. Each chunk of candidates is repaired in one write turn that re-reads the rows and everything they are planned from, with keyed lookups, so a plan is never older than its turn. The turn holds the store's single lock (`with_conn` and `write_with_deadline` share it) and the database file lock keeps other processes out. If a read in the turn fails, nothing is written. A row that stopped needing repair is skipped; one that started needing it waits for the next run.
+- Timings of the current version, single runs on a copy of the live database made with `neurostrata-mcp backup` (`hygiene_writer_wait_probe`, one process per run). The largest namespace: 4.2 s with 4 shape and 3 dangling fixes, then 4.1 s with none; the previous version with per-row rechecks took 4.3 s and 4.1 s with the same result. A writer to another namespace waited 0.5 s at most in both. Almost all of that time is the read-only candidate pass, because only 7 rows needed repair. With 3,000 synthetic rows that all needed repair (an empty temp store, 4-float embeddings): 14.2 s for the current version and 26.3 s for the previous one, and a second pass took 0.3 s. Not measured: repeated runs, a cold file cache, or a namespace larger than the copy's.
+- The repair archives refs that resolve to nothing into `metadata.archived_refs`. It does not relink them.
+- The automatic run fires only when `CARGO_PKG_VERSION` changes (the doctor check in `src/server.rs`). Redeploying the same version does not run it. Use `neurostrata-mcp repair-hygiene <namespace>`, which needs the daemon stopped.
+
 ### 3.8 Tried and not kept (do not retry without new evidence)
 
 All measured on a copy of the database with one process per variant.
@@ -283,6 +302,9 @@ cargo test --release --bin neurostrata-mcp embed_call_probe -- --ignored --nocap
 
 # where a fresh process puts its memory, with trimming stages (NS_PROBE_POOL_MB defaults to 384)
 NS_PROBE_DB=<dir> cargo test --release --bin neurostrata-mcp component_breakdown_probe -- --ignored --nocapture
+
+# how long the hygiene repair takes and how long a concurrent writer waits (NS_PROBE_NS is the namespace)
+NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> cargo test --release --bin neurostrata-mcp hygiene_writer_wait_probe -- --ignored --nocapture
 
 # whole-namespace listing against narrower reads: NS_PROBE_VARIANT is all, tasks, pinned, ingest_nodes,
 # generation_summary (what ingest reads), shape (row counts by type, no content), generations (rows per
