@@ -68,6 +68,36 @@ pub fn has_source(metadata: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// The part of one generation row that ingest reads: enough to compare file
+/// hashes, check the version stamp and carry the row forward by id. Never the
+/// row's content or the rest of its metadata (bead neurostrata-lyrw).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRow {
+    pub id: String,
+    pub memory_type: String,
+    /// The file the row came from.
+    pub location: String,
+    pub file_sha256: Option<String>,
+    /// `metadata.ingest_version`, or empty when the row has none.
+    pub ingest_version: String,
+}
+
+impl GenerationRow {
+    pub fn from_payload(id: String, payload: &MemoryPayload) -> Self {
+        Self::from_parts(id, payload.memory_type.clone(), payload.location.clone(), &payload.metadata)
+    }
+
+    pub fn from_parts(id: String, memory_type: String, location: String, metadata: &Value) -> Self {
+        Self {
+            id,
+            memory_type,
+            location,
+            file_sha256: metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ingest_version: metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        }
+    }
+}
+
 /// Represents a search result from the vector database
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SearchResult {
@@ -330,6 +360,28 @@ pub trait VectorStore: Send + Sync + AsAny {
         include_archived: bool,
     ) -> Result<Vec<SearchResult>>;
 
+    /// Closest memories of the given `memory_types` only: one vector scan, no
+    /// graph expansion, no ranking boosts. For callers that keep a few rows of
+    /// known types and discard the rest (the guard's rule lookup), so the
+    /// general `search` path's expansion work is not paid for nothing.
+    ///
+    /// Default: `search` with a wider budget, filtered to the types. Stores
+    /// with a typed query override it.
+    async fn search_by_types(
+        &self,
+        namespace: &str,
+        vector: Vec<f32>,
+        limit: usize,
+        memory_types: &[String],
+    ) -> Result<Vec<SearchResult>> {
+        let mut rows = self
+            .search(namespace, vector, limit.saturating_mul(10).max(limit), true, true)
+            .await?;
+        rows.retain(|r| memory_types.iter().any(|t| t == &r.payload.memory_type));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
     /// Unboosted raw-distance dedup candidate query. Returns up to `query.limit`
     /// active domain-memory candidates ordered by the unboosted distance metric.
     /// Default: empty (stores that cannot filter stay honest).
@@ -433,6 +485,36 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// Pushing filters into the query (rather than filtering in Rust) avoids
     /// deserialising every row in large namespaces (R15).
     async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>>;
+
+    /// Rows whose metadata mentions `pinned`: a superset of the pinned rows,
+    /// for callers that only want those and would discard the rest. Stores
+    /// that can narrow in the engine override this; the default lists the
+    /// whole namespace. Listing everything to find a few pinned rows cost
+    /// ~100 MB per call on a large namespace (bead neurostrata-zoz2).
+    async fn list_pinned(&self, namespace: &str) -> Result<Vec<SearchResult>> {
+        self.list(namespace, None, None).await
+    }
+
+    /// What ingest needs to know about each row of one generation, without the
+    /// row's content or full metadata.
+    ///
+    /// Ingest reads the previous generation twice (to decide whether anything
+    /// changed, and to carry unchanged rows forward). It used to call `list`,
+    /// which hands back every reachable row with its full text, and keep only
+    /// the rows of one generation. In isolation one such read cost ~100 MB on a
+    /// large namespace against a few MB for the part ingest uses; across a whole
+    /// ingest the saving measured only 10 to 30 MB, because the buffer pool is
+    /// already full from the writes (docs/ops/memory-footprint.md section 3.10,
+    /// bead neurostrata-lyrw). Stores that can narrow in the engine override
+    /// this; the default lists the whole namespace, as ingest did before.
+    async fn generation_summary(&self, namespace: &str, generation: u64) -> Result<Vec<GenerationRow>> {
+        let rows = self.list(namespace, None, None).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == generation))
+            .map(|r| GenerationRow::from_payload(r.id, &r.payload))
+            .collect())
+    }
 
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;

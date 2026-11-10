@@ -1049,6 +1049,13 @@ pub async fn process_mcp_request(
                     crate::synaptic_mesh::attention::global_attention_filter()
                         .record_mcp_tool_call(name, &arguments);
 
+                    // Logs the call if it left the daemon markedly larger
+                    // (see procmem). Held until the handler below returns.
+                    let _memory_guard = crate::procmem::CallGuard::begin(
+                        name,
+                        arguments.get("namespace").and_then(|v| v.as_str()),
+                    );
+
                     match name {
                         "neurostrata_list_namespaces" => {
                             result_text = crate::handlers::memory::handle_list_namespaces(store.clone()).await;
@@ -4456,6 +4463,11 @@ async fn handle_get_snapshot(
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
     }
+    // Only when memory is high or a query failed for lack of buffer pool; an
+    // agent reads the snapshot first, so this is where it learns of it.
+    if let Some(advisory) = crate::procmem::snapshot_notice() {
+        parts.push(advisory);
+    }
     if !golden_section.is_empty() {
         parts.push(golden_section);
     }
@@ -5649,16 +5661,14 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
         .unwrap_or_default();
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
         let status = crate::storage::compute_storage_status(ls.local_path(), &hygiene_cfg);
-        return serde_json::to_string(&status)
-            .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}).to_string());
+        return crate::procmem::status_with_process_memory(&status);
     }
     let db_path = cfg
         .as_ref()
         .map(|c| std::path::PathBuf::from(c.db_path.clone()))
         .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
     let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
-    serde_json::to_string(&status)
-        .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}).to_string())
+    crate::procmem::status_with_process_memory(&status)
 }
 
 pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
@@ -8191,8 +8201,12 @@ async fn handle_guard_validate(
             | "grep" | "glob"
     );
     if mutating {
-        // Determine whether this namespace is task-enabled.
-        let memories = match store.list(&namespace, None, None).await {
+        // Determine whether this namespace is task-enabled. Only task rows
+        // matter here, so the type filter goes into the query: listing the
+        // whole namespace (every AST symbol and doc section, with vectors)
+        // on each mutating call grew the daemon by hundreds of MB and made
+        // the pre-edit hook time out.
+        let memories = match store.list(&namespace, None, Some("task")).await {
             Ok(memories) => memories,
             Err(e) => {
                 // Fail closed: a store read error must never silently

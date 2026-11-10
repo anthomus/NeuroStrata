@@ -70,16 +70,18 @@ impl SemanticEvaluator {
         payload: &str,
         limit: usize,
     ) -> Result<Vec<BehavioralRule>> {
-        let vector = self.embedder.embed(payload).await?;
+        // The embedding only picks candidates; the trigger match below runs on
+        // the full payload. A whole-file edit does not need to be embedded
+        // whole.
+        let vector = self.embedder.embed(embed_input(payload)).await?;
 
-        // The store's row-class flags belong to the general search path's
-        // contract. The guard asks for everything in its own namespace and
-        // applies its own rule filter below (the `guard_rule` metadata
-        // fields), so a change to the store's contract cannot silently change
-        // which rules the guard is able to see.
+        // Only rule rows can become guard rules, so the scan is limited to
+        // those types instead of ranking the whole namespace (every AST
+        // symbol and doc section) and discarding all but a few rows.
+        let rule_types: Vec<String> = RULE_MEMORY_TYPES.iter().map(|t| t.to_string()).collect();
         let mut combined = self
             .store
-            .search(&self.namespace, vector.clone(), limit, true, true)
+            .search_by_types(&self.namespace, vector.clone(), limit, &rule_types)
             .await?;
 
         let mut seen_ids: std::collections::HashSet<String> =
@@ -90,12 +92,7 @@ impl SemanticEvaluator {
             .list(&self.namespace, None, Some("guard_rule"))
             .await
         {
-            for mut row in listed {
-                if seen_ids.insert(row.id.clone()) {
-                    row.score = row.score.max(1.0);
-                    combined.push(row);
-                }
-            }
+            merge_listed_rules(&mut combined, &mut seen_ids, listed);
         }
 
         if self.namespace != "global" {
@@ -104,16 +101,11 @@ impl SemanticEvaluator {
                 .list("global", None, Some("guard_rule"))
                 .await
             {
-                for mut row in global_listed {
-                    if seen_ids.insert(row.id.clone()) {
-                        row.score = row.score.max(1.0);
-                        combined.push(row);
-                    }
-                }
+                merge_listed_rules(&mut combined, &mut seen_ids, global_listed);
             }
             if let Ok(global_search) = self
                 .store
-                .search("global", vector, limit, true, true)
+                .search_by_types("global", vector, limit, &rule_types)
                 .await
             {
                 for row in global_search {
@@ -179,6 +171,17 @@ impl SemanticEvaluator {
     }
 }
 
+/// The most of a payload the guard embeds to pick rule candidates.
+const MAX_EMBED_CHARS: usize = 2000;
+
+/// The leading part of `payload` the guard embeds, cut on a char boundary.
+fn embed_input(payload: &str) -> &str {
+    match payload.char_indices().nth(MAX_EMBED_CHARS) {
+        Some((end, _)) => &payload[..end],
+        None => payload,
+    }
+}
+
 /// Turn raw search rows into guard rules, dropping every row that either
 /// cannot prove it is a rule (rule types only) or sits below the similarity
 /// cutoff (`MIN_CONSTRAINT_SIMILARITY`). A pure pass over the search results so
@@ -203,6 +206,29 @@ pub(crate) fn rules_from_rows(
             })
         })
         .collect()
+}
+
+/// Adds the listed `guard_rule` rows to `combined`. A listed guard rule is
+/// always eligible, whatever its distance to the payload: the trigger match
+/// that follows decides whether it fires. A rule the typed search already
+/// returned keeps its row but takes the listing's score. Search scores are
+/// distances, and a very close rule (distance below the cutoff) would
+/// otherwise be dropped by `rules_from_rows`, which the listing used to
+/// prevent before typed search made it likely that the nearest rule is already
+/// in `combined`.
+fn merge_listed_rules(
+    combined: &mut Vec<crate::traits::SearchResult>,
+    seen_ids: &mut std::collections::HashSet<String>,
+    listed: Vec<crate::traits::SearchResult>,
+) {
+    for mut row in listed {
+        if seen_ids.insert(row.id.clone()) {
+            row.score = row.score.max(1.0);
+            combined.push(row);
+        } else if let Some(existing) = combined.iter_mut().find(|r| r.id == row.id) {
+            existing.score = existing.score.max(1.0);
+        }
+    }
 }
 
 /// Extract the rule fields from one search row's metadata. `None` means the
@@ -293,6 +319,44 @@ mod tests {
     /// rule-type filter. A rule row below `MIN_CONSTRAINT_SIMILARITY` must not
     /// become a match, or loosely related memories would fire the guard as
     /// false positives.
+    #[test]
+    fn embed_input_is_bounded_and_cuts_on_a_char_boundary() {
+        assert_eq!(embed_input("short"), "short");
+        let long = "é".repeat(MAX_EMBED_CHARS + 50);
+        let cut = embed_input(&long);
+        assert_eq!(cut.chars().count(), MAX_EMBED_CHARS);
+        assert!(long.starts_with(cut));
+        let exact = "a".repeat(MAX_EMBED_CHARS);
+        assert_eq!(embed_input(&exact), exact);
+    }
+
+    /// Typed search returns the closest rules with their distance as the
+    /// score. A guard rule that is also in the listing must stay eligible even
+    /// when it is the closest match (distance below the cutoff).
+    #[test]
+    fn a_listed_guard_rule_stays_eligible_when_typed_search_already_returned_it() {
+        let mut combined = vec![
+            // The nearest rule: distance 0.05, so below the cutoff.
+            rule_row("rule-near", 0.05, "guard_rule"),
+        ];
+        let mut seen: std::collections::HashSet<String> =
+            combined.iter().map(|r| r.id.clone()).collect();
+        // The listing returns every guard rule, including the near one, with
+        // the store's own score of 0.
+        let listed = vec![rule_row("rule-near", 0.0, "guard_rule"), rule_row("rule-other", 0.0, "guard_rule")];
+
+        merge_listed_rules(&mut combined, &mut seen, listed);
+
+        let rules = rules_from_rows(combined);
+        let mut ids: Vec<&str> = rules.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["rule-near", "rule-other"],
+            "the nearest guard rule must not be dropped by the distance cutoff: {ids:?}"
+        );
+    }
+
     #[test]
     fn low_similarity_rule_rows_do_not_match() {
         let rows = vec![

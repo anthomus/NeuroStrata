@@ -214,6 +214,10 @@ async fn search_inner(
                         } else { break; }
                     }
                     let safe_ns = escape_ladybug_string(&namespace);
+                    // MEASURED, NOT KEPT (docs/ops/memory-footprint.md 3.8):
+                    // narrowing this select with lower(location/content/metadata)
+                    // predicates was slower (3.8 s vs 3.1 s) and no lighter, so
+                    // it was reverted. Do not retry without new numbers.
                     let exact_q = format!(
                         "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
                         safe_ns
@@ -301,6 +305,12 @@ async fn search_inner(
                 .collect::<Vec<_>>()
                 .join(", ");
 
+            // MEASURED, NOT KEPT (docs/ops/memory-footprint.md 3.8): ranking on
+            // id and distance only and fetching the winners by id saved memory
+            // for one cold namespace but not across namespaces (the shared pool
+            // bounds the peak); paging embeddings into Rust and ranking there
+            // was ~40x slower. The first search's growth is the buffer pool
+            // filling, not a leak. Re-measure before changing this query.
             let search_query = format!(
                 "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC, m.id ASC LIMIT {}",
                 safe_ns, excluded_types_str, vec_str, fetch_limit
@@ -1374,7 +1384,207 @@ impl Dirty {
 /// and silently drops every record it could not authenticate, which is exactly
 /// the outcome this code exists to make visible.
 fn verifying_config() -> SystemConfig {
-    SystemConfig::default().throw_on_wal_replay_failure(true)
+    with_buffer_pool(SystemConfig::default().throw_on_wal_replay_failure(true))
+}
+
+/// Smallest buffer pool the daemon will run with. Measured on a copy of a
+/// 705 MB store: 96 MB and up completed every query, 64 MB failed 8 of 12
+/// with "Unable to allocate memory! The buffer pool is full". The floor sits
+/// above the last size that worked because the largest query depends on the
+/// data, which grows.
+const MIN_BUFFER_POOL_MB: u64 = 128;
+
+/// The pool size in force, for the error message that tells a caller what to
+/// change. 0 means the engine sized it.
+static BUFFER_POOL_MB_IN_USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What size, in MB, to give the buffer pool, and what to say about it.
+/// `configured` is `storage_hygiene.buffer_pool_mb`; `env` is
+/// `NEUROSTRATA_BUFFER_POOL_MB`, which wins when it parses. 0 means "let the
+/// engine decide". Anything else below the floor is raised to it.
+fn resolve_buffer_pool_mb(configured: u64, env: Option<&str>) -> (u64, Option<String>) {
+    let mut note = None;
+    let wanted = match env.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                note = Some(format!(
+                    "NEUROSTRATA_BUFFER_POOL_MB={v:?} is not a number of megabytes; using {configured} from the config"
+                ));
+                configured
+            }
+        },
+        None => configured,
+    };
+    if wanted == 0 {
+        return (0, note);
+    }
+    if wanted < MIN_BUFFER_POOL_MB {
+        note = Some(format!(
+            "a buffer pool of {wanted} MB is below the {MIN_BUFFER_POOL_MB} MB floor (queries fail under it); using {MIN_BUFFER_POOL_MB} MB"
+        ));
+        return (MIN_BUFFER_POOL_MB, note);
+    }
+    (wanted, note)
+}
+
+/// Caps the engine's buffer pool per `storage_hygiene.buffer_pool_mb` and
+/// `NEUROSTRATA_BUFFER_POOL_MB`. Said once per process, so the log shows what
+/// the daemon is running with.
+fn with_buffer_pool(cfg: SystemConfig) -> SystemConfig {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    // `load`, not `from_default_path`: opening a store must not create a config
+    // file as a side effect. A missing file is the normal case and says nothing.
+    let default_mb = crate::storage::StorageHygieneConfig::default().buffer_pool_mb;
+    let configured = match crate::config::Config::default_path() {
+        Ok(path) if !path.exists() => default_mb,
+        _ => match crate::config::Config::load() {
+            Ok(c) => c.storage_hygiene.buffer_pool_mb,
+            Err(e) => {
+                tracing::warn!("could not read the config for buffer_pool_mb, using {default_mb}: {e}");
+                default_mb
+            }
+        },
+    };
+    let env = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
+    let (mb, note) = resolve_buffer_pool_mb(configured, env.as_deref());
+    BUFFER_POOL_MB_IN_USE.store(mb, std::sync::atomic::Ordering::Relaxed);
+    crate::procmem::set_pool_mb(mb);
+    SAID.call_once(|| {
+        if let Some(n) = &note {
+            eprintln!("WARNING: {n}");
+        }
+        if mb == 0 {
+            eprintln!("Buffer pool: sized by the engine (storage_hygiene.buffer_pool_mb = 0)");
+        } else {
+            eprintln!("Buffer pool: capped at {mb} MB");
+        }
+    });
+    if mb == 0 {
+        cfg
+    } else {
+        cfg.buffer_pool_size(mb * 1024 * 1024)
+    }
+}
+
+/// An engine error that says the buffer pool was too small, with what to do
+/// about it. Any other error passes through unchanged.
+fn explain_engine_error(e: anyhow::Error) -> anyhow::Error {
+    let text = e.to_string();
+    if !text.contains("buffer pool is full") {
+        return e;
+    }
+    let mb = BUFFER_POOL_MB_IN_USE.load(std::sync::atomic::Ordering::Relaxed);
+    // Counted for the daemon's advice level, and marked so a harness plugin can
+    // tell the agent to bring it to the user.
+    crate::procmem::note_pool_full();
+    anyhow::anyhow!(
+        "{marker} {text} -- the database engine's buffer pool ({mb} MB) is too small for this query. \
+         Raise storage_hygiene.buffer_pool_mb in ~/.config/neurostrata/config.json, or set \
+         NEUROSTRATA_BUFFER_POOL_MB; 0 lets the engine size it, at the cost of memory. \
+         Ask the user before changing anything: the daemon has to be restarted by them \
+         (neurostrata-mcp shutdown), never killed.",
+        marker = crate::procmem::ADVICE_MARKER_BUFFER_POOL
+    )
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::*;
+
+    #[test]
+    fn the_config_value_is_used_when_the_environment_says_nothing() {
+        assert_eq!(resolve_buffer_pool_mb(384, None), (384, None));
+        assert_eq!(resolve_buffer_pool_mb(384, Some("  ")), (384, None));
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_config() {
+        assert_eq!(resolve_buffer_pool_mb(384, Some("512")), (512, None));
+        assert_eq!(resolve_buffer_pool_mb(384, Some(" 640 ")), (640, None));
+    }
+
+    #[test]
+    fn zero_hands_the_sizing_back_to_the_engine() {
+        assert_eq!(resolve_buffer_pool_mb(0, None), (0, None));
+        assert_eq!(resolve_buffer_pool_mb(384, Some("0")), (0, None));
+    }
+
+    #[test]
+    fn a_value_below_the_floor_is_raised_and_said_so() {
+        let (mb, note) = resolve_buffer_pool_mb(64, None);
+        assert_eq!(mb, MIN_BUFFER_POOL_MB);
+        assert!(note.unwrap().contains("floor"));
+        let (mb, _) = resolve_buffer_pool_mb(384, Some("96"));
+        assert_eq!(mb, MIN_BUFFER_POOL_MB);
+        assert_eq!(resolve_buffer_pool_mb(MIN_BUFFER_POOL_MB, None), (MIN_BUFFER_POOL_MB, None));
+    }
+
+    #[test]
+    fn an_environment_value_that_is_not_a_number_falls_back_to_the_config() {
+        let (mb, note) = resolve_buffer_pool_mb(384, Some("lots"));
+        assert_eq!(mb, 384);
+        assert!(note.unwrap().contains("NEUROSTRATA_BUFFER_POOL_MB"));
+    }
+
+    #[test]
+    fn the_default_is_above_the_floor() {
+        let default_mb = crate::storage::StorageHygieneConfig::default().buffer_pool_mb;
+        assert!(default_mb >= MIN_BUFFER_POOL_MB, "{default_mb}");
+    }
+
+    #[test]
+    fn an_older_config_without_the_key_gets_the_default() {
+        let cfg: crate::storage::StorageHygieneConfig =
+            serde_json::from_str(r#"{"checkpoint_interval_secs": 5}"#).unwrap();
+        assert_eq!(cfg.checkpoint_interval_secs, 5);
+        assert_eq!(
+            cfg.buffer_pool_mb,
+            crate::storage::StorageHygieneConfig::default().buffer_pool_mb
+        );
+    }
+
+    #[test]
+    fn a_full_pool_error_names_the_setting_and_other_errors_pass_through() {
+        let full = anyhow::anyhow!(
+            "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!"
+        );
+        let text = explain_engine_error(full).to_string();
+        assert!(text.contains("The buffer pool is full"), "{text}");
+        assert!(text.contains("storage_hygiene.buffer_pool_mb"), "{text}");
+        assert!(text.contains("NEUROSTRATA_BUFFER_POOL_MB"), "{text}");
+        assert!(text.starts_with("NEUROSTRATA_ADVICE[buffer_pool]"), "{text}");
+        assert!(text.contains("Ask the user"), "{text}");
+
+        let other = explain_engine_error(anyhow::anyhow!("Parser exception: nope")).to_string();
+        assert_eq!(other, "Parser exception: nope");
+    }
+
+    /// A pool far under the floor must fail with the explained error, not
+    /// silently return nothing. Needs a COPY of a database (never the live one):
+    ///   NS_PROBE_DB=<dir with a copy of ladybug.db> cargo test --release \
+    ///   --bin neurostrata-mcp a_pool_too_small_for_the_data_fails_with_advice -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn a_pool_too_small_for_the_data_fails_with_advice() {
+        use crate::traits::VectorStore;
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
+        let cfg = SystemConfig::default()
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let store = LadybugStore::with_system_config(&dir.join("ladybug.db"), 768, cfg).expect("open");
+        let namespaces = store.list_namespaces().await.expect("namespaces");
+        let mut advised = 0;
+        for ns in &namespaces {
+            if let Err(e) = store.search(ns, vec![0.05; 768], 5, false, false).await {
+                let text = e.to_string();
+                if text.contains("storage_hygiene.buffer_pool_mb") {
+                    advised += 1;
+                }
+            }
+        }
+        assert!(advised > 0, "no search failed with the advice; the pool may be big enough here");
+    }
 }
 
 /// Recovery open, used only after verification has already failed. The engine
@@ -1386,9 +1596,11 @@ fn verifying_config() -> SystemConfig {
 /// This trades tamper-evidence for the writes, so it is never the normal path
 /// and never silent.
 fn unverified_config() -> SystemConfig {
-    SystemConfig::default()
-        .throw_on_wal_replay_failure(false)
-        .enable_checksums(false)
+    with_buffer_pool(
+        SystemConfig::default()
+            .throw_on_wal_replay_failure(false)
+            .enable_checksums(false),
+    )
 }
 
 /// Fail closed by default: an unauthenticated WAL is refused rather than
@@ -2507,7 +2719,8 @@ impl LadybugStore {
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
-            })();
+            })()
+            .map_err(explain_engine_error);
             ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (turn, outcome)
         })
@@ -2552,7 +2765,8 @@ impl LadybugStore {
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
-            })();
+            })()
+            .map_err(explain_engine_error);
             // Counted here rather than after the await: the await is what a
             // deadline drops, and the whole question is whether the work
             // outlives the caller that stopped waiting for it.
@@ -2920,6 +3134,29 @@ pub(crate) fn is_active_scoped_row(
         by_source.iter().any(|(k, &g)| k != "docs" && g == gen_i)
     };
     if keep { Some(id.to_string()) } else { None }
+}
+
+/// A namespace's active generations, read once, for deciding which rows a
+/// reader may see. Wraps `active_generations_by_source_of` and
+/// `is_active_scoped_row` so a reader does not carry their three loose values
+/// and a seven-argument call (`list_rows`, `generation_summary`).
+pub(crate) struct ActiveGenerations {
+    by_source: HashMap<String, i64>,
+    active_set: std::collections::HashSet<i64>,
+    max_code_gen: Option<i64>,
+}
+
+impl ActiveGenerations {
+    pub(crate) fn read(conn: &Connection, namespace: &str) -> Self {
+        let (by_source, active_set, max_code_gen) = active_generations_by_source_of(conn, namespace);
+        Self { by_source, active_set, max_code_gen }
+    }
+
+    /// Same rule as `is_active_scoped_row`: false for a row of a superseded
+    /// generation or another namespace.
+    pub(crate) fn reaches(&self, id: &str, namespace: &str, memory_type: &str, metadata: &Value) -> bool {
+        is_active_scoped_row(id, namespace, memory_type, metadata, &self.by_source, &self.active_set, self.max_code_gen).is_some()
+    }
 }
 
 /// Normative memory types that the recall path reserves result slots for.
@@ -3532,6 +3769,117 @@ impl LadybugStore {
         })
         .await
     }
+
+    /// `list`, optionally narrowed in the engine to rows whose metadata text
+    /// contains `metadata_contains`. The narrowing only drops rows the caller
+    /// would discard anyway; every row it returns goes through the same
+    /// generation and dedup rules as `list`.
+    pub(crate) async fn list_rows(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>, metadata_contains: Option<&str>) -> Result<Vec<SearchResult>> {
+        let namespace = namespace.to_string();
+        let user_id = user_id.map(|v| v.to_string());
+        let memory_type = memory_type.map(|v| v.to_string());
+        let metadata_contains = metadata_contains.map(|v| v.to_string());
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+
+            // The active generations for this namespace, resolved per source so a
+            // row is validated against the source that owns it (not just any
+            // active generation in the namespace). Read once per search.
+            let active = ActiveGenerations::read(conn, &namespace);
+
+            let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
+
+            // Build WHERE clause with optional filters (R15: push into Cypher).
+            let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
+            if let Some(ref uid) = user_id {
+                conditions.push(format!("m.user_id = '{}'", escape_ladybug_string(uid)));
+            }
+            if let Some(ref mt) = memory_type {
+                conditions.push(format!("m.memory_type = '{}'", escape_ladybug_string(mt)));
+            }
+            if let Some(ref needle) = metadata_contains {
+                conditions.push(format!("m.metadata CONTAINS '{}'", escape_ladybug_string(needle)));
+            }
+            let where_clause = conditions.join(" AND ");
+
+            let query = format!("MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", where_clause);
+
+            let result = conn.query(&query)?;
+            let mut results = Vec::new();
+
+            for row in result {
+                let id: String = format!("{}", row[0]);
+                let content: String = format!("{}", row[1]);
+                let uid: String = format!("{}", row[2]);
+                let memory_type: String = format!("{}", row[3]);
+                let agent_name: String = format!("{}", row[4]);
+                let location: String = format!("{}", row[5]);
+                let location_lines: String = format!("{}", row[6]);
+                let metadata_str: String = format!("{}", row[7]);
+
+                let metadata_val: Value = match serde_json::from_str(&metadata_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !metadata_str.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                };
+
+                // Wave 2.1 row filter: same generation-scoped reachability the
+                // search path applies, so diagnostics never see superseded rows.
+                if !active.reaches(&id, &namespace, &memory_type, &metadata_val) {
+                    continue;
+                }
+
+                let sr = SearchResult {
+                    id: id.clone(),
+                    score: 0.0,
+                    payload: MemoryPayload {
+                        content,
+                        user_id: uid,
+                        memory_type,
+                        agent_name: Some(agent_name),
+                        location,
+                        location_lines,
+                        metadata: metadata_val,
+                    },
+                    evidence: None,
+                };
+
+                // Dedup by bare_id across generations: keep the highest
+                // generation for each logical id. Unscoped rows (bare_id_of
+                // returns None) are never deduped.
+                if let Some(bare) = bare_id_of(&id) {
+                    let gen = split_scoped_id(&id)
+                        .map(|(_, g, _)| g as u64)
+                        .unwrap_or(0);
+                    match best_by_bare.get(&bare) {
+                        Some(&(existing_gen, idx)) if gen > existing_gen => {
+                            results[idx] = sr.clone();
+                            best_by_bare.insert(bare, (gen, idx));
+                        }
+                        Some(_) => {
+                            // existing entry has higher or equal gen; skip.
+                            continue;
+                        }
+                        None => {
+                            let idx = results.len();
+                            best_by_bare.insert(bare, (gen, idx));
+                            results.push(sr);
+                        }
+                    }
+                } else {
+                    results.push(sr);
+                }
+            }
+
+            Ok(results)
+        })
+        .await
+    }
+
 
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         let namespace = namespace.to_string();
@@ -5601,6 +5949,124 @@ impl VectorStore for LadybugStore {
         Ok(outcome.results)
     }
 
+    /// # WARNING: do not "simplify" this into one Cypher distance query
+    ///
+    /// The obvious version, `MATCH (m:Memory) WHERE ... RETURN
+    /// array_distance(m.embedding, [..])`, or the same with
+    /// `WHERE m.id IN [...]`, makes the engine read the Memory table's whole
+    /// embedding column into the buffer pool, whatever filter it carries. On
+    /// the live 739 MB database that cost +296 MB for a namespace with three
+    /// matching rows and +120 MB for one with none, on every guard_validate,
+    /// which runs before every edit. (The cause is inferred from the
+    /// measurements; the engine's query plan was not inspected.)
+    ///
+    /// This version avoids it in three steps: list the qualifying ids without
+    /// touching the embedding column (and stop if there are none), read each
+    /// row by a keyed `m.id = '...'` lookup, rank the few rows here. Measured
+    /// on a copy of the live db: 225 to 223 MB and 119 ms, against 224 to
+    /// roughly 500-524 MB and 0.8 to 1.3 s for the single query.
+    ///
+    /// Ranking the keyed rows in the engine instead (`array_distance` in the
+    /// per-row query) also stays small (+34 MB) but took about 2 s for 48
+    /// rows against 191 ms here, and the Edit hook times out at 5 s.
+    ///
+    /// Full numbers, probes and how to rerun them: docs/ops/memory-footprint.md
+    async fn search_by_types(
+        &self,
+        namespace: &str,
+        vector: Vec<f32>,
+        limit: usize,
+        memory_types: &[String],
+    ) -> Result<Vec<SearchResult>> {
+        if memory_types.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let namespace = namespace.to_string();
+        let memory_types = memory_types.to_vec();
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let type_list = memory_types
+                .iter()
+                .map(|t| format!("'{}'", escape_ladybug_string(t)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let now = chrono::Utc::now().timestamp();
+
+            // Name the candidate rows first, without touching the embedding
+            // column. A distance query over the Memory table reads that whole
+            // column into the buffer pool whatever filter it carries (measured:
+            // +120 MB for a namespace with no matching rows, +296 MB for one
+            // with three), so ranking is only run on the rows that qualify.
+            let id_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.memory_type IN [{}] RETURN m.id",
+                safe_ns, type_list
+            );
+            let mut candidate_ids: Vec<String> = Vec::new();
+            for row in conn.query(&id_query)? {
+                candidate_ids.push(format!("{}", row[0]));
+            }
+            if candidate_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            // One keyed lookup per candidate, the same `m.id = '...'` form `get`
+            // uses. A single `m.id IN [...]` query over the same rows was
+            // measured at +286 MB, so it is not a keyed read.
+            let mut ranked: Vec<SearchResult> = Vec::new();
+            for id in &candidate_ids {
+                let query = format!(
+                    "MATCH (m:Memory) WHERE m.id = '{}' RETURN m.id, m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
+                    escape_ladybug_string(id)
+                );
+                let mut result = conn.query(&query)?;
+                let Some(row) = result.next() else { continue };
+                let embedding: Vec<f32> = match &row[1] {
+                    lbug::Value::Array(_, vals) | lbug::Value::List(_, vals) => vals
+                        .iter()
+                        .filter_map(|v| match v {
+                            lbug::Value::Float(f) => Some(*f),
+                            lbug::Value::Double(d) => Some(*d as f32),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => continue,
+                };
+                let Some(distance) = l2_distance(&vector, &embedding) else { continue };
+                let metadata = parse_metadata_or_warn(&format!("{}", row[8]), "metadata");
+                if is_retired_at(&metadata, now)
+                    || is_archived(&metadata)
+                    || is_mesh_conflicting(&metadata)
+                    || crate::registry::is_registry_row(&metadata)
+                {
+                    continue;
+                }
+                ranked.push(SearchResult {
+                    id: format!("{}", row[0]),
+                    score: distance,
+                    payload: MemoryPayload {
+                        content: format!("{}", row[2]),
+                        user_id: format!("{}", row[3]),
+                        memory_type: format!("{}", row[4]),
+                        agent_name: Some(format!("{}", row[5])),
+                        location: format!("{}", row[6]),
+                        location_lines: format!("{}", row[7]),
+                        metadata,
+                    },
+                    evidence: None,
+                });
+            }
+            // Nearest first; the id breaks ties as the engine query did.
+            ranked.sort_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            ranked.truncate(limit);
+            Ok(ranked)
+        })
+        .await
+    }
+
     async fn search_with_domain(
         &self,
         namespace: &str,
@@ -6588,115 +7054,46 @@ impl VectorStore for LadybugStore {
         .await
     }
 
-    async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
+    /// One generation's rows, narrowed by id prefix in the engine and reduced
+    /// to what ingest reads. Same reachability rule as `list` (a row of a
+    /// superseded generation or another namespace is skipped), but the row's
+    /// content is never fetched and its metadata is parsed, summarised and
+    /// dropped one row at a time. Separate from `list_rows` on purpose: that
+    /// one backs `list` and `list_pinned` and must keep returning full rows.
+    async fn generation_summary(&self, namespace: &str, generation: u64) -> Result<Vec<crate::traits::GenerationRow>> {
         let namespace = namespace.to_string();
-        let user_id = user_id.map(|v| v.to_string());
-        let memory_type = memory_type.map(|v| v.to_string());
         self.with_conn(move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
-
-            // The active generations for this namespace, resolved per source so a
-            // row is validated against the source that owns it (not just any
-            // active generation in the namespace). Read once per search.
-            let (by_source, active_set, max_code_gen) =
-                active_generations_by_source_of(conn, &namespace);
-
-            let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
-
-            // Build WHERE clause with optional filters (R15: push into Cypher).
-            let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
-            if let Some(ref uid) = user_id {
-                conditions.push(format!("m.user_id = '{}'", escape_ladybug_string(uid)));
-            }
-            if let Some(ref mt) = memory_type {
-                conditions.push(format!("m.memory_type = '{}'", escape_ladybug_string(mt)));
-            }
-            let where_clause = conditions.join(" AND ");
-
-            let query = format!("MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", where_clause);
-
-            let result = conn.query(&query)?;
-            let mut results = Vec::new();
-
-            for row in result {
+            let active = ActiveGenerations::read(conn, &namespace);
+            let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id STARTS WITH '{}' RETURN m.id, m.memory_type, m.location, m.metadata",
+                escape_ladybug_string(&namespace),
+                escape_ladybug_string(&prefix)
+            );
+            let mut result = conn.query(&query)?;
+            let mut out = Vec::new();
+            while let Some(row) = result.next() {
                 let id: String = format!("{}", row[0]);
-                let content: String = format!("{}", row[1]);
-                let uid: String = format!("{}", row[2]);
-                let memory_type: String = format!("{}", row[3]);
-                let agent_name: String = format!("{}", row[4]);
-                let location: String = format!("{}", row[5]);
-                let location_lines: String = format!("{}", row[6]);
-                let metadata_str: String = format!("{}", row[7]);
-
-                let metadata_val: Value = match serde_json::from_str(&metadata_str) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if !metadata_str.trim().is_empty() {
-                            tracing::warn!("corrupt metadata JSON in store row: {e}");
-                        }
-                        Value::Null
-                    }
-                };
-
-                // Wave 2.1 row filter: same generation-scoped reachability the
-                // search path applies, so diagnostics never see superseded rows.
-                if is_active_scoped_row(
-                    &id,
-                    &namespace,
-                    &memory_type,
-                    &metadata_val,
-                    &by_source,
-                    &active_set,
-                    max_code_gen,
-                ).is_none() {
+                let memory_type: String = format!("{}", row[1]);
+                let location: String = format!("{}", row[2]);
+                let metadata_str: String = format!("{}", row[3]);
+                let metadata: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                if !active.reaches(&id, &namespace, &memory_type, &metadata) {
                     continue;
                 }
-
-                let sr = SearchResult {
-                    id: id.clone(),
-                    score: 0.0,
-                    payload: MemoryPayload {
-                        content,
-                        user_id: uid,
-                        memory_type,
-                        agent_name: Some(agent_name),
-                        location,
-                        location_lines,
-                        metadata: metadata_val,
-                    },
-                    evidence: None,
-                };
-
-                // Dedup by bare_id across generations: keep the highest
-                // generation for each logical id. Unscoped rows (bare_id_of
-                // returns None) are never deduped.
-                if let Some(bare) = bare_id_of(&id) {
-                    let gen = split_scoped_id(&id)
-                        .map(|(_, g, _)| g as u64)
-                        .unwrap_or(0);
-                    match best_by_bare.get(&bare) {
-                        Some(&(existing_gen, idx)) if gen > existing_gen => {
-                            results[idx] = sr.clone();
-                            best_by_bare.insert(bare, (gen, idx));
-                        }
-                        Some(_) => {
-                            // existing entry has higher or equal gen; skip.
-                            continue;
-                        }
-                        None => {
-                            let idx = results.len();
-                            best_by_bare.insert(bare, (gen, idx));
-                            results.push(sr);
-                        }
-                    }
-                } else {
-                    results.push(sr);
-                }
+                out.push(crate::traits::GenerationRow::from_parts(id, memory_type, location, &metadata));
             }
-
-            Ok(results)
+            Ok(out)
         })
         .await
+    }
+
+    async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
+        self.list_rows(namespace, user_id, memory_type, None).await
+    }
+
+    async fn list_pinned(&self, namespace: &str) -> Result<Vec<SearchResult>> {
+        self.list_rows(namespace, None, None, Some("pinned")).await
     }
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
@@ -9317,6 +9714,18 @@ fn is_retired(metadata: &Value) -> bool {
 
 /// Timestamp-aware variant so callers that fetch many rows in one pass can
 /// capture `now` once instead of calling Utc::now() per row.
+/// Euclidean distance between two vectors, `None` when they cannot be compared
+/// (empty, different lengths, or a non-finite result). The engine's
+/// `array_distance` is the same measure.
+fn l2_distance(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.is_empty() || a.len() != b.len() {
+        return None;
+    }
+    let sum: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+    let d = sum.sqrt();
+    d.is_finite().then_some(d)
+}
+
 fn is_retired_at(metadata: &Value, now: i64) -> bool {
     match metadata.get("valid_to") {
         Some(valid_to) if !valid_to.is_null() => valid_to.as_i64().unwrap_or(0) <= now,
@@ -11466,6 +11875,54 @@ eurostrata\src\daemon.rs",
 
         assert!(ids.contains(&"live-rule".to_string()), "{:?}", ids);
         assert!(!ids.contains(&"retired-rule".to_string()), "{:?}", ids);
+    }
+
+    #[test]
+    fn l2_distance_is_euclidean_and_refuses_unlike_vectors() {
+        assert_eq!(l2_distance(&[0.0, 0.0], &[3.0, 4.0]), Some(5.0));
+        assert_eq!(l2_distance(&[1.0, 2.0], &[1.0, 2.0]), Some(0.0));
+        assert_eq!(l2_distance(&[1.0], &[1.0, 2.0]), None);
+        assert_eq!(l2_distance(&[], &[]), None);
+        assert_eq!(l2_distance(&[f32::NAN], &[1.0]), None);
+    }
+
+    #[tokio::test]
+    async fn search_by_types_returns_only_the_asked_types_nearest_first() {
+        let store = retired_test_store().await;
+        let rows: [(&str, &str, [f32; 4], serde_json::Value); 5] = [
+            ("near-rule", "rule", [0.9, 0.1, 0.1, 0.1], json!({})),
+            ("far-rule", "rule", [0.1, 0.9, 0.1, 0.1], json!({})),
+            ("guard", "guard_rule", [0.5, 0.5, 0.1, 0.1], json!({})),
+            ("closest-fact", "fact", [0.9, 0.1, 0.1, 0.1], json!({})),
+            ("retired-rule", "rule", [0.9, 0.1, 0.1, 0.1], json!({ "valid_to": 1 })),
+        ];
+        for (id, kind, vec, meta) in rows {
+            store
+                .upsert("probe", id, vec.to_vec(), retired_test_payload(kind, "agent", meta))
+                .await
+                .unwrap();
+        }
+
+        let types = vec!["rule".to_string(), "guard_rule".to_string()];
+        let ids: Vec<String> = store
+            .search_by_types("probe", vec![0.9, 0.1, 0.1, 0.1], 5, &types)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        assert_eq!(ids.first().map(String::as_str), Some("near-rule"), "{ids:?}");
+        assert!(ids.contains(&"guard".to_string()) && ids.contains(&"far-rule".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"closest-fact".to_string()), "other types never appear: {ids:?}");
+        assert!(!ids.contains(&"retired-rule".to_string()), "retired rows are dropped: {ids:?}");
+
+        let limited = store
+            .search_by_types("probe", vec![0.9, 0.1, 0.1, 0.1], 1, &types)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert!(store.search_by_types("probe", vec![0.9; 4], 5, &[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
