@@ -190,6 +190,40 @@ So in a real ingest the saving is about 10 to 30 MB at this size and the process
 
 What does grow is the peak itself, by roughly 50 to 100 MB per pass in both columns (380, 421, 518, 543 MB before). The reads are not the cause. Older generations stay in the store and each changed pass copies every unchanged row forward (task `neurostrata-bcui`), which is the likelier source. The embedder (about 1 GB to load) is still the larger share of an ingest (section 3.6).
 
+### 3.11 Superseded generations pile up (`task_list_variants_probe`, `ingest_reads_probe`)
+
+Every ingest that changes anything copies each unchanged row into a new generation and keeps the old one as history. Nothing prunes. `list` and search hide superseded rows, so the cost does not show in the row counts a caller sees.
+
+On a copy of the database (`NS_PROBE_VARIANT=generations`, ids only):
+
+| Namespace | Rows in the store | Reachable through `list` | Rows per generation |
+|---|---|---|---|
+| NeuroStrata | 17,458 | 8,288 | 1: 1,980; 2: 7,190; 3: 7,190 (active); 1,098 unscoped |
+| A second, written before generations | 34,382 | 34,382 | none scoped |
+
+So 9,170 of the first namespace's rows (52%) are superseded copies. The second has none.
+
+`ingest_reads_probe` on a 166-file tree (zero embedder, 384 MB pool, one file added before each pass, no periodic checkpoint):
+
+| Pass | Highest RSS in the pass | Time |
+|---|---|---|
+| 1 (first ingest) | 362 to 392 MB | 122 to 126 s, all in walk and stage (about 27 ms per row) |
+| 2 | 401 to 402 MB | 139 to 141 s |
+| 3 | 465 to 485 MB | 138 to 140 s |
+| 4 | 518 to 553 MB | 142 to 156 s |
+| 5 | 581 to 602 MB | 143 to 147 s |
+
+- About 99% of each changed pass is the carry-forward (4,409 to 4,415 nodes at about 36 ms each, one `get` and one `upsert` per node). Walk and stage took 0.6 s once the files were unchanged.
+- The highest point was still rising at pass 5.
+- The probe's database file was 2.3 GB after five passes, against 797 MB for the live database.
+- During pass 6 writes began to time out (245 `gave up waiting on writing a memory`, each caller waiting its 30 s) while the engine reported 0 calls in flight, and the run was stopped. An earlier 8-pass run failed the same way at pass 6: the ingest returned an error after carrying only 1,196 of about 4,417 nodes.
+
+What this establishes: the growth per pass is not the listing reads (section 3.10) and not the embedder (a zero embedder was used). What it does not establish:
+
+- The cause of the write stall. The probe does not run the daemon's 2-second periodic checkpoint, so the log may simply grow until one checkpoint outlasts the deadline. Whether a daemon can hit it is not known.
+- That superseded generations cause the per-pass growth. That is the explanation left once the reads and the embedder are ruled out. A run that prunes old generations after publish would test it. Pruning changes the design that keeps history (task `neurostrata-bcui` lists the open questions), so it needs the maintainer's decision.
+- Whether the probe's 2.3 GB is real or inflated by the missing checkpoints.
+
 ---
 
 ## 4. Not fixed yet
@@ -251,7 +285,8 @@ cargo test --release --bin neurostrata-mcp embed_call_probe -- --ignored --nocap
 NS_PROBE_DB=<dir> cargo test --release --bin neurostrata-mcp component_breakdown_probe -- --ignored --nocapture
 
 # whole-namespace listing against narrower reads: NS_PROBE_VARIANT is all, tasks, pinned, ingest_nodes,
-# generation_summary (what ingest reads) or shape (row counts by type and generation, no content)
+# generation_summary (what ingest reads), shape (row counts by type, no content), generations (rows per
+# generation, ids only: how much is superseded) or relink_full / relink_lean (the read relink_edges does)
 # a whole ingest with a generation already in the store, highest resident set per pass (NS_PROBE_DIR is copied; ~10 min for 4 passes):
 #   NS_PROBE_DIR=<dir> NS_PROBE_PASSES=4 cargo test --release --bin neurostrata-mcp ingest_reads_probe -- --ignored --nocapture
 NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> NS_PROBE_VARIANT=tasks cargo test --release --bin neurostrata-mcp task_list_variants_probe -- --ignored --nocapture
