@@ -378,6 +378,7 @@ pub async fn process_mcp_request(
                                 "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Ids of tasks this one waits on; a ready task has none unfinished." },
                                 "user_id": { "type": "string", "description": "Optional user identifier for audit receipts." },
                                 "agent_name": { "type": "string", "description": "Optional agent identifier for audit receipts." },
+                                "compact": { "type": "boolean", "description": "Optional. true returns auto_retrieved_context with one slim row (id, memory_type, location, snippet) per memory instead of each memory's full metadata. Same keys; subagent_prompt_injection is unchanged. Defaults to false." },
                             },
                             "required": ["namespace", "title"]
                         }
@@ -393,6 +394,7 @@ pub async fn process_mcp_request(
                                 "assignee": { "type": "string", "description": "Who is doing the work (the agent or operator name)." },
                                 "session_id": { "type": "string", "description": "Unique id of this session; the exclusivity check compares it against the holder's." },
                                 "event_id": { "type": "string", "description": "Optional idempotency event ID for the claim receipt." },
+                                "compact": { "type": "boolean", "description": "Optional. true returns auto_retrieved_context with one slim row (id, memory_type, location, snippet) per memory instead of each memory's full metadata (the default response is about 55 KB). Same keys; subagent_prompt_injection is unchanged. Defaults to false." },
                             },
                             "required": ["id", "namespace", "assignee", "session_id"]
                         }

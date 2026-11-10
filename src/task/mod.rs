@@ -793,6 +793,45 @@ pub async fn build_task_graph_context(
     (auto_retrieved_context, subagent_prompt)
 }
 
+/// The retrieval payload `task_claim` and `task_create` answer with is up to
+/// ~55 KB (measured: 57,676 bytes for one claim, 29,498 of them in `items`
+/// and 25,790 more repeating the same items in `structural_anchors`), almost
+/// all of it each item's full metadata. With `compact: true` the caller gets
+/// the same retrieval, one slim row per memory (id, type, location, snippet)
+/// and the same keys; the default response is unchanged. The prompt block
+/// stamped on the task row and returned as `subagent_prompt_injection` is the
+/// same either way.
+fn compact_graph_context(context: &Value) -> Value {
+    fn slim(item: &Value) -> Value {
+        json!({
+            "id": item.get("id").cloned().unwrap_or(Value::Null),
+            "memory_type": item.get("memory_type").cloned().unwrap_or(Value::Null),
+            "location": item.get("location").cloned().unwrap_or(Value::Null),
+            "snippet": item.get("snippet").cloned().unwrap_or(Value::Null),
+        })
+    }
+    fn slim_all(context: &Value, key: &str) -> Value {
+        match context.get(key).and_then(|v| v.as_array()) {
+            Some(rows) => Value::Array(rows.iter().map(slim).collect()),
+            None => Value::Array(Vec::new()),
+        }
+    }
+    json!({
+        "compact": true,
+        "query": context.get("query").cloned().unwrap_or(Value::Null),
+        "golden_rules": slim_all(context, "golden_rules"),
+        "items": slim_all(context, "items"),
+        "related_edges": context.get("related_edges").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        "normative_memories": slim_all(context, "normative_memories"),
+        "structural_anchors": slim_all(context, "structural_anchors"),
+        "conceptual_bridges": context.get("conceptual_bridges").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+    })
+}
+
+fn wants_compact(args: &Value) -> bool {
+    args.get("compact").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 /// Synthesise cross-domain conceptual bridges from retrieved seed memories.
 ///
 /// For each seed item, traverses 2 hops (`seed -> via -> target`) through the
@@ -1238,6 +1277,7 @@ pub async fn handle_task_create(
                 let obj = task_obj_mut(&mut payload);
                 obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
             }
+            let hits_json = if wants_compact(&args) { compact_graph_context(&hits_json) } else { hits_json };
             encode(&json!({
                 "id": id,
                 "namespace": namespace,
@@ -1464,6 +1504,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
+    let hits_json = if wants_compact(&args) { compact_graph_context(&hits_json) } else { hits_json };
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -5769,6 +5810,89 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    /// `compact` is opt-in: the same keys come back, each retrieved memory is
+    /// reduced to id, type, location and snippet, and the default response is
+    /// left as it was.
+    #[test]
+    fn compact_context_keeps_the_keys_and_drops_the_per_item_metadata() {
+        let big = json!({ "edge_sources": vec!["x".repeat(500); 20], "mentions": ["a", "b"] });
+        let item = json!({
+            "id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text",
+            "metadata": big, "calls": ["f"], "imports": null, "governs": ["g"],
+            "depends_on": null, "evidence": [{"kind": "direct_match"}],
+        });
+        let full = json!({
+            "query": "q",
+            "golden_rules": [item.clone()],
+            "items": [item.clone(), item.clone()],
+            "related_edges": [],
+            "normative_memories": [item.clone()],
+            "structural_anchors": [item.clone()],
+            "conceptual_bridges": [{"id": "b1", "why_connected": "a -> b"}],
+        });
+        let compact = compact_graph_context(&full);
+
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let mut expected = keys(&full);
+        expected.push("compact".to_string());
+        expected.sort();
+        assert_eq!(keys(&compact), expected, "same keys plus the marker");
+        assert_eq!(compact["compact"], json!(true));
+        assert_eq!(compact["query"], full["query"]);
+        assert_eq!(compact["conceptual_bridges"], full["conceptual_bridges"]);
+        assert_eq!(compact["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            compact["items"][0],
+            json!({"id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text"})
+        );
+        assert!(
+            serde_json::to_string(&compact).unwrap().len() * 5 < serde_json::to_string(&full).unwrap().len(),
+            "the compact form is a fraction of the full one"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_and_create_answer_compactly_only_when_asked() {
+        let store = store_with_namespace("MyProj").await;
+        let a = create_task(&store, "MyProj", "first task", 1).await;
+        let b = create_task(&store, "MyProj", "second task", 1).await;
+        let claim = |id: String, compact: Option<bool>| {
+            let store = store.clone();
+            async move {
+                let mut args = json!({
+                    "namespace": "MyProj", "id": id, "assignee": "agent", "session_id": "s-compact"
+                });
+                if let Some(c) = compact {
+                    args["compact"] = json!(c);
+                }
+                serde_json::from_str::<Value>(&handle_task_claim(args, store).await).unwrap()
+            }
+        };
+        let plain = claim(a, None).await;
+        let compact = claim(b, Some(true)).await;
+        let off = claim(create_task(&store, "MyProj", "third task", 1).await, Some(false)).await;
+
+        assert!(plain["auto_retrieved_context"].get("compact").is_none(), "default is unchanged");
+        assert!(off["auto_retrieved_context"].get("compact").is_none(), "compact:false is the default");
+        assert_eq!(compact["auto_retrieved_context"]["compact"], json!(true));
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v["auto_retrieved_context"]
+                .as_object().unwrap().keys().filter(|k| *k != "compact").cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&plain), keys(&compact));
+        assert!(
+            compact["subagent_prompt_injection"].as_str().unwrap().contains("Goal: second task"),
+            "the prompt block is returned in full"
+        );
+        assert_eq!(compact["claimed"], plain["claimed"]);
     }
 
     #[tokio::test]

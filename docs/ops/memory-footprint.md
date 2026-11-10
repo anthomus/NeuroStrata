@@ -308,6 +308,12 @@ The same probe times its own first ingest (zero embedder, 384 MB pool, no period
 - A first-ingest row goes through the same `upsert` as a carried row, so the same split applies (edge materialization and the provenance stamp are most of it, section 3.12). The probe timed the upsert call, not the ingest's per-item loop, so the split is borrowed from the carried-row run.
 - Batching the per-item upserts would need a write that runs many rows through the same checks and edge queries in one transaction. That does not exist, and writing one that leaves rows and edges identical to today's is a change to `upsert` itself, not to the ingest loop. Not done; the tree sizes differ between rows, so the per-row figures are not a controlled comparison.
 
+### 3.13 The claim response is large (`compact`, task `neurostrata-2p6x`)
+
+One real `neurostrata_task_claim` response was 61,337 characters, 57,676 of them `auto_retrieved_context`: each retrieved memory's full metadata, and the same items again under `structural_anchors`. An agent pays that in context on every claim and create.
+
+`neurostrata_task_claim` and `neurostrata_task_create` take an optional `compact: true`. The response then keeps the same keys, with one row per memory (`id`, `memory_type`, `location`, `snippet`) and `"compact": true` in `auto_retrieved_context`. `subagent_prompt_injection` is the same in both forms. Recomputed offline from that one response, the compact form is 7,512 characters (the handler's own output was not re-measured). The default is unchanged. No file under `plugins/core/index.ts` or `scripts/` reads `auto_retrieved_context`, so changing the default later would not break them; it was not changed, because agents and clients outside this repository may read the metadata.
+
 ---
 
 ## 4. Not fixed yet

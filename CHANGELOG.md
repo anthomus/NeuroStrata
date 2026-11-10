@@ -8,6 +8,8 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ### Fixed
 
+- `neurostrata_task_claim` and `neurostrata_task_create` accept an optional `compact: true`. The default response is unchanged (one real claim was 61,337 characters, almost all of it per-memory metadata). With it, `auto_retrieved_context` keeps its keys and carries one row (`id`, `memory_type`, `location`, `snippet`) per memory and `"compact": true`; `subagent_prompt_injection` is identical. Recomputed offline from that response: 7,512 characters. The default was not changed (`docs/ops/memory-footprint.md` section 3.13). Daemon code changed: needs a deploy to take effect.
+
 - Recorded first-ingest write throughput in a release build with a zero embedder: 24 to 32 ms per row (about 32 to 41 rows per second), one run per tree. The cost is in `upsert` (edge materialization and the provenance stamp), so batching the ingest loop's calls was not done; see `docs/ops/memory-footprint.md` section 3.12. Documentation only.
 
 - An ingest that copies unchanged rows into a new generation now reports how far the copy is: `IngestObserver::carry_forward(carried, total)`, and `carried_nodes` / `carry_total` on the ingest progress a status call returns (absent when nothing is copied). The copy itself is unchanged. Measured on a 4,423-row tree: one carried row costs about 47 ms, 1.1 ms of it the `get`, and about 75% is edge materialization plus the `edge_sources` stamp inside `upsert`, so batching the reads would not help and a batched write would have to keep those queries (`docs/ops/memory-footprint.md` section 3.12). One run; the single-transaction version was not tried. No GUI change.
