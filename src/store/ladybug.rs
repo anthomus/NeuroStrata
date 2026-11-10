@@ -4098,6 +4098,11 @@ impl LadybugStore {
     ///   3. the namespace's existing edges are read once;
     ///   4. the repair is planned in Rust, and only rows that change and edges
     ///      that are missing are written, a few dozen statements per turn.
+    ///
+    /// Do not go back to one query per row or one turn for the whole pass: the
+    /// first took 193 s and the second blocks every writer past the 30 s
+    /// deadline (docs/ops/memory-footprint.md 3.7). Readers share the writer's
+    /// lock, so keep every turn short.
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         const PAGE: usize = 500;
         const RESOLVE_CHUNK: usize = 50;

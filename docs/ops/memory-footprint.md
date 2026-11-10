@@ -132,6 +132,24 @@ One process on a copy of a 759 MB database, pool cap 384 MB, real embedder, four
 - A long-running daemon sits roughly 500 MB above this (1.66 GB against 1.14 GB after a similar search). That gap is not explained yet. Task `neurostrata-yl3o`.
 - Trimming the idle working set lowers resident memory, not committed memory: the pages move to the standby list. Unloading the embedder is what lowers committed memory. Tasks `neurostrata-chhm` and `neurostrata-00kg`.
 
+### 3.7 The hygiene repair (`hygiene_writer_wait_probe`)
+
+`repair_namespace_hygiene` used to scan and repair the whole namespace in one write turn. On a large namespace it outlived the 30 second write deadline (the daemon logged `gave up waiting on repairing namespace hygiene`) and every other writer queued behind it.
+
+| Version | Repair time on the 759 MB copy |
+|---|---|
+| One write turn for the whole namespace | over 30 s, deadline hit on the live daemon |
+| One write turn per row (a keyed read per row, a lookup per edge target) | 193 s; the writer waited at most 460 ms |
+| Id-ordered pages, targets resolved once, existing edges read once, plan in Rust, only changes written in chunks of 40 | 2.5 s; live runs took about 3 s and 4 s on two namespaces, and a rerun found nothing to fix |
+
+Things to keep when changing it:
+
+- Readers and writers share one lock (`with_conn` takes the writer's turn), so a long read blocks writers too. Keep every turn short.
+- Do not use `m.id IN [...]` or an `OR` across `id` and `namespace` for lookups. They read the whole embedding column or scan the table.
+- Each metadata write is conditional on the row still holding the metadata that was read, and each ref about to be archived is checked again inside the write turn. Without that, a concurrent edit is overwritten with a stale copy.
+- The repair archives refs that resolve to nothing into `metadata.archived_refs`. It does not relink them.
+- The automatic run fires only when `CARGO_PKG_VERSION` changes (the doctor check in `src/server.rs`). Redeploying the same version does not run it. Use `neurostrata-mcp repair-hygiene <namespace>`, which needs the daemon stopped.
+
 ### 3.8 Tried and not kept (do not retry without new evidence)
 
 All measured on a copy of the database with one process per variant.
@@ -283,6 +301,9 @@ cargo test --release --bin neurostrata-mcp embed_call_probe -- --ignored --nocap
 
 # where a fresh process puts its memory, with trimming stages (NS_PROBE_POOL_MB defaults to 384)
 NS_PROBE_DB=<dir> cargo test --release --bin neurostrata-mcp component_breakdown_probe -- --ignored --nocapture
+
+# how long the hygiene repair takes and how long a concurrent writer waits (NS_PROBE_NS is the namespace)
+NS_PROBE_DB=<dir> NS_PROBE_NS=<namespace> cargo test --release --bin neurostrata-mcp hygiene_writer_wait_probe -- --ignored --nocapture
 
 # whole-namespace listing against narrower reads: NS_PROBE_VARIANT is all, tasks, pinned, ingest_nodes,
 # generation_summary (what ingest reads), shape (row counts by type, no content), generations (rows per
