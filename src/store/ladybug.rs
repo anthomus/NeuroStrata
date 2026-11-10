@@ -3170,6 +3170,28 @@ fn plan_hygiene_row(
     }
 }
 
+/// Whether a declared target resolves to a row in `ns` the way a write would
+/// resolve it (active generation, suffix forms), not only by its literal id.
+/// The hygiene repair uses it both to plan and to recheck at write time, so a
+/// file published between the two is seen.
+fn hygiene_target_resolves(conn: &Connection, ns: &str, t: &str) -> bool {
+    let ns_prefix = format!("{}{}", ns, crate::parser::ingest::NAMESPACE_SEPARATOR);
+    if let Some(stripped) = t.strip_prefix(&ns_prefix) {
+        matches!(resolve_target_on_write(conn, ns, stripped), crate::traits::TargetResolution::Resolved(_))
+    } else if !t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+        matches!(resolve_target_on_write(conn, ns, t), crate::traits::TargetResolution::Resolved(_))
+    } else {
+        false
+    }
+}
+
+/// Write-time recheck: has any target the plan found missing appeared since?
+fn hygiene_recheck_hit(conn: &Connection, ns: &str, recheck: &[String]) -> bool {
+    recheck
+        .iter()
+        .any(|t| exact_target_exists(conn, t).unwrap_or(false) || hygiene_target_resolves(conn, ns, t))
+}
+
 /// Exact ID lookup for qualified target resolution.
 fn exact_target_exists(conn: &Connection, id: &str) -> Result<bool> {
     let safe_id = escape_ladybug_string(id);
@@ -4183,18 +4205,10 @@ impl LadybugStore {
             let (ns, chunk) = (namespace.clone(), chunk.to_vec());
             let resolved = self
                 .with_conn(move |conn| {
-                    let ns_prefix = format!("{}{}", ns, crate::parser::ingest::NAMESPACE_SEPARATOR);
                     let mut out = Vec::new();
                     for t in chunk {
                         let exact = exact_target_exists(conn, &t).unwrap_or(false);
-                        let resolved = !exact
-                            && if let Some(stripped) = t.strip_prefix(&ns_prefix) {
-                                matches!(resolve_target_on_write(conn, &ns, stripped), crate::traits::TargetResolution::Resolved(_))
-                            } else if !t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
-                                matches!(resolve_target_on_write(conn, &ns, &t), crate::traits::TargetResolution::Resolved(_))
-                            } else {
-                                false
-                            };
+                        let resolved = !exact && hygiene_target_resolves(conn, &ns, &t);
                         out.push((t, HygieneTarget { exact, resolved }));
                     }
                     Ok(out)
@@ -4232,6 +4246,7 @@ impl LadybugStore {
         let mut dangling_updates = 0usize;
         for chunk in writes.chunks(WRITE_CHUNK) {
             let chunk = chunk.to_vec();
+            let ns_w = namespace.clone();
             let (shape, dangling) = self
                 .write_with_deadline("repairing namespace hygiene", move |conn| {
                     let (mut shape_n, mut dangling_n) = (0usize, 0usize);
@@ -4243,7 +4258,7 @@ impl LadybugStore {
                                 }
                             }
                             HygieneWrite::Row { id, recheck, meta_q, content_q, shape, dangling } => {
-                                if recheck.iter().any(|t| exact_target_exists(conn, t).unwrap_or(false)) {
+                                if hygiene_recheck_hit(conn, &ns_w, recheck) {
                                     continue; // a target appeared since the read; the next run decides
                                 }
                                 if let Some(q) = content_q {
@@ -15896,6 +15911,42 @@ eurostrata\src\daemon.rs",
             .unwrap();
         assert!(!edited_matched, "the backfill must not overwrite an edit made since the read");
         assert!(blank_matched, "a row that is still blank is backfilled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A target the plan found missing can appear before the write turn by a
+    /// path that resolves logically (a suffix of the declared path) and not by
+    /// its literal id. The write-time recheck must see it, or the repair
+    /// archives a declaration that has just become valid.
+    #[tokio::test]
+    async fn repair_hygiene_recheck_sees_a_target_published_after_the_read() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-recheck-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let recheck = vec!["src/new.rs".to_string()];
+        let before = recheck.clone();
+        let hit_before = store
+            .with_conn(move |conn| Ok(hygiene_recheck_hit(conn, "probe", &before)))
+            .await
+            .unwrap();
+        assert!(!hit_before, "nothing resolves yet");
+
+        let target = retired_test_payload("fact", "agent", json!({}));
+        store.upsert("probe", "new.rs", vec![0.1, 0.2, 0.3, 0.4], target).await.unwrap();
+        // The literal-id check the recheck used to be is blind to this target.
+        let literal = store
+            .with_conn(|conn| Ok(exact_target_exists(conn, "src/new.rs").unwrap_or(false)))
+            .await
+            .unwrap();
+        assert!(!literal, "the declared id itself still does not exist");
+        let hit_after = store
+            .with_conn(move |conn| Ok(hygiene_recheck_hit(conn, "probe", &recheck)))
+            .await
+            .unwrap();
+        assert!(
+            hit_after,
+            "a target that now resolves logically blocks the archiving"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
