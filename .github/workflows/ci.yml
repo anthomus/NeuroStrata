@@ -5,11 +5,13 @@ name: CI
 # that introduces it: Cargo.lock had been missing 9 packages, including
 # clap_derive, which src/main.rs requires via #[derive(Parser)].
 
+# This fork runs CI on demand and nightly, not on every push or pull request.
+# When a branch is ready: gh workflow run ci.yml --ref <branch>
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
+  schedule:
+    # 07:17 UTC, an hour after nightly.yml and off the hour for the same reason.
+    - cron: '17 7 * * *'
 
 # Cancel superseded runs on the same branch/PR rather than paying for both.
 concurrency:

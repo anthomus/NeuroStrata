@@ -82,7 +82,7 @@ of memory; the file's header covers that and the named-volume setup.
 
 | Workflow | Trigger | Publishes |
 | --- | --- | --- |
-| `ci.yml` | push, PR | nothing — a `--release --locked` build on linux, windows, and macOS arm64, plus a version assertion (there is no macOS x64 runner: `ort` rc.13, pinned by `fastembed >= 5`, ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`) |
+| `ci.yml` | dispatch, cron (this fork; upstream: push, PR) | nothing — a `--release --locked` build on linux, windows, and macOS arm64, plus a version assertion (there is no macOS x64 runner: `ort` rc.13, pinned by `fastembed >= 5`, ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`) |
 | `nightly.yml` | cron, dispatch | linux + windows amd64 → the `nightly` tag, prerelease |
 | `release.yml` | `v*` tags | all four targets → that tag (linux amd64 + linux arm64, darwin arm64, windows amd64) |
 
