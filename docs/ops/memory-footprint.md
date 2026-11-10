@@ -334,6 +334,20 @@ The question was why the live daemon sits about 500 MB above a fresh process doi
 - The 250 to 450 MB of "long-run growth the probe does not reproduce" in the earlier note is not supported by this run: there was no long-run growth, only call-driven rises that later fell. The earlier note came from an uncapped-pool daemon that reached 3.1 GB in 40 minutes, which is a different configuration.
 - Not done: a Tantivy, cache or call-history breakdown. With no retained excess to attribute, there was nothing to split. One run, one machine.
 
+### 3.15 Trimming the idle working set, and loading the model lazily (tasks `neurostrata-chhm`, `neurostrata-00kg`)
+
+What each option would buy, from numbers already in this document and the logs:
+
+| Option | Measured | Not measured |
+|---|---|---|
+| Trim the idle working set with `EmptyWorkingSet` (Windows) | Probe (section 3.6): resident 1,137 MB, 0 after the trim, 553 MB after one search pass, search time +12% | A trim inside the daemon (none exists; `EmptyWorkingSet` is only called from `component_breakdown_probe`); the first-query cost on the live daemon |
+| Load the embedder on first use, unload when idle | `embed_call_probe`, four runs: model load 1,009 to 1,307 ms with the weights in the operating system's file cache, resident 11 to 571 MB (+560 MB), first embed after load 19 to 20 ms | Load time from a cold file cache; what an unload frees on the live daemon (the allocator and the pool may keep part of it) |
+| The quantized Nomic model | Nothing run | Resident size, query time, retrieval quality. Its vectors differ, so every namespace would be re-embedded and the pinned SHA-256 in `src/embed.rs` would change |
+
+- The live daemon already sits low when idle: 614 to 875 MB in the 7 hour log (section 3.14). A daemon-driven trim would save at most the difference to the probe's 553 MB, about 60 to 320 MB of resident memory, at the cost of re-faulting on the first query after it.
+- Unloading the model would save about 560 MB of the daemon's resident memory while idle, and the next call that embeds (search, claim, guard) would wait about a second for the load. That is a latency change on a path agents hit before every edit.
+- Neither is built. Both change how the daemon behaves under load, and the quantized model changes stored vectors, so they are decisions for the maintainer; the table gives the numbers that decision needs.
+
 ---
 
 ## 4. Not fixed yet
