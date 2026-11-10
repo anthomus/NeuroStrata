@@ -145,8 +145,9 @@ One process on a copy of a 759 MB database, pool cap 384 MB, real embedder, four
 Things to keep when changing it:
 
 - Readers and writers share one lock (`with_conn` takes the writer's turn), so a long read blocks writers too. Keep every turn short.
-- Do not use `m.id IN [...]` or an `OR` across `id` and `namespace` for lookups. They read the whole embedding column or scan the table.
-- Each metadata write is conditional on the row still holding the metadata that was read, and each ref about to be archived is checked again inside the write turn. Without that, a concurrent edit is overwritten with a stale copy.
+- Look rows up by `m.id = '...'`: it is a hash-indexed primary-key lookup (about 0.4 ms in a 20,000-row probe). `m.id IN [...]`, an `OR` across `id` and `namespace`, and `STARTS WITH` do not use that index; `EXPLAIN` shows a full `SCAN_NODE_TABLE` with a filter (1.6 to 2 ms there). A scan is cheap while the query returns small columns. The large memory cost in section 1 comes from also reading `m.embedding`, which the repair never does.
+- The candidate pass only chooses rows and writes nothing. Each chunk of candidates is repaired in one write turn that re-reads the rows and everything they are planned from, with keyed lookups, so a plan is never older than its turn. The turn holds the store's single lock (`with_conn` and `write_with_deadline` share it) and the database file lock keeps other processes out. If a read in the turn fails, nothing is written. A row that stopped needing repair is skipped; one that started needing it waits for the next run.
+- The 2.5 s figure above was measured before the write turn re-read its rows. It has not been repeated for the current version.
 - The repair archives refs that resolve to nothing into `metadata.archived_refs`. It does not relink them.
 - The automatic run fires only when `CARGO_PKG_VERSION` changes (the doctor check in `src/server.rs`). Redeploying the same version does not run it. Use `neurostrata-mcp repair-hygiene <namespace>`, which needs the daemon stopped.
 

@@ -2979,7 +2979,7 @@ struct HygieneRow {
 }
 
 /// What the database said about an edge target that is not a known row id.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct HygieneTarget {
     /// A row with exactly this id exists (any namespace).
     exact: bool,
@@ -2993,11 +2993,10 @@ enum HygieneWrite {
     Edge(String),
     Row {
         id: String,
-        /// Refs this row will archive; each is re-checked in the write turn,
-        /// because the row that owns one may have been created since the read.
-        recheck: Vec<String>,
         /// Sets the metadata only while it is still what the plan was made
-        /// from, so a concurrent edit is never overwritten with a stale copy.
+        /// from. The repair plans inside the write turn from rows it has just
+        /// read, so this always holds there; it stays as a guard on the
+        /// statement itself.
         meta_q: String,
         content_q: Option<String>,
         shape: bool,
@@ -3005,14 +3004,189 @@ enum HygieneWrite {
     },
 }
 
+/// What the planner needs to know about the rest of the namespace. The
+/// candidate pass answers from data it prefetched; the write turn answers from
+/// keyed lookups made in that turn, so the answer is never older than the turn.
+trait HygieneView {
+    /// A live (not archived) row of this namespace has exactly this id.
+    fn is_known(&self, id: &str) -> bool;
+    /// What the database says about a target that is not a live row here.
+    fn target(&self, t: &str) -> HygieneTarget;
+    /// A long target that exactly one live row id of this namespace starts with.
+    fn unique_prefix(&self, t: &str) -> bool;
+    /// The relationship `from -[rel]-> to` is already stored.
+    fn edge_exists(&self, from: &str, to: &str, rel: &'static str) -> bool;
+}
+
+/// Answers from data read ahead of time, for the candidate pass.
+#[derive(Default)]
+struct PrefetchedView {
+    known_ids: std::collections::BTreeSet<String>,
+    targets: HashMap<String, HygieneTarget>,
+    existing: HashSet<(String, String, &'static str)>,
+}
+
+impl HygieneView for PrefetchedView {
+    fn is_known(&self, id: &str) -> bool {
+        self.known_ids.contains(id)
+    }
+    fn target(&self, t: &str) -> HygieneTarget {
+        self.targets.get(t).copied().unwrap_or_default()
+    }
+    fn unique_prefix(&self, t: &str) -> bool {
+        t.len() >= 7
+            && self
+                .known_ids
+                .range(t.to_string()..)
+                .take_while(|x| x.starts_with(t))
+                .take(2)
+                .count()
+                == 1
+    }
+    fn edge_exists(&self, from: &str, to: &str, rel: &'static str) -> bool {
+        self.existing.contains(&(from.to_string(), to.to_string(), rel))
+    }
+}
+
+/// Answers from keyed lookups made now, on the connection of the write turn.
+/// A read that fails is remembered in `failed`: the view can no longer vouch
+/// for what it says, so the caller must not write from the plan.
+struct LiveView<'a, 'db> {
+    conn: &'a Connection<'db>,
+    namespace: &'a str,
+    known: std::cell::RefCell<HashMap<String, bool>>,
+    targets: std::cell::RefCell<HashMap<String, HygieneTarget>>,
+    failed: std::cell::RefCell<Option<String>>,
+}
+
+impl<'a, 'db> LiveView<'a, 'db> {
+    fn new(conn: &'a Connection<'db>, namespace: &'a str) -> Self {
+        Self {
+            conn,
+            namespace,
+            known: Default::default(),
+            targets: Default::default(),
+            failed: Default::default(),
+        }
+    }
+    fn fail(&self, what: &str, e: impl std::fmt::Display) {
+        let mut failed = self.failed.borrow_mut();
+        if failed.is_none() {
+            *failed = Some(format!("{what}: {e}"));
+        }
+    }
+}
+
+impl HygieneView for LiveView<'_, '_> {
+    fn is_known(&self, id: &str) -> bool {
+        if let Some(known) = self.known.borrow().get(id) {
+            return *known;
+        }
+        let q = format!(
+            "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' RETURN m.metadata",
+            escape_ladybug_string(id),
+            escape_ladybug_string(self.namespace)
+        );
+        let live = match self.conn.query(&q) {
+            Ok(mut res) => match res.next() {
+                Some(row) => !hygiene_meta_archived(&format!("{}", row[0])),
+                None => false,
+            },
+            Err(e) => {
+                self.fail("reading a target row", e);
+                false
+            }
+        };
+        self.known.borrow_mut().insert(id.to_string(), live);
+        live
+    }
+
+    fn target(&self, t: &str) -> HygieneTarget {
+        if self.is_known(t) {
+            return HygieneTarget::default();
+        }
+        if let Some(info) = self.targets.borrow().get(t) {
+            return *info;
+        }
+        let exact = match exact_target_exists(self.conn, t) {
+            Ok(exact) => exact,
+            Err(e) => {
+                self.fail("looking up a target id", e);
+                false
+            }
+        };
+        let resolved = !exact
+            && match hygiene_target_resolves(self.conn, self.namespace, t) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    self.fail("resolving a target", e);
+                    false
+                }
+            };
+        let info = HygieneTarget { exact, resolved };
+        self.targets.borrow_mut().insert(t.to_string(), info);
+        info
+    }
+
+    fn unique_prefix(&self, t: &str) -> bool {
+        if t.len() < 7 {
+            return false;
+        }
+        let q = format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id STARTS WITH '{}' RETURN m.metadata",
+            escape_ladybug_string(self.namespace),
+            escape_ladybug_string(t)
+        );
+        match self.conn.query(&q) {
+            Ok(mut res) => {
+                let mut live = 0usize;
+                while let Some(row) = res.next() {
+                    if !hygiene_meta_archived(&format!("{}", row[0])) {
+                        live += 1;
+                        if live > 1 {
+                            break;
+                        }
+                    }
+                }
+                live == 1
+            }
+            Err(e) => {
+                self.fail("looking up ids by prefix", e);
+                false
+            }
+        }
+    }
+
+    fn edge_exists(&self, from: &str, to: &str, rel: &'static str) -> bool {
+        let q = format!(
+            "MATCH (a:Memory {{id: '{}'}})-[r:{rel}]->(b:Memory {{id: '{}'}}) RETURN a.id LIMIT 1",
+            escape_ladybug_string(from),
+            escape_ladybug_string(to)
+        );
+        match self.conn.query(&q) {
+            Ok(mut res) => res.next().is_some(),
+            Err(e) => {
+                self.fail("looking up an edge", e);
+                true
+            }
+        }
+    }
+}
+
+/// Whether row metadata marks the row archived.
+fn hygiene_meta_archived(meta_str: &str) -> bool {
+    serde_json::from_str::<Value>(meta_str)
+        .ok()
+        .and_then(|m| m.get("archived").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
 /// Plans the repair of one row from data already in memory, and appends the
 /// statements it needs to `out`. Nothing here touches the database.
 fn plan_hygiene_row(
     row: &HygieneRow,
     namespace: &str,
-    known_ids: &std::collections::BTreeSet<String>,
-    targets: &HashMap<String, HygieneTarget>,
-    existing_edges: &HashSet<(String, String, &'static str)>,
+    view: &dyn HygieneView,
     out: &mut Vec<HygieneWrite>,
 ) {
     let (id, mtype, loc) = (&row.id, &row.mtype, &row.loc);
@@ -3103,12 +3277,9 @@ fn plan_hygiene_row(
                 unresolvable.push(t.to_string());
                 continue;
             }
-            let known = known_ids.contains(t);
-            let info = targets.get(t).copied().unwrap_or(HygieneTarget { exact: false, resolved: false });
-            let exists = known
-                || info.exact
-                || info.resolved
-                || (t.len() >= 7 && known_ids.range(t.to_string()..).take_while(|x| x.starts_with(t)).take(2).count() == 1);
+            let known = view.is_known(t);
+            let info = view.target(t);
+            let exists = known || info.exact || info.resolved || view.unique_prefix(t);
             if !exists {
                 unresolvable.push(t.to_string());
                 continue;
@@ -3124,7 +3295,7 @@ fn plan_hygiene_row(
                     _ => "RELATES_TO",
                 };
                 let (from_id, to_id) = if *k == "contained_by" { (t, id.as_str()) } else { (id.as_str(), t) };
-                if !existing_edges.contains(&(from_id.to_string(), to_id.to_string(), rel_table)) {
+                if !view.edge_exists(from_id, to_id, rel_table) {
                     let safe_self = escape_ladybug_string(id);
                     edges.push(format!(
                         "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.confidence = 1.0, r.evidence_id = '{}', r.origin = 'local'",
@@ -3140,7 +3311,6 @@ fn plan_hygiene_row(
             }
         }
     }
-    let recheck: Vec<String> = unresolvable.iter().filter(|t| *t != "samples" && *t != "total").cloned().collect();
     if !unresolvable.is_empty() {
         archived_refs.extend(unresolvable);
         if let Some(obj) = meta.as_object_mut() {
@@ -3153,7 +3323,6 @@ fn plan_hygiene_row(
         let has_backfill = content_backfill.is_some();
         out.push(HygieneWrite::Row {
             id: id.clone(),
-            recheck,
             meta_q: format!(
                 "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' AND m.metadata = '{}' SET m.metadata = '{}' RETURN m.id",
                 safe, escape_ladybug_string(id), escape_ladybug_string(&row.meta_str), escape_ladybug_string(&meta.to_string())
@@ -3172,24 +3341,113 @@ fn plan_hygiene_row(
 
 /// Whether a declared target resolves to a row in `ns` the way a write would
 /// resolve it (active generation, suffix forms), not only by its literal id.
-/// The hygiene repair uses it both to plan and to recheck at write time, so a
-/// file published between the two is seen.
-fn hygiene_target_resolves(conn: &Connection, ns: &str, t: &str) -> bool {
+/// The hygiene repair uses it in its candidate pass and again, from fresh data,
+/// in the write turn.
+fn hygiene_target_resolves(conn: &Connection, ns: &str, t: &str) -> Result<bool> {
     let ns_prefix = format!("{}{}", ns, crate::parser::ingest::NAMESPACE_SEPARATOR);
-    if let Some(stripped) = t.strip_prefix(&ns_prefix) {
-        matches!(resolve_target_on_write(conn, ns, stripped), crate::traits::TargetResolution::Resolved(_))
+    let declared = if let Some(stripped) = t.strip_prefix(&ns_prefix) {
+        stripped
     } else if !t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
-        matches!(resolve_target_on_write(conn, ns, t), crate::traits::TargetResolution::Resolved(_))
+        t
     } else {
-        false
+        return Ok(false);
+    };
+    match resolve_target_on_write(conn, ns, declared) {
+        crate::traits::TargetResolution::Resolved(_) => Ok(true),
+        crate::traits::TargetResolution::Failed(e) => Err(anyhow::anyhow!("resolving {t}: {e}")),
+        _ => Ok(false),
     }
 }
 
-/// Write-time recheck: has any target the plan found missing appeared since?
-fn hygiene_recheck_hit(conn: &Connection, ns: &str, recheck: &[String]) -> bool {
-    recheck
-        .iter()
-        .any(|t| exact_target_exists(conn, t).unwrap_or(false) || hygiene_target_resolves(conn, ns, t))
+/// Repairs `ids` from what the database holds now, inside the caller's single
+/// write turn.
+///
+/// The turn holds the store's one lock (`with_conn` and `write_with_deadline`
+/// share it) and the database file lock keeps every other process out, so
+/// nothing can change between the reads and the writes here. Every input to the
+/// plan is read in the turn, from keyed lookups: the rows, which of their edge
+/// targets exist, which resolve, and which edges are already stored. That makes
+/// the repair correct without trusting any earlier read: a row that stopped
+/// needing repair is skipped, one edited or archived since is judged as it is
+/// now, and one that started needing repair is left for the next run. If any
+/// read fails the plan is discarded and nothing is written.
+fn hygiene_repair_chunk(conn: &Connection, namespace: &str, ids: &[String]) -> Result<(usize, usize)> {
+    let safe_ns = escape_ladybug_string(namespace);
+
+    // 1. The rows as they are now, one keyed read each. Archived rows are not
+    // repaired.
+    let mut rows: Vec<HygieneRow> = Vec::new();
+    for id in ids {
+        let mut res = conn.query(&format!(
+            "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{safe_ns}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata",
+            escape_ladybug_string(id)
+        ))?;
+        while let Some(row) = res.next() {
+            let meta_str = format!("{}", row[4]);
+            if hygiene_meta_archived(&meta_str) {
+                continue;
+            }
+            rows.push(HygieneRow {
+                id: format!("{}", row[0]),
+                mtype: format!("{}", row[1]),
+                loc: format!("{}", row[2]),
+                content: format!("{}", row[3]),
+                content_empty: format!("{}", row[3]).trim().is_empty(),
+                meta_str,
+            });
+        }
+    }
+
+    // 2. Plan from the live view.
+    let view = LiveView::new(conn, namespace);
+    let mut writes: Vec<HygieneWrite> = Vec::new();
+    for row in &rows {
+        plan_hygiene_row(row, namespace, &view, &mut writes);
+    }
+    if let Some(failure) = view.failed.borrow().clone() {
+        return Err(anyhow::anyhow!("hygiene repair could not read what it plans from; nothing was written: {failure}"));
+    }
+
+    // 3. Write it.
+    let (mut shape_n, mut dangling_n) = (0usize, 0usize);
+    for w in &writes {
+        match w {
+            HygieneWrite::Edge(q) => {
+                if let Err(e) = conn.query(q) {
+                    tracing::debug!("hygiene edge merge note: {e}");
+                }
+            }
+            HygieneWrite::Row { id, meta_q, content_q, shape, dangling } => {
+                if let Some(q) = content_q {
+                    match conn.query(q) {
+                        Err(e) => {
+                            tracing::warn!("hygiene repair: content write failed for {id}: {e}");
+                            continue;
+                        }
+                        Ok(mut res) => {
+                            if res.next().is_none() {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                match conn.query(meta_q) {
+                    Err(e) => {
+                        tracing::warn!("hygiene repair: metadata write failed for {id}: {e}");
+                        continue;
+                    }
+                    Ok(mut res) => {
+                        if res.next().is_none() {
+                            continue;
+                        }
+                    }
+                }
+                shape_n += *shape as usize;
+                dangling_n += *dangling as usize;
+            }
+        }
+    }
+    Ok((shape_n, dangling_n))
 }
 
 /// Exact ID lookup for qualified target resolution.
@@ -4110,29 +4368,27 @@ impl LadybugStore {
     }
 
 
-    /// Repairs row shape and dangling refs without holding the writer for long
-    /// and without a query per row (beads neurostrata-w9pr).
+    /// Repairs row shape and dangling refs (beads neurostrata-w9pr).
     ///
-    /// It used to scan the namespace and repair every row inside ONE write
-    /// turn. On a large namespace that outlived the write deadline ("gave up
-    /// waiting on repairing namespace hygiene") and every other writer queued
-    /// behind it. A first per-row-turn version fixed the queueing but took
-    /// three minutes: a keyed read per row, and a lookup per edge target per
-    /// row. Now:
-    ///   1. rows are read in id-ordered pages (short read turns);
-    ///   2. each distinct edge target that is not a known id is resolved once;
-    ///   3. the namespace's existing edges are read once;
-    ///   4. the repair is planned in Rust, and only rows that change and edges
-    ///      that are missing are written, a few dozen statements per turn.
+    /// Two passes, so that no turn is long and no write rests on a stale read:
+    ///   1. A read-only candidate pass pages through the namespace in id
+    ///      order, resolves each distinct edge target once, reads the existing
+    ///      edges once, and plans every row in Rust. It keeps only the ids of
+    ///      the rows that need work; the plan itself is thrown away.
+    ///   2. The candidates are repaired in chunks, each in ONE write turn that
+    ///      re-reads its rows and everything they are planned from (keyed
+    ///      lookups) and plans again before it writes. See
+    ///      `hygiene_repair_chunk`.
     ///
-    /// Do not go back to one query per row or one turn for the whole pass: the
-    /// first took 193 s and the second blocks every writer past the 30 s
-    /// deadline (docs/ops/memory-footprint.md 3.7). Readers share the writer's
-    /// lock, so keep every turn short.
+    /// Do not go back to scanning and rewriting the whole namespace in one
+    /// turn (it outlived the 30 s write deadline on a large namespace), or to a
+    /// turn and several lookups per row for every row (about 193 s on the same
+    /// namespace); see docs/ops/memory-footprint.md 3.7. Readers share the
+    /// writer's lock, so keep every turn short.
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         const PAGE: usize = 500;
         const RESOLVE_CHUNK: usize = 50;
-        const WRITE_CHUNK: usize = 40;
+        const REPAIR_CHUNK: usize = 25;
         let namespace = namespace.to_string();
 
         // 1. Pages of rows, ordered by id.
@@ -4208,7 +4464,7 @@ impl LadybugStore {
                     let mut out = Vec::new();
                     for t in chunk {
                         let exact = exact_target_exists(conn, &t).unwrap_or(false);
-                        let resolved = !exact && hygiene_target_resolves(conn, &ns, &t);
+                        let resolved = !exact && hygiene_target_resolves(conn, &ns, &t).unwrap_or(false);
                         out.push((t, HygieneTarget { exact, resolved }));
                     }
                     Ok(out)
@@ -4237,62 +4493,30 @@ impl LadybugStore {
             })
             .await?;
 
-        // 4. Plan in Rust, write only what changes.
-        let mut writes: Vec<HygieneWrite> = Vec::new();
+        // 4. Find the rows that need work. This pass only chooses candidates;
+        // it writes nothing, and its plan is thrown away.
+        let view = PrefetchedView { known_ids, targets, existing };
+        let mut candidates: Vec<String> = Vec::new();
+        let mut scratch: Vec<HygieneWrite> = Vec::new();
         for row in &rows {
-            plan_hygiene_row(row, &namespace, &known_ids, &targets, &existing, &mut writes);
+            let before = scratch.len();
+            plan_hygiene_row(row, &namespace, &view, &mut scratch);
+            if scratch.len() > before {
+                candidates.push(row.id.clone());
+            }
         }
+
+        // 5. Repair each chunk of candidates in ONE write turn that re-reads
+        // the rows and everything they are planned from. Nothing planned
+        // earlier is trusted at write time, so a row edited, or a target
+        // published, since the read cannot be repaired from a stale copy.
         let mut shape_updates = 0usize;
         let mut dangling_updates = 0usize;
-        for chunk in writes.chunks(WRITE_CHUNK) {
-            let chunk = chunk.to_vec();
-            let ns_w = namespace.clone();
+        for chunk in candidates.chunks(REPAIR_CHUNK) {
+            let (ns_w, ids) = (namespace.clone(), chunk.to_vec());
             let (shape, dangling) = self
                 .write_with_deadline("repairing namespace hygiene", move |conn| {
-                    let (mut shape_n, mut dangling_n) = (0usize, 0usize);
-                    for w in &chunk {
-                        match w {
-                            HygieneWrite::Edge(q) => {
-                                if let Err(e) = conn.query(q) {
-                                    tracing::debug!("hygiene edge merge note: {e}");
-                                }
-                            }
-                            HygieneWrite::Row { id, recheck, meta_q, content_q, shape, dangling } => {
-                                if hygiene_recheck_hit(conn, &ns_w, recheck) {
-                                    continue; // a target appeared since the read; the next run decides
-                                }
-                                if let Some(q) = content_q {
-                                    match conn.query(q) {
-                                        Err(e) => {
-                                            tracing::warn!("hygiene repair: content write failed for {id}: {e}");
-                                            continue;
-                                        }
-                                        Ok(mut res) => {
-                                            // Nothing matched: the content changed since the read.
-                                            if res.next().is_none() {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                                match conn.query(meta_q) {
-                                    Err(e) => {
-                                        tracing::warn!("hygiene repair: metadata write failed for {id}: {e}");
-                                        continue;
-                                    }
-                                    Ok(mut res) => {
-                                        // Nothing matched: the row changed since the read.
-                                        if res.next().is_none() {
-                                            continue;
-                                        }
-                                    }
-                                }
-                                shape_n += *shape as usize;
-                                dangling_n += *dangling as usize;
-                            }
-                        }
-                    }
-                    Ok((shape_n, dangling_n))
+                    hygiene_repair_chunk(conn, &ns_w, &ids)
                 })
                 .await?;
             shape_updates += shape;
@@ -15853,7 +16077,7 @@ eurostrata\src\daemon.rs",
             meta_str: r#"{"source":"N/A","an_older_field":1}"#.to_string(),
         };
         let mut writes = Vec::new();
-        plan_hygiene_row(&stale, "probe", &Default::default(), &HashMap::new(), &HashSet::new(), &mut writes);
+        plan_hygiene_row(&stale, "probe", &PrefetchedView::default(), &mut writes);
         let HygieneWrite::Row { meta_q, .. } = writes.pop().expect("a repair was planned") else {
             panic!("expected a row write")
         };
@@ -15896,7 +16120,7 @@ eurostrata\src\daemon.rs",
                 meta_str: "{}".to_string(),
             };
             let mut writes = Vec::new();
-            plan_hygiene_row(&read, "probe", &Default::default(), &HashMap::new(), &HashSet::new(), &mut writes);
+            plan_hygiene_row(&read, "probe", &PrefetchedView::default(), &mut writes);
             let HygieneWrite::Row { content_q, .. } = writes.pop().expect("a backfill was planned") else {
                 panic!("expected a row write")
             };
@@ -15914,39 +16138,105 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A target the plan found missing can appear before the write turn by a
-    /// path that resolves logically (a suffix of the declared path) and not by
-    /// its literal id. The write-time recheck must see it, or the repair
-    /// archives a declaration that has just become valid.
+    /// The chunk repair re-reads everything inside its own write turn, so what
+    /// happened after the candidate pass is judged as it is now. A target
+    /// published after the pass, by a path that resolves logically and not by
+    /// its literal id, keeps the declaration that names it.
     #[tokio::test]
-    async fn repair_hygiene_recheck_sees_a_target_published_after_the_read() {
-        let dir = std::env::temp_dir().join(format!("ns-repair-recheck-{}", uuid::Uuid::new_v4()));
+    async fn repair_hygiene_chunk_keeps_a_declaration_whose_target_appeared_after_the_candidate_pass() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-chunk-target-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("init");
-        let recheck = vec!["src/new.rs".to_string()];
-        let before = recheck.clone();
-        let hit_before = store
-            .with_conn(move |conn| Ok(hygiene_recheck_hit(conn, "probe", &before)))
-            .await
-            .unwrap();
-        assert!(!hit_before, "nothing resolves yet");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        let declarer = retired_test_payload("fact", "agent", json!({ "related_to": ["src/new.rs", "no-such-row"] }));
+        store.upsert("probe", "declarer", v.clone(), declarer).await.unwrap();
 
+        // `src/new.rs` is missing when the candidate pass reads; the file is
+        // published (as the id `new.rs`) before the write turn runs.
         let target = retired_test_payload("fact", "agent", json!({}));
-        store.upsert("probe", "new.rs", vec![0.1, 0.2, 0.3, 0.4], target).await.unwrap();
-        // The literal-id check the recheck used to be is blind to this target.
-        let literal = store
-            .with_conn(|conn| Ok(exact_target_exists(conn, "src/new.rs").unwrap_or(false)))
+        store.upsert("probe", "new.rs", v.clone(), target).await.unwrap();
+
+        let ids = vec!["declarer".to_string()];
+        let (_, dangling) = store
+            .with_conn(move |conn| hygiene_repair_chunk(conn, "probe", &ids))
             .await
             .unwrap();
-        assert!(!literal, "the declared id itself still does not exist");
-        let hit_after = store
-            .with_conn(move |conn| Ok(hygiene_recheck_hit(conn, "probe", &recheck)))
-            .await
-            .unwrap();
-        assert!(
-            hit_after,
-            "a target that now resolves logically blocks the archiving"
+        assert_eq!(dangling, 1, "the row still had one ref that resolves to nothing");
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
+        assert_eq!(
+            row.payload.metadata["related_to"],
+            json!(["src/new.rs"]),
+            "the declaration that now resolves is kept"
         );
+        assert_eq!(row.payload.metadata["archived_refs"], json!(["no-such-row"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Content saved after the candidate pass is not overwritten by the
+    /// blank-content backfill, even though the metadata is unchanged; a row
+    /// that is still blank in the same chunk is backfilled.
+    #[tokio::test]
+    async fn repair_hygiene_chunk_leaves_content_edited_after_the_candidate_pass() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-chunk-content-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let payload = |content: &str| MemoryPayload {
+            content: content.to_string(),
+            user_id: "probe".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: Some("probe".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        store.upsert("probe", "edited", v.clone(), payload("")).await.unwrap();
+        store.upsert("probe", "blank", v.clone(), payload("")).await.unwrap();
+        // Someone saves a correction on `edited` after the candidate pass.
+        store.upsert("probe", "edited", v.clone(), payload("a saved correction")).await.unwrap();
+
+        let ids = vec!["edited".to_string(), "blank".to_string()];
+        store
+            .with_conn(move |conn| hygiene_repair_chunk(conn, "probe", &ids))
+            .await
+            .unwrap();
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let content_of = |id: &str| rows.iter().find(|r| r.id == id).map(|r| r.payload.content.clone()).unwrap();
+        assert_eq!(content_of("edited"), "a saved correction");
+        assert_eq!(content_of("blank"), "legacy", "a row that is still blank is backfilled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The planner counts a long target as present when exactly one live row id
+    /// starts with it. The chunk repair sees only the rows it fetched, so check
+    /// it reproduces that rule: one match keeps the ref, two archive it.
+    #[tokio::test]
+    async fn repair_hygiene_chunk_applies_the_unique_prefix_rule() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-chunk-prefix-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        for id in ["target-row-alpha", "target-row-beta"] {
+            store.upsert("probe", id, v.clone(), retired_test_payload("fact", "agent", json!({}))).await.unwrap();
+        }
+        let declarer = retired_test_payload("fact", "agent", json!({
+            "related_to": ["target-row-al", "target-row"],
+        }));
+        store.upsert("probe", "declarer", v.clone(), declarer).await.unwrap();
+
+        let ids = vec!["declarer".to_string()];
+        store
+            .with_conn(move |conn| hygiene_repair_chunk(conn, "probe", &ids))
+            .await
+            .unwrap();
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
+        assert_eq!(row.payload.metadata["related_to"], json!(["target-row-al"]), "one id starts with it");
+        assert_eq!(row.payload.metadata["archived_refs"], json!(["target-row"]), "two ids start with it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
