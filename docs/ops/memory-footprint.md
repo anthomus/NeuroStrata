@@ -314,6 +314,26 @@ One real `neurostrata_task_claim` response was 61,337 characters, 57,676 of them
 
 `neurostrata_task_claim` and `neurostrata_task_create` take an optional `compact: true`. The response then keeps the same keys, with one row per memory (`id`, `memory_type`, `location`, `snippet`) and `"compact": true` in `auto_retrieved_context`. `subagent_prompt_injection` is the same in both forms. Recomputed offline from that one response, the compact form is 7,512 characters (the handler's own output was not re-measured). The default is unchanged. No file under `plugins/core/index.ts` or `scripts/` reads `auto_retrieved_context`, so changing the default later would not break them; it was not changed, because agents and clients outside this repository may read the metadata.
 
+### 3.14 Is the live daemon holding memory a fresh process does not? (`memory-growth.log`, task `neurostrata-yl3o`)
+
+The question was why the live daemon sits about 500 MB above a fresh process doing the same work (about 1.66 GB against 1.14 GB). The daemon's own log covers one run, from a restart at 15:17 to 22:29 the same day (45 samples, 153 logged calls, local times). `storage_status` on that daemon now reports a 384 MB pool; whether the pool was 384 MB for the whole run was not checked.
+
+| Time | Resident | Peak so far | Calls since last sample |
+|---|---|---|---|
+| 15:17 (just after start) | 839 MB | 1,982 | 20 |
+| 16:10 | 656 MB | 1,256 | 25 |
+| 17:39 | 614 MB | 1,212 | 46 |
+| 18:39 | 1,261 MB | 1,667 | 0 |
+| 19:39 | 1,084 MB | 1,791 | 89 |
+| 20:09 to 21:39 | 875 MB (flat) | 1,791 | 0 |
+| 22:09 | 1,301 MB | 1,791 | 31 |
+
+- Resident memory went down as well as up: 614 MB after more than two hours of use, 875 MB through an idle stretch, against 1.14 GB for the fresh-process probe. So the daemon is not holding a fixed 500 MB more than the probe; it is above the probe's figure while calls are running and below it when idle. Whether the operating system trimmed pages in the idle stretches, or the daemon released them, was not separated.
+- The rises line up with a few tools. Summed positive deltas over the run (overlapping calls double-count, so these are not a total): `task_list` 81 calls, largest +342 MB; `memories_for_file` 36 calls, +167 MB; `task_claim` 15 calls, +350 MB; `task_complete` 6 calls, +329 MB; `search_memory` 5 calls, +460 MB; `add_memory` 3 calls, +326 MB. Task `neurostrata-zoz2` covers `task_list` and `task_claim`.
+- That daemon predates the narrowed `task_list`, `task_create` and `task_complete` reads on the `perf/` branches, so those spikes were measured without them.
+- The 250 to 450 MB of "long-run growth the probe does not reproduce" in the earlier note is not supported by this run: there was no long-run growth, only call-driven rises that later fell. The earlier note came from an uncapped-pool daemon that reached 3.1 GB in 40 minutes, which is a different configuration.
+- Not done: a Tantivy, cache or call-history breakdown. With no retained excess to attribute, there was nothing to split. One run, one machine.
+
 ---
 
 ## 4. Not fixed yet
