@@ -4499,12 +4499,19 @@ impl LadybugStore {
         let mut candidates: Vec<String> = Vec::new();
         let mut scratch: Vec<HygieneWrite> = Vec::new();
         for row in &rows {
-            let before = scratch.len();
+            // One row's plan at a time: only whether it is non-empty matters,
+            // and the statements embed whole metadata copies.
+            scratch.clear();
             plan_hygiene_row(row, &namespace, &view, &mut scratch);
-            if scratch.len() > before {
+            if !scratch.is_empty() {
                 candidates.push(row.id.clone());
             }
         }
+        // The chunks re-read what they need, so let go of the namespace-sized
+        // data before the long write phase.
+        drop(scratch);
+        drop(view);
+        drop(rows);
 
         // 5. Repair each chunk of candidates in ONE write turn that re-reads
         // the rows and everything they are planned from. Nothing planned
