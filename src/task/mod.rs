@@ -141,15 +141,26 @@ fn allocate_task_id(key: &str, existing: &HashSet<String>) -> Option<String> {
     None
 }
 
-async fn existing_ids(
+/// Allocates an unused id with one keyed `get` per candidate. It used to list
+/// the whole namespace to build a HashSet (neurostrata-evcp): that read every
+/// row, embeddings included, to answer "is this 4-character suffix free?".
+/// Do not go back to a listing here; `ID_ATTEMPTS` bounds the keyed reads.
+async fn allocate_unused_task_id(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
-) -> Result<HashSet<String>, String> {
-    store
-        .list(namespace, None, None)
-        .await
-        .map(|rows| rows.into_iter().map(|r| r.id).collect())
-        .map_err(|e| format!("Failed to list memories for id allocation: {}", e))
+    key: &str,
+) -> Result<Option<String>, String> {
+    for _ in 0..ID_ATTEMPTS {
+        let id = format!("{}-{}", key, random_suffix());
+        let taken = store
+            .get(namespace, &id)
+            .await
+            .map_err(|e| format!("Failed to check task id '{}': {}", id, e))?;
+        if taken.is_none() {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 /// Mutable access to `metadata.task`, creating/coercing the object if a
@@ -369,14 +380,13 @@ async fn store_new_task(
     task_meta: Map<String, Value>,
     top_level: Map<String, Value>,
 ) -> Result<(String, MemoryPayload), String> {
-    // Listing is what finds id collisions, and listing needs the schema.
+    // The keyed collision check needs the schema.
     store
         .init(namespace)
         .await
         .map_err(|_| "Failed to initialize table.".to_string())?;
-    let existing = existing_ids(store, namespace).await?;
     let key = ns_key(namespace);
-    let id = allocate_task_id(&key, &existing).ok_or_else(|| {
+    let id = allocate_unused_task_id(store, namespace, &key).await?.ok_or_else(|| {
         format!(
             "ERROR: could not allocate a task id under '{}' after {} attempts.",
             key, ID_ATTEMPTS
