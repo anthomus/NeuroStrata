@@ -87,6 +87,24 @@ The Rust distance is Euclidean and agrees with the engine's `array_distance` to 
 
 Not the cause. With the real model loaded (574 MB), repeated short and 2000-character embeds moved resident memory by 0 to 2 MB each. Loading the model once peaks at 1094 MB.
 
+#### CPU arena off against on (task `neurostrata-aq2u`)
+
+The daemon runs with the ONNX CPU arena off (`src/embed.rs`). `NEUROSTRATA_ORT_ARENA=1` (also `true`, `on`) turns it on for a probe run; the default is unchanged. `embed_call_probe` embeds four fixed texts 30 times each and can write every vector to `NS_PROBE_VEC_OUT`. Two runs per setting, same machine, same model:
+
+| Text | Arena off, median ms | Arena on, median ms |
+|---|---|---|
+| 25 chars | 20.8, 22.4 | 20.4, 21.0 |
+| 44 chars | 18.9, 20.5 | 18.8, 19.6 |
+| 41 chars | 17.5, 19.4 | 18.9, 17.7 |
+| 2000 chars | 337.1, 342.3 | 326.5, 328.7 |
+| Resident memory after the runs | 574 MB | 752 MB |
+
+- The vectors are bit-identical. The output file (every float as hex) has the same MD5 in all four runs.
+- Short queries are the same within run-to-run noise. The 2000-character text is about 3% slower with the arena off (337 and 342 ms against 327 and 329 ms), which is the size of the gap between the two runs of the same setting on the short texts.
+- With the arena off the process holds 178 MB less.
+- `SameAsRequested` was not tried, because the arena-off latency gives no reason to.
+- Not measured: concurrent embeds, or a different model.
+
 ### 3.5 The buffer pool cap (`pool_curve_probe`)
 
 The engine's buffer pool caches database pages and, left alone, is sized to most of the machine's memory. After one big search the running daemon went from about 860 MB to about 1.9 GB and stayed there. We capped the pool and measured peak memory and query time on a copy of the database. Each cap ran in its own process: three passes over every namespace, each pass a general search, a task list and a typed search per namespace. No cap produced an error.

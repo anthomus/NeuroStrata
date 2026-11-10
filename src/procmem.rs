@@ -703,6 +703,42 @@ mod tests {
             embedder.embed(long).await.unwrap();
             report(&format!("2000-char embed {i}"));
         }
+
+        // Latency and identity, for comparing NEUROSTRATA_ORT_ARENA on and off.
+        // NS_PROBE_VEC_OUT names a file that receives every vector, one per
+        // line, so two runs can be diffed.
+        let texts = [
+            "fn probe() { let x = 1; }",
+            "how does the task gate decide a task is done",
+            "guard validate semantic step memory spike",
+            long,
+        ];
+        let mut dump = String::new();
+        for (k, text) in texts.iter().enumerate() {
+            let mut ms = Vec::new();
+            let mut vector = Vec::new();
+            for _ in 0..30 {
+                let t = std::time::Instant::now();
+                vector = embedder.embed(text).await.unwrap();
+                ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "EMBED | text {k} ({:>4} chars) | median {:.1} ms, p90 {:.1} ms, min {:.1} ms (30 calls)",
+                text.len(),
+                ms[ms.len() / 2],
+                ms[ms.len() * 9 / 10],
+                ms[0]
+            );
+            let bits: Vec<String> = vector.iter().map(|f| format!("{:08x}", f.to_bits())).collect();
+            dump.push_str(&bits.join(" "));
+            dump.push_str("\n");
+        }
+        report("after latency runs");
+        if let Ok(path) = std::env::var("NS_PROBE_VEC_OUT") {
+            std::fs::write(&path, dump).expect("write vectors");
+            println!("EMBED | vectors written to {path}");
+        }
     }
 
     /// What do the guard's store reads cost, on a COPY of the database? Run:

@@ -314,6 +314,16 @@ pub struct FastEmbedder {
     dimensions: usize,
 }
 
+/// The ONNX CPU arena is off unless `NEUROSTRATA_ORT_ARENA` is `1`, `true` or
+/// `on`. The variable exists so `embed_call_probe` can compare the two
+/// settings; the default (off) is what the daemon has always run.
+fn arena_allocator_requested() -> bool {
+    matches!(
+        std::env::var("NEUROSTRATA_ORT_ARENA").ok().as_deref().map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
 impl FastEmbedder {
     pub fn new() -> Result<Self> {
         let target_model = configured_model()?;
@@ -361,7 +371,7 @@ impl FastEmbedder {
                 // needed. Texts here are embedded one at a time at their own
                 // length, so the arena ratchets up and never gives it back.
                 .with_execution_providers(vec![ort::ep::CPU::default()
-                    .with_arena_allocator(false)
+                    .with_arena_allocator(arena_allocator_requested())
                     .build()])
                 .with_show_download_progress(true),
         )?;
