@@ -1294,6 +1294,37 @@ mod tests {
         let schema = crate::parser::schema::ParserSchema::load(include_str!("schema.json")).expect("schema");
         let embedder: Arc<dyn Embedder> = Arc::new(Zero);
 
+        // NS_PROBE_CHECKPOINT=1 runs the daemon's periodic checkpoint (every 2 s
+        // while the store is dirty, src/daemon.rs) so the probe matches what a
+        // served ingest does; without it the WAL only grows (bead
+        // neurostrata-gou3).
+        let checkpoints = Arc::new(AtomicU64::new(0));
+        let checkpoint_failures = Arc::new(AtomicU64::new(0));
+        let (stop_checkpoint, mut checkpoint_stopped) = tokio::sync::watch::channel(false);
+        let checkpointer = if std::env::var("NS_PROBE_CHECKPOINT").ok().as_deref() == Some("1") {
+            let (store, ok, bad) = (store.clone(), checkpoints.clone(), checkpoint_failures.clone());
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                        _ = checkpoint_stopped.changed() => break,
+                    }
+                    if !store.is_dirty() {
+                        continue;
+                    }
+                    match store.checkpoint().await {
+                        Ok(()) => ok.fetch_add(1, Ordering::SeqCst),
+                        Err(_) => bad.fetch_add(1, Ordering::SeqCst),
+                    };
+                }
+            }))
+        } else {
+            None
+        };
+        let file_mb = |name: &str| {
+            std::fs::metadata(db.join(name)).map(|m| m.len() / MB).unwrap_or(0)
+        };
+
         println!("READS | start rss {} MB", sample().rss_bytes.unwrap_or(0) / MB);
         for pass in 1..=passes {
             if pass > 1 {
@@ -1325,6 +1356,17 @@ mod tests {
                 max.load(Ordering::SeqCst),
                 elapsed.as_millis()
             );
+            println!(
+                "READS | pass {pass} | db {} MB, wal {} MB | checkpoints ok {} failed {}",
+                file_mb("ladybug.db"),
+                file_mb("ladybug.db.wal"),
+                checkpoints.load(Ordering::SeqCst),
+                checkpoint_failures.load(Ordering::SeqCst)
+            );
+        }
+        stop_checkpoint.send(true).ok();
+        if let Some(task) = checkpointer {
+            task.await.ok();
         }
         println!("READS | process peak {} MB", sample().peak_bytes.unwrap_or(0) / MB);
         std::fs::remove_dir_all(&tree).ok();

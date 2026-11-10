@@ -238,9 +238,24 @@ So 9,170 of the first namespace's rows (52%) are superseded copies. The second h
 
 What this establishes: the growth per pass is not the listing reads (section 3.10) and not the embedder (a zero embedder was used). What it does not establish:
 
-- The cause of the write stall. The probe does not run the daemon's 2-second periodic checkpoint, so the log may simply grow until one checkpoint outlasts the deadline. Whether a daemon can hit it is not known.
-- That superseded generations cause the per-pass growth. That is the explanation left once the reads and the embedder are ruled out. A run that prunes old generations after publish would test it. Pruning changes the design that keeps history (task `neurostrata-bcui` lists the open questions), so it needs the maintainer's decision.
-- Whether the probe's 2.3 GB is real or inflated by the missing checkpoints.
+- That superseded generations cause the per-pass growth. That is the explanation left once the reads and the embedder are ruled out. A run that prunes old generations after publish would test it. Pruning changes the design that keeps history (task `neurostrata-bcui` lists the questions for the maintainer), so it needs the maintainer's decision.
+
+#### With the 2-second checkpoint on (`NS_PROBE_CHECKPOINT=1`, task `neurostrata-gou3`, one run, stopped during pass 5)
+
+The probe now runs the same checkpoint the daemon runs every 2 s while dirty, and reports the file sizes and checkpoint counts per pass.
+
+| Pass | Highest RSS in the pass | Time | Database file | WAL | Checkpoints ok / failed |
+|---|---|---|---|---|---|
+| 1 | 336 MB | 255 s | 86 MB | 0 MB | 113 / 0 |
+| 2 | 466 MB | 285 s | 133 MB | 0 MB | 228 / 0 |
+| 3 | 555 MB | 263 s | 191 MB | 0 MB | 328 / 0 |
+| 4 | 554 MB | 285 s | 243 MB | 1 MB | 428 / 1 |
+| 5 | stopped | | | | 4 failures, then 6,056 abandoned writes |
+
+- The 2.3 GB database file in the table above was inflated by the missing checkpoints. With them it is 243 MB after four passes, growing about 50 MB per pass.
+- The write stall reproduces with the checkpoint on. In pass 5 a checkpoint failed with `Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!` (the commit itself is durable). After that every writer waited its 30 s and gave up (`gave up waiting on writing a memory`), with 0 calls in flight in the engine. The count reached 6,056 before the run was stopped by hand.
+- The passes took 255 to 285 s here against 122 to 156 s without the checkpoint. The checkpoint is not free in this probe.
+- The pool cap in this run was the probe's 384 MB. The failure is a full buffer pool during a checkpoint, so it depends on the cap and on how much of the pool the writes hold. Not measured: the same run with the cap raised, or on the daemon itself. A daemon that ingests a changing tree repeatedly may reach the same state. Task `neurostrata-bcui` covers the growth that gets it there.
 
 ---
 
