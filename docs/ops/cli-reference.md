@@ -30,6 +30,7 @@ Gracefully checkpoints the database and stops the running daemon.
 ```bash
 neurostrata-mcp shutdown
 ```
+While it stops, the daemon appends one line per step to `~/.config/neurostrata/daemon-shutdown.log` (set `NEUROSTRATA_SHUTDOWN_LOG` to use another path; the file rolls to `.1` at 256 KB). Each line has a UTC time and the milliseconds since the stop signal arrived: the signal, in-flight requests finished, whether an ingest was still running, the periodic checkpoint and memory sampler stopping, and each final-checkpoint attempt. If a stop is slow, the last line shows which step it was waiting on. The same lines go to stderr.
 
 ### `setup`
 Installs or refreshes the user-level background service (`systemd` on Linux, `launchd` on macOS) and initializes default configuration under `~/.config/neurostrata/`.

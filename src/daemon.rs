@@ -1153,14 +1153,18 @@ pub(crate) async fn start_daemon_on(
     eprintln!("NeuroStrata Daemon listening on {bind_addr}");
     let cause = Arc::new(Mutex::new(ShutdownCause::Requested));
     let recorded_cause = cause.clone();
+    let timeline = Arc::new(ShutdownTimeline::new(shutdown_log_path()));
+    let signal_timeline = timeline.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let why = shutdown_signal(shutdown_rx).await;
             *recorded_cause.lock().unwrap_or_else(|e| e.into_inner()) = why;
+            signal_timeline.signalled(&format!("{why:?}"));
         })
         .await?;
 
     let cause = cause.lock().map(|c| *c).unwrap_or(ShutdownCause::Requested);
+    timeline.mark("in-flight requests finished, server stopped");
 
     // An ingest runs detached from the request that started it, so the graceful
     // shutdown above did not wait for it. Stopping without waiting left the
@@ -1168,14 +1172,19 @@ pub(crate) async fn start_daemon_on(
     // had rebuilt or relinked it. The periodic checkpoint keeps running
     // meanwhile, and is stopped only once the walk is done.
     if !ingests.wait_idle(ingest_wait_budget(cause)).await {
+        timeline.mark("an ingest was still running at the end of its wait");
         eprintln!("WARNING: an ingest was still running when the daemon had to stop, so its namespace may be only partly rebuilt. Ingest it again.");
+    } else {
+        timeline.mark("no ingest running");
     }
 
     let _ = stop_periodic.send(true);
     if let Err(e) = periodic.await {
         tracing::warn!("periodic checkpoint task join error: {e}");
     }
+    timeline.mark("periodic checkpoint task stopped");
     let _ = memory_sampler.await;
+    timeline.mark("memory sampler stopped");
 
     // The whole point of stopping gracefully: get everything on disk before exit.
     // A checkpoint needs every transaction to drain, and detached work such as
@@ -1186,6 +1195,7 @@ pub(crate) async fn start_daemon_on(
     loop {
         match vector_store.checkpoint().await {
             Ok(()) => {
+                timeline.mark(&format!("final checkpoint complete after {} refusal(s)", failures));
                 eprintln!("Checkpoint complete. NeuroStrata Daemon stopped.");
                 // Release the store lock deterministically: drop our handle to
                 // the database so the engine closes its files before exit,
@@ -1198,6 +1208,7 @@ pub(crate) async fn start_daemon_on(
                 failures += 1;
                 let wait = checkpoint_backoff(failures);
                 if tokio::time::Instant::now() + wait > deadline {
+                    timeline.mark(&format!("final checkpoint gave up after {} refusal(s)", failures));
                     eprintln!(
                         "ERROR: final checkpoint failed {} time(s), recent writes may be lost: {}",
                         failures, e
@@ -1209,6 +1220,7 @@ pub(crate) async fn start_daemon_on(
                         e
                     ));
                 }
+                timeline.mark(&format!("final checkpoint refused (attempt {failures})"));
                 eprintln!(
                     "Final checkpoint refused (attempt {}), retrying in {}s: {}",
                     failures,
@@ -1523,6 +1535,83 @@ enum ShutdownCause {
     /// Everything else: /shutdown, Ctrl-C, SIGTERM. Nothing outside is counting
     /// down, so it can wait out a busy engine.
     Requested,
+}
+
+/// One line per shutdown step, with the time since the stop signal arrived,
+/// appended to `~/.config/neurostrata/daemon-shutdown.log` (override with
+/// `NEUROSTRATA_SHUTDOWN_LOG`) and echoed to stderr. A daemon started without
+/// a console has nowhere for stderr to go, so a slow stop used to leave no
+/// trace of which step was slow (task `neurostrata-jlc2`). Writing the log is
+/// best effort: a failure to write never delays or fails the shutdown.
+struct ShutdownTimeline {
+    signalled: Mutex<Option<std::time::Instant>>,
+    created: std::time::Instant,
+    path: PathBuf,
+}
+
+/// The file is rolled to `.1` once it passes this size, so it cannot grow
+/// without bound across many stops.
+const SHUTDOWN_LOG_MAX_BYTES: u64 = 256 * 1024;
+
+fn shutdown_log_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("NEUROSTRATA_SHUTDOWN_LOG") {
+        return PathBuf::from(p);
+    }
+    // Daemons the tests start and stop must not write into the real config
+    // directory.
+    #[cfg(test)]
+    {
+        return std::env::temp_dir().join("neurostrata-test-daemon-shutdown.log");
+    }
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home.join(".config").join("neurostrata").join("daemon-shutdown.log")
+    }
+}
+
+impl ShutdownTimeline {
+    fn new(path: PathBuf) -> Self {
+        Self { signalled: Mutex::new(None), created: std::time::Instant::now(), path }
+    }
+
+    /// The stop signal arrived: later steps are timed from here.
+    fn signalled(&self, why: &str) {
+        *self.signalled.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+        self.mark(&format!("stop signal received ({why})"));
+    }
+
+    fn mark(&self, step: &str) {
+        let since = self
+            .signalled
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(None)
+            .unwrap_or(self.created);
+        let line = format!(
+            "{} +{} ms {}",
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            since.elapsed().as_millis(),
+            step
+        );
+        eprintln!("[neurostrata:shutdown] {line}");
+        self.append(&line);
+    }
+
+    fn append(&self, line: &str) {
+        use std::io::Write;
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if std::fs::metadata(&self.path).map(|m| m.len() > SHUTDOWN_LOG_MAX_BYTES).unwrap_or(false) {
+            let mut rolled = self.path.clone().into_os_string();
+            rolled.push(".1");
+            let _ = std::fs::rename(&self.path, rolled);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
 }
 
 fn final_checkpoint_budget(cause: ShutdownCause) -> std::time::Duration {
@@ -2087,6 +2176,40 @@ mod tests {
             final_checkpoint_budget(ShutdownCause::ConsoleClosing)
                 < std::time::Duration::from_secs(5)
         );
+    }
+
+    /// Each shutdown step leaves one line with the time since the stop signal,
+    /// in order, and a file past its size limit rolls instead of growing.
+    #[test]
+    fn the_shutdown_timeline_writes_one_ordered_line_per_step() {
+        let dir = std::env::temp_dir().join(format!("ns-shutdown-log-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("daemon-shutdown.log");
+        let timeline = ShutdownTimeline::new(path.clone());
+        timeline.signalled("Requested");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        timeline.mark("in-flight requests finished, server stopped");
+        timeline.mark("final checkpoint complete after 0 refusal(s)");
+
+        let text = std::fs::read_to_string(&path).expect("the log file exists");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].contains("stop signal received (Requested)"), "{}", lines[0]);
+        assert!(lines[1].contains("server stopped") && lines[2].contains("final checkpoint complete"));
+        let elapsed = |line: &str| -> u64 {
+            let after = line.split(" +").nth(1).expect("an elapsed field");
+            after.split(" ms").next().unwrap().parse().expect("milliseconds")
+        };
+        assert!(elapsed(lines[1]) >= 20, "time since the signal: {}", lines[1]);
+        assert!(elapsed(lines[2]) >= elapsed(lines[1]));
+
+        // Past the size limit the file is rolled to `.1` and a new one starts.
+        std::fs::write(&path, vec![b'x'; SHUTDOWN_LOG_MAX_BYTES as usize + 1]).unwrap();
+        timeline.mark("after the roll");
+        let mut rolled = path.clone().into_os_string();
+        rolled.push(".1");
+        assert!(std::path::Path::new(&rolled).exists(), "the old log is kept as .1");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
