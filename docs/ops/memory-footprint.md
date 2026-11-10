@@ -275,6 +275,26 @@ The probe now runs the same checkpoint the daemon runs every 2 s while dirty, an
 - The passes took 255 to 285 s here against 122 to 156 s without the checkpoint. The checkpoint is not free in this probe.
 - The pool cap in this run was the probe's 384 MB. The failure is a full buffer pool during a checkpoint, so it depends on the cap and on how much of the pool the writes hold. Not measured: the same run with the cap raised, or on the daemon itself. A daemon that ingests a changing tree repeatedly may reach the same state. Task `neurostrata-bcui` covers the growth that gets it there.
 
+### 3.12 Where one carried row's time goes (`carry_cost_probe`, task `neurostrata-wt2r`)
+
+An ingest with a changed file copies every unchanged row into the new generation with one `get` and one `upsert`. `carry_cost_probe` ingests a tree once (zero embedder, 4,423 rows from `src`), then times those two calls for 300 rows the way the loop does. One run, with timers placed temporarily inside `upsert` (removed afterwards):
+
+| Step | Mean per row |
+|---|---|
+| `get` | 1.1 ms |
+| `upsert`, whole call | 47 ms (38.7 ms in a first run on the repository, 400 rows) |
+| of which: preparation before the write (symbol ids, ontology, SHACL) | 4.9 ms |
+| the id-collision check | 0.6 ms |
+| the `MERGE` of the row | 6.4 ms |
+| edge materialization (2.4 edges per row: target lookup, type lookup, edge `MERGE`) | 27.6 ms |
+| stamping `edge_sources` back onto the row (one read, one write) | 7.5 ms |
+
+- The copy is the `upsert` call, not the `get`. Reading the rows in a batch would save under 3% of a row.
+- Edge materialization and the provenance stamp are 75% of an upsert, and they run inside the same write for every row. Putting many rows in one transaction would save the commit, which this run does not isolate, but not those queries.
+- A copy that skips them would write different edges and `edge_sources` than today's carried rows have, so it is not a change that keeps behavior. Not done.
+- What did change: `IngestObserver::carry_forward(carried, total)` reports progress while the copy runs, and `IngestProgress` carries `carried_nodes` and `carry_total` (task `neurostrata-wt2r`). The GUI banner was not changed: no GUI file in this repository reads `relinked_edges` or the other progress fields.
+- Not measured: the commit share of the 6.4 ms `MERGE`, or a single-transaction version.
+
 ---
 
 ## 4. Not fixed yet

@@ -341,6 +341,11 @@ pub trait IngestObserver: Send + Sync {
         tracing::debug!("ingest skipped file: {path}");
     }
     fn relinked(&self, edges: usize);
+    /// Called while unchanged rows are copied into the new generation: how
+    /// many are done and how many there are to copy. Called once with
+    /// `(0, total)` before the first copy and every 100 rows after, ending
+    /// with `(carried, total)`. Not called when nothing is copied.
+    fn carry_forward(&self, _carried: usize, _total: usize) {}
     /// Called once per run when the previous generation's `ingest_version`
     /// differs from the current one (or is absent). Implementors surface this
     /// as a warning; the ingest continues with a full re-parse.
@@ -1212,6 +1217,9 @@ pub async fn ingest_directory(
                 Vec::new()
             }
         };
+        // Decide which rows carry before copying any, so the observer can be
+        // told the total up front. Same filter as before, same order.
+        let mut to_carry = Vec::new();
         for r in rows {
             let id = r.id.clone();
             let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
@@ -1236,6 +1244,13 @@ pub async fn ingest_directory(
                 false
             };
             if !carry { continue; }
+            to_carry.push((id, tail));
+        }
+        let carry_total = to_carry.len();
+        if let Some(obs) = &observer {
+            obs.carry_forward(0, carry_total);
+        }
+        for (id, tail) in to_carry {
             match vector_store.get(namespace, &id).await {
                 Ok(Some((vec, mut payload))) => {
                     let old_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, prev_gen, crate::parser::generation::NAMESPACE_SEPARATOR);
@@ -1269,8 +1284,16 @@ pub async fn ingest_directory(
                     tracing::warn!("carry-forward: vector_store.get failed for node {id}: {e}");
                 }
             }
+            if carried % 100 == 0 && carried > 0 {
+                if let Some(obs) = &observer {
+                    obs.carry_forward(carried, carry_total);
+                }
+            }
         }
-        println!("Carried forward {} unchanged nodes", carried);
+        if let Some(obs) = &observer {
+            obs.carry_forward(carried, carry_total);
+        }
+        println!("Carried forward {} unchanged nodes of {}", carried, carry_total);
     }
 
     // Stamp DEPENDS_ON targets onto file nodes (best-effort, warn-first).
@@ -2127,6 +2150,59 @@ mod tests {
             store.get("probe", &file_id).await.expect("read").is_some(),
             "file node with '#' in name must survive carry-forward"
         );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A changed tree copies its unchanged rows; the observer is told the
+    /// total first and ends on carried == total, and an unchanged tree (no
+    /// copy at all) reports nothing.
+    #[tokio::test]
+    async fn carry_forward_reports_carried_out_of_total() {
+        struct Recorder(std::sync::Mutex<Vec<(usize, usize)>>);
+        impl IngestObserver for Recorder {
+            fn file_ingested(&self, _path: &str, _symbols: usize) {}
+            fn relinked(&self, _edges: usize) {}
+            fn carry_forward(&self, carried: usize, total: usize) {
+                self.0.lock().unwrap().push((carried, total));
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!("ns-carry-progress-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("a.rs"), "fn a() {}\nfn a2() {}").expect("write a");
+        std::fs::write(tmp.join("b.rs"), "fn b() {}").expect("write b");
+        let db = std::env::temp_dir().join(format!("ns-carry-progress-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        let first = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(first.clone()), &[])
+            .await
+            .expect("first ingest");
+        assert!(first.0.lock().unwrap().is_empty(), "a first ingest copies nothing");
+
+        // Nothing changed: the unchanged shortcut keeps the generation.
+        let same = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(same.clone()), &[])
+            .await
+            .expect("unchanged ingest");
+        assert!(same.0.lock().unwrap().is_empty(), "an unchanged tree copies nothing");
+
+        // One file changes; a.rs's rows are copied.
+        std::fs::write(tmp.join("b.rs"), "fn b() {}\nfn b2() {}").expect("change b");
+        let changed = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(changed.clone()), &[])
+            .await
+            .expect("changed ingest");
+        let calls = changed.0.lock().unwrap().clone();
+        let (_, total) = calls[0];
+        assert!(total > 0, "the unchanged file's rows are copied");
+        assert_eq!(calls[0], (0, total), "the total is announced before the first copy");
+        assert_eq!(*calls.last().unwrap(), (total, total), "every row is carried");
 
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();

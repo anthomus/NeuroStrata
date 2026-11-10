@@ -741,6 +741,73 @@ mod tests {
         }
     }
 
+    /// Where does the per-row cost of the carry-forward copy go? Ingests a
+    /// copy of NS_PROBE_DIR once (zero embedder), then times `get` and
+    /// `upsert` for each row of that generation, the way the carry-forward
+    /// loop does (bead neurostrata-wt2r). Run:
+    ///   NS_PROBE_DIR=<source tree>     ///   cargo test --release --bin neurostrata-mcp carry_cost_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn carry_cost_probe() {
+        use crate::traits::{Embedder, VectorStore};
+        use std::sync::Arc;
+
+        struct Zero;
+        #[async_trait::async_trait]
+        impl Embedder for Zero {
+            async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0; 4])
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+        }
+
+        let source = std::path::PathBuf::from(std::env::var("NS_PROBE_DIR").expect("NS_PROBE_DIR"));
+        let pid = std::process::id();
+        let db = std::env::temp_dir().join(format!("ns-reads-probe-carry-{pid}"));
+        std::fs::create_dir_all(&db).expect("create db dir");
+        let cfg = lbug::SystemConfig::default()
+            .buffer_pool_size(384 * MB)
+            .throw_on_wal_replay_failure(true);
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::with_system_config(&db.join("ladybug.db"), 4, cfg).expect("open"));
+        store.init("probe").await.expect("init");
+        let schema = crate::parser::schema::ParserSchema::load(include_str!("schema.json")).expect("schema");
+        let embedder: Arc<dyn Embedder> = Arc::new(Zero);
+        let t = std::time::Instant::now();
+        crate::parser::ingest::ingest_directory(&source, &schema, embedder, store.clone(), "probe", None, &[])
+            .await
+            .expect("ingest");
+        println!("CARRY | first ingest {} ms", t.elapsed().as_millis());
+        let source_key = crate::parser::ingest::source_key_for(&source);
+        let generation = store.active_generation("probe", &source_key).await.expect("generation");
+        let rows = store.generation_summary("probe", generation).await.expect("rows");
+        let take: usize = std::env::var("NS_PROBE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        println!("CARRY | generation {generation}: {} rows, timing {}", rows.len(), take.min(rows.len()));
+
+        let (mut get_ms, mut upsert_ms) = (0.0_f64, 0.0_f64);
+        let mut done = 0usize;
+        for r in rows.iter().take(take) {
+            let t = std::time::Instant::now();
+            let got = store.get("probe", &r.id).await.expect("get");
+            get_ms += t.elapsed().as_secs_f64() * 1000.0;
+            let Some((vec, payload)) = got else { continue };
+            let Some((ns, _gen, tail)) = crate::parser::ingest::split_scoped_id(&r.id) else { continue };
+            let new_id = crate::parser::ingest::generation_scoped_id(&ns, generation + 1, &tail);
+            let t = std::time::Instant::now();
+            store.upsert("probe", &new_id, vec, payload).await.expect("upsert");
+            upsert_ms += t.elapsed().as_secs_f64() * 1000.0;
+            done += 1;
+        }
+        println!(
+            "CARRY | {done} rows: get {:.2} ms each, upsert {:.2} ms each",
+            get_ms / done.max(1) as f64,
+            upsert_ms / done.max(1) as f64
+        );
+        std::fs::remove_dir_all(&db).ok();
+    }
+
     /// What do the guard's store reads cost, on a COPY of the database? Run:
     ///   NS_PROBE_DB=<dir holding a copy of ladybug.db> \
     ///   cargo test --release --bin neurostrata-mcp guard_scan_probe -- --ignored --nocapture

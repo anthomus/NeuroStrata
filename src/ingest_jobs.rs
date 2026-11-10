@@ -43,6 +43,13 @@ pub struct IngestProgress {
     pub last_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relinked_edges: Option<usize>,
+    /// Unchanged rows copied into the new generation so far, and how many
+    /// there are to copy. Present only on a run that copies (a changed tree
+    /// with a previous generation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_nodes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carry_total: Option<usize>,
     pub started_unix: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_unix: Option<u64>,
@@ -59,6 +66,8 @@ impl IngestProgress {
             symbols_ingested: 0,
             last_file: None,
             relinked_edges: None,
+            carried_nodes: None,
+            carry_total: None,
             started_unix: now_unix(),
             finished_unix: None,
         }
@@ -89,6 +98,13 @@ impl IngestObserver for ProgressReporter {
     fn relinked(&self, edges: usize) {
         self.tx
             .send_modify(|progress| progress.relinked_edges = Some(edges));
+    }
+
+    fn carry_forward(&self, carried: usize, total: usize) {
+        self.tx.send_modify(|progress| {
+            progress.carried_nodes = Some(carried);
+            progress.carry_total = Some(total);
+        });
     }
 
     fn version_gate_tripped(&self, _prev: &str, _current: &str) {
@@ -318,8 +334,11 @@ mod tests {
         reporter.file_ingested("src/a.rs", 3);
         reporter.file_ingested("src/b.rs", 4);
         reporter.relinked(20);
+        reporter.carry_forward(100, 4400);
 
         let progress = rx.borrow();
+        assert_eq!(progress.carried_nodes, Some(100));
+        assert_eq!(progress.carry_total, Some(4400));
         assert_eq!(progress.files_ingested, 2);
         assert_eq!(progress.symbols_ingested, 7);
         assert_eq!(progress.last_file.as_deref(), Some("src/b.rs"));
