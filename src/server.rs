@@ -4541,22 +4541,36 @@ async fn handle_ingest_directory(
             // AC4: normalize resolvable declared targets so every ingest run
             // leaves the namespace edge-canonical, not just bus subscribers.
             // A normalization failure is logged, never silently swallowed.
-            if let Err(e) = crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
+            let normalized = match crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
                 &*store,
                 namespace,
             )
             .await
             {
-                tracing::warn!("post-ingest normalize failed: {e}");
-            }
-            // Genuinely trigger the live-bus PostIngestNormalize subscriber on
-            // top of the AC4 direct normalize above.
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!("post-ingest normalize failed: {e}");
+                    false
+                }
+            };
+            // Trigger the live-bus PostIngestNormalize subscriber. When the
+            // direct pass above succeeded the pulse says so
+            // (INGEST_NORMALIZED_KIND) and the subscriber only clears the
+            // export-freshness flag: running normalize a second time listed the
+            // whole namespace again for no change (bead neurostrata-g3ib). If
+            // the direct pass failed, the plain `ingest_done` pulse makes the
+            // subscriber retry it.
             if let Some(bus) = bus {
                 bus.emit(
                     ThalamicPulse::Created {
                         id: format!("ingest:{namespace}"),
                         namespace: namespace.to_string(),
-                        kind: "ingest_done".to_string(),
+                        kind: if normalized {
+                            crate::events::subscribers::post_ingest_normalize::INGEST_NORMALIZED_KIND
+                        } else {
+                            "ingest_done"
+                        }
+                        .to_string(),
                     },
                     &RecursionToken::root(),
                 );

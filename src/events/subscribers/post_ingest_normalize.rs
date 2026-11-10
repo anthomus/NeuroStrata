@@ -65,6 +65,10 @@ fn normalize_payload_metadata(
     changed
 }
 
+/// Pulse kind for "ingest finished and the emitter already ran the AC4
+/// normalization pass": the subscriber then only clears the freshness flag.
+pub const INGEST_NORMALIZED_KIND: &str = "ingest_done_normalized";
+
 /// AC4 normalization pass over one namespace: every resolvable declared target
 /// is rewritten to the exact id the store holds (KnownIds::resolve), so the
 /// graph's edge-canonicalization converges without an agent remembering to do
@@ -156,6 +160,46 @@ mod tests {
             .into_iter()
             .find(|r| r.payload.memory_type == "freshness_flag")
             .map(|r| r.payload)
+    }
+
+    /// The pulse an emitter sends after it normalized itself clears the
+    /// freshness flag and does not run a second normalization pass (bead
+    /// neurostrata-g3ib).
+    #[tokio::test]
+    async fn the_already_normalized_pulse_only_clears_the_flag() {
+        let svc = PostIngestNormalize::new();
+        let pulse = ThalamicPulse::Created {
+            id: "i".into(), kind: INGEST_NORMALIZED_KIND.into(), namespace: "global".into(),
+        };
+        let mock: Arc<crate::guard::testkit::MockStore> = Arc::new(crate::guard::testkit::MockStore::new());
+        let store_ref: &dyn crate::traits::VectorStore = mock.as_ref();
+        let ctx = SubscriberContext { store: store_ref, namespace: "global", ts: 0 };
+        let token = RecursionToken::new();
+        store_ref
+            .upsert("global", "NeuroStrata::src/lib.rs", vec![0.0; 4],
+                payload("auto-ingestor", serde_json::json!({})))
+            .await
+            .unwrap();
+        store_ref
+            .upsert("global", "task-doc", vec![0.0; 4],
+                payload("agent", serde_json::json!({ "related_to": ["src/lib.rs"] })))
+            .await
+            .unwrap();
+        ExportFreshnessDirty::new(4)
+            .handle(
+                &ThalamicPulse::Created { id: "task-doc".into(), kind: "task".into(), namespace: "global".into() },
+                &token,
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        svc.handle(&pulse, &token, &ctx).await.unwrap();
+
+        let meta = mock.metadata_of("global", "task-doc").expect("row kept");
+        assert_eq!(meta["related_to"][0], "src/lib.rs", "no second normalization pass: {meta}");
+        let after = freshness_flag(store_ref).await.expect("the flag row survives");
+        assert_eq!(after.metadata["dirty"], serde_json::json!(false), "the flag was cleared");
     }
 
     #[tokio::test]
@@ -277,10 +321,16 @@ impl MemorySubscriber for PostIngestNormalize {
             // a subscriber error the bus counts, and callers see it. Only the
             // ingested namespace's flag is cleared — other namespaces may
             // still hold un-exported mutations and must not pass the gate.
-            ThalamicPulse::Created { kind, namespace, .. } if kind == "ingest_done" => {
-                normalize_namespace_targets(ctx.store, namespace)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("post_ingest_normalize failed: {e}"))?;
+            ThalamicPulse::Created { kind, namespace, .. }
+                if kind == "ingest_done" || kind == INGEST_NORMALIZED_KIND =>
+            {
+                // The emitter that already normalized says so; do not list the
+                // namespace a second time (bead neurostrata-g3ib).
+                if kind == "ingest_done" {
+                    normalize_namespace_targets(ctx.store, namespace)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("post_ingest_normalize failed: {e}"))?;
+                }
                 super::export_freshness_dirty::clear_export_freshness_for_namespace(
                     ctx.store,
                     namespace,
