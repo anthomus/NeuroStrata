@@ -910,6 +910,8 @@ mod tests {
     /// embedder and the default pool cap (bead neurostrata-bo32). Run:
     ///   NS_PROBE_DB=<dir with a copy of ladybug.db> NS_PROBE_POOL_MB=384 \
     ///   cargo test --release --bin neurostrata-mcp component_breakdown_probe -- --ignored --nocapture
+    // Windows-only: the trim stage calls kernel32 heap APIs, which do not link elsewhere.
+    #[cfg(windows)]
     #[tokio::test]
     #[ignore]
     async fn component_breakdown_probe() {
