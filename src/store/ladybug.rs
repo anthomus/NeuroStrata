@@ -2972,6 +2972,8 @@ struct HygieneRow {
     id: String,
     mtype: String,
     loc: String,
+    /// The content as read, so a backfill can be conditional on it.
+    content: String,
     content_empty: bool,
     meta_str: String,
 }
@@ -3156,9 +3158,11 @@ fn plan_hygiene_row(
                 "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' AND m.metadata = '{}' SET m.metadata = '{}' RETURN m.id",
                 safe, escape_ladybug_string(id), escape_ladybug_string(&row.meta_str), escape_ladybug_string(&meta.to_string())
             ),
+            // Conditional on the blank content that was read: an edit made
+            // since then must not be overwritten by the placeholder.
             content_q: content_backfill.map(|text| format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.content = '{}'",
-                safe, escape_ladybug_string(id), escape_ladybug_string(&text)
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' AND m.content = '{}' SET m.content = '{}' RETURN m.id",
+                safe, escape_ladybug_string(id), escape_ladybug_string(&row.content), escape_ladybug_string(&text)
             )),
             shape: shape_changed || has_backfill,
             dangling: dangling_changed,
@@ -4134,6 +4138,7 @@ impl LadybugStore {
                                 id: format!("{}", row[0]),
                                 mtype: format!("{}", row[1]),
                                 loc: format!("{}", row[2]),
+                                content: format!("{}", row[3]),
                                 content_empty: format!("{}", row[3]).trim().is_empty(),
                                 meta_str,
                             },
@@ -4241,6 +4246,20 @@ impl LadybugStore {
                                 if recheck.iter().any(|t| exact_target_exists(conn, t).unwrap_or(false)) {
                                     continue; // a target appeared since the read; the next run decides
                                 }
+                                if let Some(q) = content_q {
+                                    match conn.query(q) {
+                                        Err(e) => {
+                                            tracing::warn!("hygiene repair: content write failed for {id}: {e}");
+                                            continue;
+                                        }
+                                        Ok(mut res) => {
+                                            // Nothing matched: the content changed since the read.
+                                            if res.next().is_none() {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 match conn.query(meta_q) {
                                     Err(e) => {
                                         tracing::warn!("hygiene repair: metadata write failed for {id}: {e}");
@@ -4251,11 +4270,6 @@ impl LadybugStore {
                                         if res.next().is_none() {
                                             continue;
                                         }
-                                    }
-                                }
-                                if let Some(q) = content_q {
-                                    if let Err(e) = conn.query(q) {
-                                        tracing::warn!("hygiene repair: content write failed for {id}: {e}");
                                     }
                                 }
                                 shape_n += *shape as usize;
@@ -15819,6 +15833,7 @@ eurostrata\src\daemon.rs",
             id: "r1".to_string(),
             mtype: "rule".to_string(),
             loc: "src/x.rs".to_string(),
+            content: "kept".to_string(),
             content_empty: false,
             meta_str: r#"{"source":"N/A","an_older_field":1}"#.to_string(),
         };
@@ -15832,6 +15847,55 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
         assert!(!matched, "a stale plan must not match the changed row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blank-content backfill planned from the read must not overwrite
+    /// content someone saved after the read, even when metadata is unchanged.
+    #[tokio::test]
+    async fn repair_hygiene_content_backfill_is_skipped_when_the_content_was_edited() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-content-cas-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let payload = |content: &str| MemoryPayload {
+            content: content.to_string(),
+            user_id: "probe".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: Some("probe".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        // `edited` was blank when the repair read it and was edited after;
+        // `blank` is still blank.
+        store.upsert("probe", "edited", vec![0.1, 0.2, 0.3, 0.4], payload("a saved correction")).await.unwrap();
+        store.upsert("probe", "blank", vec![0.1, 0.2, 0.3, 0.4], payload("")).await.unwrap();
+
+        let plan = |id: &str| {
+            let read = HygieneRow {
+                id: id.to_string(),
+                mtype: "fact".to_string(),
+                loc: String::new(),
+                content: String::new(),
+                content_empty: true,
+                meta_str: "{}".to_string(),
+            };
+            let mut writes = Vec::new();
+            plan_hygiene_row(&read, "probe", &Default::default(), &HashMap::new(), &HashSet::new(), &mut writes);
+            let HygieneWrite::Row { content_q, .. } = writes.pop().expect("a backfill was planned") else {
+                panic!("expected a row write")
+            };
+            content_q.expect("the blank content is backfilled")
+        };
+        let (edited_q, blank_q) = (plan("edited"), plan("blank"));
+        let (edited_matched, blank_matched) = store
+            .with_conn(move |conn| {
+                Ok((conn.query(&edited_q)?.next().is_some(), conn.query(&blank_q)?.next().is_some()))
+            })
+            .await
+            .unwrap();
+        assert!(!edited_matched, "the backfill must not overwrite an edit made since the read");
+        assert!(blank_matched, "a row that is still blank is backfilled");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
