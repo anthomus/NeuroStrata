@@ -713,6 +713,23 @@ mod tests {
             "guard validate semantic step memory spike",
             long,
         ];
+        // Process CPU time (kernel + user) around the timed runs, Windows only.
+        #[cfg(windows)]
+        fn cpu_ms() -> f64 {
+            extern "system" {
+                fn GetCurrentProcess() -> isize;
+                fn GetProcessTimes(p: isize, c: *mut u64, e: *mut u64, k: *mut u64, u: *mut u64) -> i32;
+            }
+            let (mut c, mut e, mut k, mut u) = (0u64, 0u64, 0u64, 0u64);
+            unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+            (k + u) as f64 / 10_000.0
+        }
+        #[cfg(not(windows))]
+        fn cpu_ms() -> f64 {
+            0.0
+        }
+        let cpu_before = cpu_ms();
+        let wall_before = std::time::Instant::now();
         let mut dump = String::new();
         for (k, text) in texts.iter().enumerate() {
             let mut ms = Vec::new();
@@ -734,6 +751,12 @@ mod tests {
             dump.push_str(&bits.join(" "));
             dump.push_str("\n");
         }
+        println!(
+            "EMBED | cpu {:.0} ms over {:.0} ms wall for 120 embeds ({:.2} cores busy on average)",
+            cpu_ms() - cpu_before,
+            wall_before.elapsed().as_secs_f64() * 1000.0,
+            (cpu_ms() - cpu_before) / (wall_before.elapsed().as_secs_f64() * 1000.0)
+        );
         report("after latency runs");
         if let Ok(path) = std::env::var("NS_PROBE_VEC_OUT") {
             std::fs::write(&path, dump).expect("write vectors");

@@ -324,6 +324,16 @@ fn arena_allocator_requested() -> bool {
     )
 }
 
+/// `NEUROSTRATA_ORT_INTRA_THREADS=<n>` caps the ONNX runtime's intra-op
+/// threads for `embed_call_probe` runs. Unset (the default) leaves the
+/// runtime's own choice, which is what the daemon has always run.
+fn intra_threads_requested() -> Option<usize> {
+    std::env::var("NEUROSTRATA_ORT_INTRA_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
 impl FastEmbedder {
     pub fn new() -> Result<Self> {
         let target_model = configured_model()?;
@@ -363,10 +373,14 @@ impl FastEmbedder {
         // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
+        let mut init = TextInitOptions::new(model_enum.clone())
+            .with_cache_dir(cache_dir.clone())
+            .with_max_length(MAX_EMBED_TOKENS);
+        if let Some(threads) = intra_threads_requested() {
+            init = init.with_intra_threads(threads);
+        }
         let model = TextEmbedding::try_new(
-            TextInitOptions::new(model_enum.clone())
-                .with_cache_dir(cache_dir.clone())
-                .with_max_length(MAX_EMBED_TOKENS)
+            init
                 // The CPU arena keeps the largest buffer any input ever
                 // needed. Texts here are embedded one at a time at their own
                 // length, so the arena ratchets up and never gives it back.

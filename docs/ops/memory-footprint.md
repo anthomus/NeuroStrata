@@ -105,6 +105,25 @@ The daemon runs with the ONNX CPU arena off (`src/embed.rs`). `NEUROSTRATA_ORT_A
 - `SameAsRequested` was not tried, because the arena-off latency gives no reason to.
 - Not measured: concurrent embeds, or a different model.
 
+#### Capping the runtime's threads (task `neurostrata-slqn`)
+
+`NEUROSTRATA_ORT_INTRA_THREADS=<n>` caps the ONNX runtime's intra-op threads for `embed_call_probe` runs; unset (the default, and the daemon's setting) leaves the runtime's own choice. Same four texts, 30 embeds each (120 in all), on a 16-logical-processor machine, arena off, one run per setting (two for the default):
+
+| Threads | Median, short texts (ms) | Median, 2000 chars (ms) | Wall for 120 embeds | CPU time | Cores busy | Resident after |
+|---|---|---|---|---|---|---|
+| default | 17 to 22 | 346, 366 | 12.0 s, 13.0 s | 117 s, 119 s | 9.7, 9.2 | 575 MB |
+| 8 | 18 to 20 | 443 | 15.1 s | 90 s | 5.9 | 574 MB |
+| 4 | 17 to 20 | 469 | 16.0 s | 58 s | 3.6 | 573 MB |
+| 2 | 21 to 27 | 769 | 25.4 s | 49 s | 1.9 | 573 MB |
+| 1 | 37 to 46 | 1,367 | 44.8 s | 45 s | 1.0 | 573 MB |
+
+- The vectors are bit-identical at every setting (same MD5 of the hex dump in all six runs), so a cap changes time and CPU, not what is stored.
+- Resident memory does not move (573 to 575 MB), so a thread cap is a CPU lever, not a memory one.
+- With 4 threads the process uses about half the CPU time (58 s against 117 s) and short queries take the same time. The 2000-character text takes about 35% longer (469 against 346 ms). The default spends the extra CPU on long inputs, where it buys about a third of the time back.
+- Whether an ingest, where symbol texts are mixed lengths, would be slower overall with a cap was not measured; the per-text figures above are the inputs for that estimate.
+- Batching texts by length was not re-run. The rule recorded on 2026-08-30 (commit 2013008) measured a batched embed path four times slower than one text per call.
+- Not changed: the default. Choosing a cap trades CPU for long-text latency, which is the maintainer's call.
+
 ### 3.5 The buffer pool cap (`pool_curve_probe`)
 
 The engine's buffer pool caches database pages and, left alone, is sized to most of the machine's memory. After one big search the running daemon went from about 860 MB to about 1.9 GB and stayed there. We capped the pool and measured peak memory and query time on a copy of the database. Each cap ran in its own process: three passes over every namespace, each pass a general search, a task list and a typed search per namespace. No cap produced an error.

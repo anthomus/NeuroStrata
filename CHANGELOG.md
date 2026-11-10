@@ -8,6 +8,8 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ### Fixed
 
+- Measured capping the embedder's ONNX threads (`NEUROSTRATA_ORT_INTRA_THREADS`, a probe-only switch; the default is unchanged). Vectors are bit-identical at 1, 2, 4, 8 threads and the default; resident memory does not change; with 4 threads CPU time halves (58 s against 117 s for 120 embeds) and short queries take the same time, but a 2000-character text takes about 35% longer (469 against 346 ms). One run per setting, 16-processor machine, ingest-shaped mixes not measured. Batching by length was not re-run (an earlier measurement found it four times slower). See `docs/ops/memory-footprint.md` section 3.4.
+
 - Recorded what an idle working-set trim and a lazily loaded embedder would buy, as numbers for the maintainer's decision, and built neither: the live daemon idles at 614 to 875 MB already; a trim would save at most about 60 to 320 MB of resident memory and cost +12% on the first query in the probe; unloading the model would free about 560 MB and cost about a second on the next embedding call (four probe runs, warm file cache). The quantized model was not run (`docs/ops/memory-footprint.md` section 3.15). Documentation only.
 
 - Documented the live daemon's memory against the fresh-process probe, from its own `memory-growth.log` (one run, 7 hours): resident memory fell to 614 MB after two hours of use and sat at 875 MB through idle stretches, below the probe's 1.14 GB, and rose with calls (`task_list`, `task_claim`, `memories_for_file`). The "500 MB held above a fresh process" was not retained memory in this run. Documentation only (`docs/ops/memory-footprint.md` section 3.14).
