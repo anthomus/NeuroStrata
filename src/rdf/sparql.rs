@@ -13,9 +13,9 @@ use spargebra::SparqlParser;
 use spareval::QueryEvaluator;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use crate::parser::ingest::split_scoped_id;
-use crate::store::ladybug::active_generations_by_source_of;
+use crate::store::ladybug::ActiveGenerations;
 
 /// Configuration for SPARQL query execution.
 #[derive(Debug, Clone)]
@@ -99,14 +99,12 @@ pub async fn project_sparql_dataset_with_meta_async(
     // superseded ingest-generation rows and deduplicate by bare_id.
     // `with_conn` requires a 'static closure, so the namespace is copied in.
     let ns_owned = namespace.to_string();
-    let (by_source, active_set, _max_code_gen) = store
-        .with_conn(move |conn| {
-            Ok(active_generations_by_source_of(conn, &ns_owned))
-        })
+    let active = store
+        .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &ns_owned)))
         .await
         .unwrap_or_else(|_err| {
             tracing::warn!("active_generations_by_source_of query failed for '{namespace}'");
-            (HashMap::new(), HashSet::new(), None)
+            ActiveGenerations::none()
         });
 
     let memories = store
@@ -122,15 +120,7 @@ pub async fn project_sparql_dataset_with_meta_async(
     // filter: active generation, not retired/archived/mesh-conflicting, and
     // not a registry row.
     let passes = |m: &crate::traits::SearchResult| -> bool {
-        crate::store::ladybug::is_active_scoped_row(
-            &m.id,
-            namespace,
-            &m.payload.memory_type,
-            &m.payload.metadata,
-            &by_source,
-            &active_set,
-            _max_code_gen,
-        ).is_some()
+        active.reaches(&m.id, namespace, &m.payload.memory_type, &m.payload.metadata)
         && (include_retired || !is_retired_at(&m.payload.metadata, now))
         && (include_archived || !is_archived(&m.payload.metadata))
         && !is_mesh_conflicting(&m.payload.metadata)

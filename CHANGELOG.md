@@ -8,6 +8,8 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ### Fixed
 
+- `search_inner` and the SPARQL projection read a namespace's active generations through `ActiveGenerations` (as `list_rows` and `generation_summary` already did) instead of three loose values and a seven-argument call. The rule is the same function, so which rows are visible does not change; the existing search, SPARQL and generation tests pass. Refactor only, no measurement.
+
 - `neurostrata_task_claim` and `neurostrata_task_create` accept an optional `compact: true`. The default response is unchanged (one real claim was 61,337 characters, almost all of it per-memory metadata). With it, `auto_retrieved_context` keeps its keys and carries one row (`id`, `memory_type`, `location`, `snippet`) per memory and `"compact": true`; `subagent_prompt_injection` is identical. Recomputed offline from that response: 7,512 characters. The default was not changed (`docs/ops/memory-footprint.md` section 3.13). Daemon code changed: needs a deploy to take effect.
 
 - Recorded first-ingest write throughput in a release build with a zero embedder: 24 to 32 ms per row (about 32 to 41 rows per second), one run per tree. The cost is in `upsert` (edge materialization and the provenance stamp), so batching the ingest loop's calls was not done; see `docs/ops/memory-footprint.md` section 3.12. Documentation only.

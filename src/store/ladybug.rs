@@ -189,8 +189,7 @@ async fn search_inner(
             // Active generations for this namespace, resolved per source so a
             // row is validated against the source that owns it (not just any
             // active generation in the namespace). Read once per search.
-            let (by_source, active_set, max_code_gen) =
-                active_generations_by_source_of(conn, &namespace);
+            let active = ActiveGenerations::read(conn, &namespace);
 
             // LadybugDB (the embedder) has no OFFSET, so we over-fetch with a larger LIMIT and
             // filter/trim in Rust. The multiplier bounds cost: at most
@@ -374,16 +373,9 @@ async fn search_inner(
                 // Active-generation filter (Wave 2.1): drop rows from superseded
                 // ingest generations or other namespaces before they consume a
                 // candidate slot. Unscoped normative rows always pass.
-                let kept_id = is_active_scoped_row(
-                    &id,
-                    &namespace,
-                    &memory_type,
-                    &metadata_val,
-                    &by_source,
-                    &active_set,
-                    max_code_gen,
-                );
-                let Some(_kept_id) = kept_id else { continue };
+                if !active.reaches(&id, &namespace, &memory_type, &metadata_val) {
+                    continue;
+                }
 
                 // Usage boost: ln(1+n) gives a real gain even at n=1, and the
                 // cap at half distance preserves semantic ranking order.
@@ -3084,6 +3076,12 @@ impl ActiveGenerations {
     pub(crate) fn read(conn: &Connection, namespace: &str) -> Self {
         let (by_source, active_set, max_code_gen) = active_generations_by_source_of(conn, namespace);
         Self { by_source, active_set, max_code_gen }
+    }
+
+    /// No generation table entries: nothing is superseded, so every row of
+    /// the namespace reaches. What a reader uses when the table cannot be read.
+    pub(crate) fn none() -> Self {
+        Self { by_source: HashMap::new(), active_set: std::collections::HashSet::new(), max_code_gen: None }
     }
 
     /// Same rule as `is_active_scoped_row`: false for a row of a superseded
