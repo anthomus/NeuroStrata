@@ -249,7 +249,7 @@ What this establishes: the growth per pass is not the listing reads (section 3.1
 
 - `neurostrata_task_list` (+197 MB) and `neurostrata_task_claim` (+107 MB) spike the same way on a fresh daemon. Task `neurostrata-zoz2`.
 - Whether the 384 MB cap brings the running daemon's steady state down as much as the probe suggests is not measured on a live daemon yet. Compare `memory-growth.log` before and after the restart.
-- `rules_from_rows` in `src/guard/semantic.rs` keeps rows whose score is at least 0.25 and calls that a similarity floor, but store scores are distances. Task `neurostrata-rhnz`. Behavior is unchanged.
+- `rules_from_rows` in `src/guard/semantic.rs` used to keep rows whose score was at least 0.25 and call that a similarity floor, but store scores are distances (lower is closer). It now keeps rows at distance 0.75 or less (similarity 0.25 or more, `similarity = 1 - distance`), and a listed guard rule gets distance 0.0. Task `neurostrata-rhnz`.
 
 ---
 
