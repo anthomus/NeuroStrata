@@ -236,7 +236,8 @@ pub async fn process_mcp_request(
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
                                 "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." },
                                 "include_archived": { "type": "boolean", "description": "When true, include archived memories in search results." },
-                                "include_references": { "type": "boolean", "description": "When true, append edge_sources provenance citations for each returned memory. Defaults to false." }
+                                "include_references": { "type": "boolean", "description": "When true, append edge_sources provenance citations for each returned memory. Defaults to false." },
+                                "read_only": { "type": "boolean", "default": false, "description": "When true, do not raise the access_count of the returned memories. Use it for measurement and audits: every normal search nudges the ranking it is measuring." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -7312,6 +7313,7 @@ async fn handle_search_memory(
     let node_set_mode = arguments.get("node_set_mode").and_then(|v| v.as_str()).unwrap_or("any").to_string();
     let domain_expansion = arguments.get("domain_expansion").and_then(|v| v.as_bool()).unwrap_or(true);
     let include_references = arguments.get("include_references").and_then(|v| v.as_bool()).unwrap_or(false);
+    let read_only = arguments.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
     // existing search behavior (include_code_ast defaults to true so searches
@@ -7466,7 +7468,7 @@ async fn handle_search_memory(
             return "No relevant memories found.".to_string();
         }
 
-        for res in &results {
+        for res in results.iter().filter(|_| !read_only) {
             if crate::traits::is_direct_match(&res.evidence) {
                 let store_clone = store.clone();
                 let ns_clone = namespace.to_string();
@@ -7704,8 +7706,9 @@ async fn handle_search_memory(
                 if results.is_empty() {
                     "No relevant memories found.".to_string()
                 } else {
-                    // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch)
-                    for res in &results {
+                    // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch),
+                    // and not at all for a read-only (measurement) search.
+                    for res in results.iter().filter(|_| !read_only) {
                         if crate::traits::is_direct_match(&res.evidence) {
                             let store_clone = store.clone();
                             let ns_clone = namespace.to_string();
@@ -13778,6 +13781,75 @@ mod tests {
             .expect("access_count must be a number");
         assert_eq!(access_after, 0, "access_count must still be 0 after recall");
         assert_eq!(access_after, access_before, "access_count must not change during recall");
+    }
+
+    /// A read-only search must leave access_count alone, and an ordinary one
+    /// must still raise it, so the first assertion cannot pass by accident.
+    #[tokio::test]
+    async fn search_memory_read_only_leaves_access_count_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&dir.path().join("store"), 4).expect("open temp"),
+        );
+        store.init("probe").await.expect("init");
+        let add_result = handle_add_memory(
+            serde_json::json!({
+                "namespace": "probe",
+                "create_new_namespace": true,
+                "memory_type": "fact",
+                "content": "read only probe rule",
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(add_result.starts_with("Successfully added memory"), "add failed: {}", add_result);
+        let fact_id = add_result
+            .lines()
+            .find(|l| l.starts_with("Memory ID: "))
+            .map(|l| l[11..].trim().to_string())
+            .expect("fact ID in response");
+        let count = |store: Arc<dyn VectorStore>, id: String| async move {
+            store
+                .get("probe", &id)
+                .await
+                .unwrap()
+                .expect("fact exists")
+                .1
+                .metadata
+                .get("access_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+
+        let quiet = handle_search_memory(
+            serde_json::json!({"namespace": "probe", "query": "read only probe rule", "read_only": true}),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(quiet.contains(&fact_id), "the fact must be found: {quiet}");
+        // The increment is a spawned task; give it ample time to run if it were going to.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(count(store.clone(), fact_id.clone()).await, 0, "read_only must not raise access_count");
+
+        let _ = handle_search_memory(
+            serde_json::json!({"namespace": "probe", "query": "read only probe rule"}),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let mut raised = 0;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            raised = count(store.clone(), fact_id.clone()).await;
+            if raised > 0 {
+                break;
+            }
+        }
+        assert_eq!(raised, 1, "an ordinary search must still raise access_count");
     }
 
     /// The neurostrata_append_log tool's inputSchema must carry the optional
