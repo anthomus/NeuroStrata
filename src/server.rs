@@ -13336,6 +13336,68 @@ mod tests {
         );
     }
 
+    /// The one-shot Claude hook (cli-hook.mjs) no longer lists in_progress
+    /// tasks before the guard, so it sends `active_task_id: null` where it
+    /// used to send the task it found. With a session id and no pending Breath
+    /// prompt the verdict must not depend on that field: the handler picks an
+    /// in_progress task itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_guard_verdict_does_not_depend_on_active_task_id_when_a_session_is_given() {
+        async fn verdict_for(store: &Arc<dyn VectorStore>, active_task_id: Value) -> Value {
+            let reply = handle_guard_validate(
+                serde_json::json!({
+                    "namespace": "probe",
+                    "action_type": "Edit",
+                    "payload": "{\"file_path\":\"src/lib.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}",
+                    "cwd": "C:\\work",
+                    "worktree": "C:\\work",
+                    "session_id": "sess-cli",
+                    "active_task_id": active_task_id,
+                    "mutations_since_note": 0,
+                    "use_sandbox": false,
+                }),
+                store.clone(),
+                Arc::new(StubEmbedder),
+                Arc::new(ThalamicBus::new(16)),
+            )
+            .await;
+            let body: Value =
+                serde_json::from_str(&reply[reply.find('{').expect("a JSON body")..]).expect("JSON");
+            serde_json::json!({ "verdict": body["verdict"], "rules": body["rule_ids_triggered"] })
+        }
+        async fn task(store: &Arc<dyn VectorStore>, id: &str, status: &str, session: &str) {
+            let mut row = payload("a task");
+            row.memory_type = "task".to_string();
+            row.metadata = serde_json::json!({ "task": { "status": status, "session_id": session } });
+            store
+                .upsert("probe", id, StubEmbedder.embed(id).await.unwrap(), row)
+                .await
+                .expect("seed the task");
+        }
+
+        // Two claimed tasks with different sessions, and an open one.
+        let (store, _) = store_with_one_rule("probe").await;
+        task(&store, "task-a", "in_progress", "s-a").await;
+        task(&store, "task-b", "in_progress", "s-b").await;
+        task(&store, "task-c", "open", "").await;
+        let named_a = verdict_for(&store, serde_json::json!("task-a")).await;
+        let named_b = verdict_for(&store, serde_json::json!("task-b")).await;
+        let unnamed = verdict_for(&store, Value::Null).await;
+        let not_claimed = verdict_for(&store, serde_json::json!("task-c")).await;
+        assert_eq!(unnamed, named_a);
+        assert_eq!(unnamed, named_b);
+        assert_eq!(unnamed, not_claimed);
+        assert_ne!(unnamed["verdict"]["bucket"], serde_json::json!("DeterministicReject"));
+
+        // No claimed task: rejected the same way whatever the caller names.
+        let (store, _) = store_with_one_rule("probe").await;
+        task(&store, "task-c", "open", "").await;
+        let unnamed = verdict_for(&store, Value::Null).await;
+        let named = verdict_for(&store, serde_json::json!("task-c")).await;
+        assert_eq!(unnamed, named);
+        assert_eq!(unnamed["verdict"]["bucket"], serde_json::json!("DeterministicReject"));
+    }
+
     /// A refused call never reached a verdict, so there is nothing to record.
     /// The audit trail is a trail of *calls that happened*, and a call the
     /// handler rejected on its arguments did not validate anything.
