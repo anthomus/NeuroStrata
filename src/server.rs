@@ -969,6 +969,7 @@ pub async fn process_mcp_request(
                                 "max_items": { "type": "integer", "description": "Max items (default 10)." },
                                 "max_bytes": { "type": "integer", "description": "Approx byte budget (converted to tokens at ~4 bytes/token; defaults to max_items * 1024 bytes)." },
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale from the context plan." },
+                                "explain": { "type": "boolean", "default": false, "description": "Also return each planned item's rank score (distance after the usage bonus, lower is closer) and access_count, under `explain` in JSON or as trailing lines in text. Read-only: it does not change any count." },
                                 "file_paths": { "type": "array", "items": { "type": "string" }, "description": "Alias for files." },
                                 "target_namespace": { "type": "string", "description": "Optional cross-scope target namespace when authorized." },
                                 "turn_used": { "type": "integer", "description": "Bytes already used in the current turn budget." },
@@ -1542,6 +1543,21 @@ async fn handle_context_plan(
             Vec::new()
         }
     };
+    let explain = arguments.get("explain").and_then(|v| v.as_bool()).unwrap_or(false);
+    // The plan items carry neither a score nor a usage count, so keep both aside
+    // before the results are turned into items. The score already includes the
+    // usage bonus, which is why the two are shown together.
+    let explain_rows: std::collections::HashMap<String, (f32, i64)> = if explain {
+        results
+            .iter()
+            .map(|r| {
+                let hits = r.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                (r.id.clone(), (r.score, hits))
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
     let mut items: Vec<ContextItem> = Vec::new();
     let exclude_stale = arguments
         .get("exclude_stale")
@@ -1727,7 +1743,36 @@ async fn handle_context_plan(
         plan.degradation = crate::context::model::Degradation::Partial;
     }
     if format == "text" {
-        render_plan_text(&plan)
+        let mut text = render_plan_text(&plan);
+        if explain {
+            text.push_str("explain (score = distance after the usage bonus, lower is closer):\n");
+            for item in &plan.items {
+                if let Some((score, hits)) = explain_rows.get(&item.id) {
+                    text.push_str(&format!("- {} score={:.3} access_count={}\n", item.id, score, hits));
+                }
+            }
+        }
+        text
+    } else if explain {
+        let mut value = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
+        let rows: Vec<Value> = plan
+            .items
+            .iter()
+            .filter_map(|item| {
+                explain_rows.get(&item.id).map(|(score, hits)| {
+                    serde_json::json!({
+                        "id": item.id,
+                        "memory_type": item.memory_type,
+                        "score": score,
+                        "access_count": hits,
+                    })
+                })
+            })
+            .collect();
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("explain".to_string(), Value::Array(rows));
+        }
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
     } else {
         serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".into())
     }
@@ -15196,6 +15241,63 @@ mod context_plan_tests {
         let args_text = serde_json::json!({"namespace":"test","format":"text"});
         let text_result = handle_context_plan(&args_text, embedder.clone(), store.clone()).await;
         assert!(text_result.contains("context-plan") || text_result.contains("(no items)"));
+    }
+
+    #[tokio::test]
+    async fn context_plan_explain_returns_score_and_access_count_only_when_asked() {
+        use crate::traits::MemoryPayload;
+        let embedder = Arc::new(LocalStubEmbedder);
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-explain-test"), 4)
+                .expect("open"),
+        );
+        store.init("test").await.unwrap();
+        store
+            .upsert(
+                "test",
+                "plan-explain-seed",
+                vec![0.1f32; 4],
+                MemoryPayload {
+                    content: "explain seed memory".to_string(),
+                    user_id: "test".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "access_count": 7 }),
+                },
+            )
+            .await
+            .expect("insert seed");
+
+        let base = serde_json::json!({"namespace":"test","query":"explain seed memory","format":"json"});
+        let plain = handle_context_plan(&base, embedder.clone(), store.clone()).await;
+        let plain_val: serde_json::Value = serde_json::from_str(&plain).expect("json parses");
+        assert!(plain_val.get("explain").is_none(), "explain must be opt-in");
+
+        let mut asked = base.clone();
+        asked["explain"] = serde_json::json!(true);
+        let out = handle_context_plan(&asked, embedder.clone(), store.clone()).await;
+        let val: serde_json::Value = serde_json::from_str(&out).expect("json parses");
+        let rows = val["explain"].as_array().expect("explain array");
+        let row = rows
+            .iter()
+            .find(|r| r["id"] == "plan-explain-seed")
+            .expect("the seed is explained");
+        assert_eq!(row["access_count"], serde_json::json!(7));
+        assert!(row["score"].as_f64().is_some(), "score is a number: {row}");
+        assert_eq!(row["memory_type"], "fact");
+        // The plan itself is unchanged by asking.
+        assert_eq!(val["items"], plain_val["items"]);
+
+        let text = handle_context_plan(
+            &serde_json::json!({"namespace":"test","query":"explain seed memory","format":"text","explain":true}),
+            embedder.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(text.contains("plan-explain-seed score="), "text: {text}");
+        assert!(text.contains("access_count=7"), "text: {text}");
     }
 
     #[tokio::test]
