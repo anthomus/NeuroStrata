@@ -8087,6 +8087,18 @@ fn render_search_results(results: &[SearchResult]) -> String {
             out.push_str("\n\n");
         }
         out.push_str(&format_memory(&result.id, &result.payload));
+        // The rank already includes a usage bonus (access_count), so show both:
+        // without them a result that outranks a closer match cannot be explained.
+        let hits = result
+            .payload
+            .metadata
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "\nScore: {:.3} (distance after ranking bonus, lower is closer) access_count: {}",
+            result.score, hits
+        ));
 
         if let Some(suffix) = render_evidence_suffix(result, remaining_budget) {
             out.push_str(&suffix);
