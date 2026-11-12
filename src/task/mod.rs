@@ -2935,7 +2935,10 @@ if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     exit 0
 fi
 
-NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
+# The namespace configured for this project (harness settings; folder name
+# last), resolved in one place: `neurostrata-mcp namespace resolve`.
+NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null)
+[ -n "$NAMESPACE" ] || NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
@@ -2973,7 +2976,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
-# neurostrata-hook-sha256: cb1c385835cfe2ddc026878074e34ea3661674f44d314679c8c85764ef7d70b7
+# neurostrata-hook-sha256: f4e93b082075d74edb226cb31692b8b38ac79a430f32c0cba5e6ca69f422ac65
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -3032,8 +3035,15 @@ case "$COMMON" in
     */.git) MAIN_ROOT="${COMMON%/.git}" ;;
 esac
 LEDGER="$MAIN_ROOT/.NeuroStrata/session_queries.json"
+# The namespace configured for this project (harness settings; folder name
+# last), resolved in one place: `neurostrata-mcp namespace resolve`. The
+# ledger's own field and the folder name are fallbacks when the binary is
+# not on PATH.
 NAMESPACE=""
-if [ -f "$LEDGER" ]; then
+if command -v neurostrata-mcp >/dev/null 2>&1; then
+    NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null)
+fi
+if [ -z "$NAMESPACE" ] && [ -f "$LEDGER" ]; then
     NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
 fi
 if [ -z "$NAMESPACE" ]; then
@@ -3518,11 +3528,12 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     if !root.join(".git").exists() {
         return String::new();
     }
-    let repo_ns = root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("default");
-    let _ = harness_plugins::auto_install_detected_plugins(root, repo_ns, None);
+    // The configured namespace (harness settings, then the main checkout's,
+    // folder name last) -- the same answer the hooks get from
+    // `neurostrata-mcp namespace resolve`, so a refresh never rewrites a
+    // harness config with the folder name.
+    let repo_ns = harness_plugins::resolve_project_namespace(root);
+    let _ = harness_plugins::auto_install_detected_plugins(root, &repo_ns, None);
     let hooks_dir = git_hooks_dir(root);
     if !hooks_dir.is_dir() {
         if let Err(e) = std::fs::create_dir_all(&hooks_dir) {
