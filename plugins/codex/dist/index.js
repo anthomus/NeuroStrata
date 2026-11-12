@@ -845,17 +845,34 @@ function formatFileMemorySnippet(hit) {
     }
     return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${content}`;
 }
-function capSnippets(snippets) {
+/**
+ * Fill one PREFETCH_MAX_CHARS recall block with whole snippets and mark in
+ * `seen` only the memories that made it in. A snippet that does not fit is
+ * dropped, not cut: a cut one loses its `neurostrata_get_memory id=` pointer,
+ * and a memory marked as seen without being delivered would be withheld from
+ * every later touch. `dropped` tells the caller a memory is still owed.
+ */
+function fillRecallBlock(entries, seen) {
+    const snippets = [];
+    const added = [];
+    let dropped = false;
     let total = 0;
-    const out = [];
-    for (const snippet of snippets) {
-        if (total >= PREFETCH_MAX_CHARS)
-            break;
-        const room = PREFETCH_MAX_CHARS - total;
-        out.push(snippet.length > room ? snippet.slice(0, room) : snippet);
-        total += Math.min(snippet.length, room) + 1;
+    for (const entry of entries) {
+        if (entry.dedupKey && seen.has(entry.dedupKey))
+            continue;
+        if (total + entry.snippet.length > PREFETCH_MAX_CHARS) {
+            if (entry.dedupKey)
+                dropped = true;
+            continue;
+        }
+        snippets.push(entry.snippet);
+        total += entry.snippet.length + 1;
+        if (entry.dedupKey) {
+            seen.add(entry.dedupKey);
+            added.push(entry.dedupKey);
+        }
     }
-    return out;
+    return { snippets, added, dropped };
 }
 /**
  * Record a session-query ledger entry in <projectRoot>/.NeuroStrata/session_queries.json.
@@ -1039,19 +1056,13 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
         }
         const entries = parseRawFileRecallEntries(text, normalized);
         cacheSubagentFileRecall(key, entries);
-        const out = [];
-        const added = [];
-        for (const entry of entries) {
-            if (entry.dedupKey) {
-                if (injectedMemoryIds.has(entry.dedupKey))
-                    continue;
-                injectedMemoryIds.add(entry.dedupKey);
-                added.push(entry.dedupKey);
-            }
-            out.push(entry.snippet);
-        }
+        const { snippets, added, dropped } = fillRecallBlock(entries, injectedMemoryIds);
+        // A memory left out for room is still owed: the next touch of this file
+        // queries again and delivers it (the delivered ones are deduped).
+        if (dropped)
+            prefetchedPaths.delete(key);
         pendingPrefetchDeliveries.set(key, added);
-        return capSnippets(out);
+        return snippets;
     }
     catch {
         return [];
@@ -1262,16 +1273,7 @@ async function recallMemoriesForSubagentFile(namespace, filePath, seenInPrompt) 
     else {
         cacheSubagentFileRecall(key, entries);
     }
-    const out = [];
-    for (const entry of entries) {
-        if (entry.dedupKey) {
-            if (seenInPrompt.has(entry.dedupKey))
-                continue;
-            seenInPrompt.add(entry.dedupKey);
-        }
-        out.push(entry.snippet);
-    }
-    return capSnippets(out);
+    return fillRecallBlock(entries, seenInPrompt).snippets;
 }
 export function formatFileTouchRecallBlock(filePath, snippets) {
     return `[NeuroStrata Governing Memories for ${filePath}]\n${snippets.join("\n")}`;

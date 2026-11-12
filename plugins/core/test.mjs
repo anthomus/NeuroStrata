@@ -152,6 +152,7 @@ function createMockDaemonServer({
   returnTask = null,
   guardReject = false,
   memoryContent = "Always claim a task before editing files.",
+  hits = null,
 } = {}) {
   const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
   return new Promise((resolve) => {
@@ -200,7 +201,7 @@ function createMockDaemonServer({
                 {
                   type: "text",
                   text: JSON.stringify({
-                    hits: [
+                    hits: hits ?? [
                       {
                         id: "mem-rule-1",
                         valid_from: "2026-01-01T00:00:00Z",
@@ -2753,6 +2754,51 @@ describe("file-recall ledger across hook processes", () => {
       const [snippet] = await prefetchMemoriesForFile("ledger-ns", "src/long.ts");
       assert.ok(snippet.length < MEMORY_SNIPPET_MAX_CHARS + 200, `snippet length ${snippet.length}`);
       assert.ok(snippet.includes("truncated from 3465 chars; neurostrata_get_memory id=mem-rule-1"));
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  // Five capped memories (~590 chars each) do not fit one 2,048-char block.
+  const longHits = [1, 2, 3, 4, 5].map((n) => ({
+    id: `mem-long-${n}`,
+    valid_from: "2026-01-01T00:00:00Z",
+    memory_type: "rule",
+    content: `rule ${n} `.repeat(120),
+  }));
+  const blockIds = (block) => [...block.matchAll(/\[NeuroStrata rule (mem-long-\d)/g)].map((m) => m[1]);
+  const ledgerIds = () =>
+    Object.keys(JSON.parse(readFileSync(fileRecallLedgerPath("ledger-ns", "sess-ledger"), "utf8")).memories)
+      .map((key) => key.split(":")[0])
+      .sort();
+
+  it("records in the ledger only the memories whose whole snippet is in the block", async () => {
+    const { server } = await start({ hits: longHits });
+    try {
+      const block = await touch("src/long.ts");
+      const ids = blockIds(block);
+      assert.ok(ids.length > 0 && ids.length < 5, `some memories left out for room, got ${ids.join(",")}`);
+      assert.deepEqual(ledgerIds(), [...ids].sort(), "ledger == ids in the block");
+      for (const id of ids) {
+        assert.ok(block.includes(`neurostrata_get_memory id=${id} has the rest]`), `${id} is whole, pointer kept`);
+      }
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("delivers a memory left out for room on the next touch of the same file", async () => {
+    const { server, counters } = await start({ hits: longHits });
+    try {
+      const first = blockIds(await touch("src/long.ts"));
+      const second = blockIds(await touch("src/long.ts"));
+      assert.equal(counters.memoriesForFile, 2, "the file is queried again while a memory is owed");
+      assert.deepEqual([...first, ...second].sort(), longHits.map((h) => h.id), "each memory exactly once");
+      assert.deepEqual(ledgerIds(), longHits.map((h) => h.id));
+      assert.equal(await touch("src/long.ts"), "", "all delivered: nothing more");
+      assert.equal(counters.memoriesForFile, 2, "and no further daemon call");
     } finally {
       server.close();
       resetModuleState();
