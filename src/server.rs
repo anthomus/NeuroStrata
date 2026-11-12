@@ -2085,20 +2085,20 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
 /// as given, without touching the store or the disk; an absolute one is made
 /// relative to the caller's `project_root`, the nearest `.git` ancestor (a
 /// linked worktree's `.git` file included), or the namespace's registered
-/// root (see `crate::parser::lookup_path`).
+/// root (see `crate::paths::to_project_relative`). All path handling goes
+/// through crate::paths. Do not normalize, join or compare paths by hand.
 async fn lookup_path_for(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     path: &str,
     project_root: Option<&str>,
-) -> crate::parser::lookup_path::LookupPath {
-    use crate::parser::lookup_path::{is_absolute_lookup_path, resolve_lookup_path};
-    let registry_root = if is_absolute_lookup_path(path) {
+) -> crate::paths::LookupPath {
+    let registry_root = if crate::paths::is_absolute_any(path) {
         crate::registry::cached_project_root(store, namespace).await
     } else {
         None
     };
-    resolve_lookup_path(path, project_root, registry_root.as_deref())
+    crate::paths::to_project_relative(path, project_root, registry_root.as_deref())
 }
 
 /// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
@@ -2202,7 +2202,7 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             });
             // An absolute path says what it was looked up as, so a miss on a
             // file outside every known root is visible rather than silent.
-            if lookup.source != crate::parser::lookup_path::RootSource::Relative {
+            if lookup.source != crate::paths::RootSource::Relative {
                 response["resolved_path"] = serde_json::Value::String(lookup.path.clone());
                 response["resolved_from"] = serde_json::json!(lookup.source.as_str());
             }
