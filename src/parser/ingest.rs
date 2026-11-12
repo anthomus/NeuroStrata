@@ -114,6 +114,46 @@ pub fn is_qualified(namespace: &str, id: &str) -> bool {
     id.starts_with(&qualified_id(namespace, ""))
 }
 
+/// Directory names an ingest and a dry run never descend into, wherever they
+/// sit below the walk root. One list for both walks.
+pub const SKIPPED_DIRS: [&str; 19] = [
+    "node_modules",
+    "target",
+    "vendor",
+    ".venv",
+    "venv",
+    "env",
+    ".env",
+    "dist",
+    "build",
+    "out",
+    ".dolt",
+    ".git",
+    ".next",
+    ".nuxt",
+    "__pycache__",
+    ".fastembed_cache",
+    ".idea",
+    ".vscode",
+    "coverage",
+];
+
+/// Whether a walked `path` is, or is inside, a [`SKIPPED_DIRS`] directory,
+/// judged on the components of `path` below the walk `root` only. Matching
+/// components rather than `"/name/"` substrings works with either separator
+/// (a Windows walk yields `\`), and leaving out the root's own ancestors
+/// keeps a project that lives under a directory named `build` or `out`
+/// from being skipped whole.
+pub fn is_in_skipped_dir(root: &Path, path: &Path) -> bool {
+    let below_root = path.strip_prefix(root).unwrap_or(path);
+    below_root.components().any(|component| match component {
+        std::path::Component::Normal(name) => {
+            name.to_str().is_some_and(|name| SKIPPED_DIRS.contains(&name))
+        }
+        _ => false,
+    })
+}
+
 /// The id a node gets, relative to the directory being ingested.
 ///
 /// Ids used to inherit whatever the caller passed: the CLI walked a relative
@@ -1264,28 +1304,6 @@ fn run_producer(
         std::collections::HashMap::new();
     let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    let skipped_dirs = [
-        "node_modules",
-        "target",
-        "vendor",
-        ".venv",
-        "venv",
-        "env",
-        ".env",
-        "dist",
-        "build",
-        "out",
-        ".dolt",
-        ".git",
-        ".next",
-        ".nuxt",
-        "__pycache__",
-        ".fastembed_cache",
-        ".idea",
-        ".vscode",
-        "coverage",
-    ];
-
     let walker = WalkBuilder::new(&dir_path).build();
 
     let mut unreadable = 0usize;
@@ -1311,24 +1329,10 @@ fn run_producer(
         };
 
         let path = entry.path();
-        let path_str = path.to_string_lossy().to_string();
-
-        let mut should_skip = false;
-        for skip_dir in &skipped_dirs {
-            let skip_pattern = format!("/{}/", skip_dir);
-            let skip_start = format!("{}/", skip_dir);
-            let skip_exact = format!("./{}", skip_dir);
-            if path_str.contains(&skip_pattern)
-                || path_str.starts_with(&skip_start)
-                || path_str == skip_exact
-            {
-                should_skip = true;
-                break;
-            }
-        }
-        if should_skip {
+        if is_in_skipped_dir(&dir_path, path) {
             continue;
         }
+        let path_str = path.to_string_lossy().to_string();
 
         let abs_path = if path.is_absolute() {
             path.to_string_lossy().to_string()
@@ -4392,6 +4396,78 @@ mod tests {
         assert_eq!(secs[1].heading, "Second");
     }
 
+    /// The skip list matches path components below the walk root, with either
+    /// separator, and never the root's own ancestors.
+    #[test]
+    fn skipped_dirs_match_components_below_the_walk_root() {
+        let root = std::env::temp_dir().join("build").join("example-project");
+        for skipped in [
+            root.join("node_modules").join("pkg").join("index.js"),
+            root.join("src").join("build").join("gen.rs"),
+            root.join("target"),
+        ] {
+            assert!(is_in_skipped_dir(&root, &skipped), "{}", skipped.display());
+        }
+        for kept in [root.clone(), root.join("src").join("lib.rs"), root.join("builds").join("x.rs")] {
+            assert!(!is_in_skipped_dir(&root, &kept), "{}", kept.display());
+        }
+        // A relative walk, as the CLI runs it.
+        assert!(is_in_skipped_dir(Path::new("."), Path::new("./node_modules/x.js")));
+        assert!(!is_in_skipped_dir(Path::new("./src"), Path::new("./src/lib.rs")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn skipped_dirs_match_windows_walk_paths() {
+        // What a daemon ingest walks on Windows: the std-canonical verbatim root.
+        let root = Path::new(r"\?\C:\dev\example-project");
+        assert!(is_in_skipped_dir(root, Path::new(r"\?\C:\dev\example-project\node_modules\x.js")));
+        assert!(is_in_skipped_dir(Path::new(r".\src"), Path::new(r".\src\dist\x.js")));
+        assert!(!is_in_skipped_dir(root, Path::new(r"\?\C:\dev\example-project\src\lib.rs")));
+    }
+
+    /// One fixture under an ancestor named `build`, holding a `node_modules`
+    /// directory: the ingest and the dry run skip the same entries, and the
+    /// project itself is not skipped. Before the shared matcher, Windows
+    /// ingested node_modules (no `/` in its paths) and POSIX skipped
+    /// everything (the root's path contains `/build/`).
+    #[tokio::test]
+    async fn ingest_and_dry_run_skip_the_same_entries() {
+        let tmp = std::env::temp_dir()
+            .join(format!("ns-skip-{}", uuid::Uuid::new_v4()))
+            .join("build")
+            .join("example-project");
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.join("node_modules").join("pkg")).unwrap();
+        std::fs::write(tmp.join("src").join("lib.rs"), "pub fn kept() {}").unwrap();
+        std::fs::write(tmp.join("README.md"), "# kept\n").unwrap();
+        std::fs::write(tmp.join("node_modules").join("pkg").join("index.js"), "module.exports = 1;").unwrap();
+
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema parses");
+        let report = dry_run_directory(&tmp, &schema, "estimate").await.unwrap();
+        assert!(report.contains("Files: 2\n"), "{report}");
+
+        let db = std::env::temp_dir().join(format!("ns-skip-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("skip-ns").await.expect("create the schema");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "skip-ns", None, &[])
+            .await
+            .expect("ingest");
+        let mut locations: Vec<String> = Vec::new();
+        for kind in ["file", "markdown", "directory"] {
+            for row in store.list("skip-ns", None, Some(kind)).await.expect("list") {
+                locations.push(row.payload.location.clone());
+            }
+        }
+        assert!(locations.iter().any(|l| l == "src/lib.rs"), "{locations:?}");
+        assert!(locations.iter().any(|l| l == "README.md"), "{locations:?}");
+        assert!(!locations.iter().any(|l| l.contains("node_modules")), "{locations:?}");
+
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap().parent().unwrap());
+        let _ = std::fs::remove_dir_all(&db);
+    }
+
     /// F8 dry-run estimate and presort with all required fields present.
     #[tokio::test]
     async fn test_f8_dry_run_estimate_and_presort_zero_writes() {
@@ -5848,28 +5924,6 @@ pub async fn dry_run_directory(
     mode: &str,
 ) -> anyhow::Result<String> {
     let ext_to_lang = build_ext_map(schema);
-    let skipped_dirs = [
-        "node_modules",
-        "target",
-        "vendor",
-        ".venv",
-        "venv",
-        "env",
-        ".env",
-        "dist",
-        "build",
-        "out",
-        ".dolt",
-        ".git",
-        ".next",
-        ".nuxt",
-        "__pycache__",
-        ".fastembed_cache",
-        ".idea",
-        ".vscode",
-        "coverage",
-    ];
-
     let mut files = 0usize;
     let mut parseable = 0usize;
     let mut symbols = 0usize;
@@ -5897,23 +5951,10 @@ pub async fn dry_run_directory(
             }
         };
         let path = entry.path();
-        let path_str = path.to_string_lossy();
-        let mut should_skip = false;
-        for skip_dir in &skipped_dirs {
-            let skip_pattern = format!("/{}/", skip_dir);
-            let skip_start = format!("{}/", skip_dir);
-            let skip_exact = format!("./{}", skip_dir);
-            if path_str.contains(&skip_pattern)
-                || path_str.starts_with(&skip_start)
-                || path_str == skip_exact
-            {
-                should_skip = true;
-                break;
-            }
-        }
-        if should_skip {
+        if is_in_skipped_dir(dir_path, path) {
             continue;
         }
+        let path_str = path.to_string_lossy();
         let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
         if !is_file {
             continue;
