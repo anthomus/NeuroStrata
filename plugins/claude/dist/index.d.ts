@@ -262,10 +262,14 @@ export declare const MEMORY_SNIPPET_MAX_CHARS = 400;
 /**
  * Recall governing memories for a touched file. LRU path dedup (no re-query within the
  * window) and injectedMemoryIds dedup (each memory injected once per session).
+ * With `ledger`, the dedup is decided against the session's file-recall ledger
+ * as it is after the daemon call, so parallel hook processes do not deliver
+ * the same memory twice.
  */
 export declare function prefetchMemoriesForFile(namespace: string, filePath: string, opts?: {
     recordLedgerDir?: string;
     projectRoot?: string;
+    ledger?: FileRecallSession;
 }): Promise<string[]>;
 /**
  * Mark a prefetch as delivered: its memories were handed to the caller, so the
@@ -292,15 +296,36 @@ export declare const FILE_RECALL_LEDGER_TTL_MS: number;
 /** Session-scoped, so it lives in the temp dir: never in a checkout or worktree. */
 export declare function fileRecallLedgerDir(): string;
 export declare function fileRecallLedgerPath(namespace: string, sessionId: string, agentId?: string | null): string;
+/** How long a hook waits for another hook's ledger lock before it goes on without it. */
+export declare const FILE_RECALL_LOCK_WAIT_MS = 2000;
+/** A lock older than this was left by a hook that died; the next hook takes it over. */
+export declare const FILE_RECALL_LOCK_STALE_MS = 10000;
+/** One hook event's view of its session's file-recall ledger. */
+export interface FileRecallSession {
+    /**
+     * Under the ledger lock: take in what parallel hooks of the session recorded
+     * since this event began, run `decide` (which fills the recall block against
+     * that state), and record what it delivered.
+     */
+    deliver<T>(decide: () => T): T;
+    /**
+     * Under the ledger lock: record this event's final state. A denied edit has
+     * already rolled its ids back (restorePrefetchDelivery), so they are taken
+     * out of the ledger again and the allowed retry still recalls them.
+     */
+    commit(): void;
+}
 /**
  * Load a session's ledger into the in-memory dedup state for one hook event
- * and count this file touch. `commit()` writes back what the event delivered:
- * a denied edit has already rolled its ids back (restorePrefetchDelivery), so
- * they are not recorded and the allowed retry still recalls them.
+ * and count this file touch.
+ *
+ * Every ledger change is a merge under the lock: the event adds the keys it
+ * delivered and removes the ones it rolled back, and leaves every other entry
+ * as it finds it. Writing the event's whole state instead dropped what a
+ * parallel hook had recorded in the meantime, and reading the ledger only at
+ * the start let two parallel hooks deliver the same memory.
  */
-export declare function beginFileRecallSession(namespace: string, sessionId: string, agentId?: string | null): {
-    commit: () => void;
-};
+export declare function beginFileRecallSession(namespace: string, sessionId: string, agentId?: string | null): FileRecallSession;
 /** Forget what a session was given (SessionStart `compact` / `clear`). */
 export declare function resetFileRecallSession(namespace: string, sessionId: string): void;
 export declare function formatFileTouchRecallBlock(filePath: string, snippets: string[]): string;

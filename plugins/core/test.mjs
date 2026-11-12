@@ -1,10 +1,10 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, isAbsolute } from "node:path";
-import { execFileSync as execFileSyncTop } from "node:child_process";
+import { execFileSync as execFileSyncTop, spawn } from "node:child_process";
 
 // Windows cannot execute a .sh file directly (EFTYPE). Production hook
 // execution uses git's own shell, so resolve Git Bash through `git
@@ -153,8 +153,19 @@ function createMockDaemonServer({
   guardReject = false,
   memoryContent = "Always claim a task before editing files.",
   hits = null,
+  // (path) => hits, for a reply that depends on the file.
+  hitsFor = null,
+  // Hold the first `barrier` memories_for_file replies until all of them have
+  // arrived (or 5 s passed), so parallel hook processes are all in flight.
+  barrier = 0,
 } = {}) {
   const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [], memoriesForFileArgs: [] };
+  const held = [];
+  let barrierTimer = null;
+  const releaseHeld = () => {
+    clearTimeout(barrierTimer);
+    for (const send of held.splice(0)) send();
+  };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -197,23 +208,31 @@ function createMockDaemonServer({
             const args = params.arguments ?? {};
             if (typeof args.path === "string") counters.memoriesForFilePaths.push(args.path);
             counters.memoriesForFileArgs.push(args);
-            respond({
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify({
-                    hits: hits ?? [
-                      {
-                        id: "mem-rule-1",
-                        valid_from: "2026-01-01T00:00:00Z",
-                        memory_type: "rule",
-                        content: memoryContent,
-                      },
-                    ],
-                  }),
-                },
-              ],
-            });
+            const send = () =>
+              respond({
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify({
+                      hits: (hitsFor ? hitsFor(args.path) : hits) ?? [
+                        {
+                          id: "mem-rule-1",
+                          valid_from: "2026-01-01T00:00:00Z",
+                          memory_type: "rule",
+                          content: memoryContent,
+                        },
+                      ],
+                    }),
+                  },
+                ],
+              });
+            if (counters.memoriesForFile <= barrier) {
+              held.push(send);
+              if (held.length === 1) barrierTimer = setTimeout(releaseHeld, 5000);
+              if (counters.memoriesForFile === barrier) releaseHeld();
+              return;
+            }
+            send();
             return;
           }
           if (name === "neurostrata_task_list") {
@@ -2821,6 +2840,104 @@ describe("file-recall ledger across hook processes", () => {
     } finally {
       server.close();
       resetModuleState();
+    }
+  });
+});
+
+describe("file-recall ledger with parallel hook processes", () => {
+  // Claude Code runs the PreToolUse hooks of parallel tool calls as parallel
+  // processes; each child below is one such hook process (what cli-hook.mjs
+  // does: initialize, then handleHookEvent).
+  let projectDir;
+  let ledgerDir;
+  beforeEach(() => {
+    projectDir = mkdtempSync(join(tmpdir(), "ns-recall-race-"));
+    // A `.git` stops the project-root walk here; with no `.NeuroStrata`
+    // nothing is recorded or logged outside this folder.
+    mkdirSync(join(projectDir, ".git"));
+    ledgerDir = join(projectDir, "ledger");
+    writeFileSync(
+      join(projectDir, "hook.mjs"),
+      [
+        `import { initialize, handleHookEvent } from ${JSON.stringify(new URL("./dist/index.js", import.meta.url).href)};`,
+        "console.log = console.error;",
+        "const [event, endpoint] = process.argv.slice(2);",
+        'await initialize({ config: { namespace: "race-ns", endpoint, bearerToken: "tok", strictMode: false, requestTimeoutMs: 10000 }, tool: { hook: async () => {} }, hooks: {} });',
+        "process.stdout.write(JSON.stringify(await handleHookEvent(JSON.parse(event))));",
+        "process.exit(0);",
+      ].join("\n"),
+    );
+  });
+  afterEach(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  function runHook(url, file, sessionId) {
+    const event = {
+      hook_event_name: "PreToolUse",
+      tool_name: "Read",
+      tool_input: { file_path: file },
+      session_id: sessionId,
+      cwd: projectDir,
+    };
+    return new Promise((resolvePromise, reject) => {
+      const child = spawn(process.execPath, [join(projectDir, "hook.mjs"), JSON.stringify(event), url], {
+        cwd: projectDir,
+        env: { ...process.env, NEUROSTRATA_FILE_RECALL_DIR: ledgerDir },
+      });
+      let out = "";
+      child.stdout.on("data", (chunk) => (out += chunk));
+      child.on("error", reject);
+      child.on("close", () => {
+        try {
+          resolvePromise(JSON.parse(out).hookSpecificOutput?.additionalContext ?? "");
+        } catch (err) {
+          reject(new Error(`hook output: ${out} (${err})`));
+        }
+      });
+    });
+  }
+  const idsIn = (block) => [...block.matchAll(/\[NeuroStrata rule (mem-[\w-]+)/g)].map((m) => m[1]);
+  const readLedger = (sessionId) => JSON.parse(readFileSync(join(ledgerDir, `race-ns--${sessionId}--main.json`), "utf8"));
+
+  it("parallel reads of different files: a shared memory once, and every hook's record kept", async () => {
+    const files = [1, 2, 3, 4, 5, 6].map((n) => `src/f${n}.ts`);
+    const rule = (id) => ({ id, valid_from: "2026-01-01T00:00:00Z", memory_type: "rule", content: `${id} text` });
+    const { server, url, counters } = await createMockDaemonServer({
+      barrier: files.length,
+      hitsFor: (path) => [rule("mem-shared"), rule(`mem-own-${path.slice(4, 6)}`)],
+    });
+    try {
+      const blocks = await Promise.all(files.map((file) => runHook(url, file, "sess-par")));
+      assert.equal(counters.memoriesForFile, files.length, "all six were in flight together");
+
+      const ledger = readLedger("sess-par");
+      assert.equal(ledger.touches, files.length);
+      assert.deepEqual(Object.keys(ledger.paths).sort(), files.map((f) => `race-ns:${f}`), "no hook's record lost");
+      assert.equal(Object.keys(ledger.memories).length, files.length + 1);
+
+      const ids = blocks.flatMap(idsIn);
+      assert.equal(ids.filter((id) => id === "mem-shared").length, 1, `shared memory once, got ${JSON.stringify(blocks)}`);
+      assert.equal(ids.length, files.length + 1, "each file's own memory once");
+
+      // The same files again, one at a time: all recorded, so no daemon call
+      // and nothing injected.
+      for (const file of files) assert.equal(await runHook(url, file, "sess-par"), "", file);
+      assert.equal(counters.memoriesForFile, files.length);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("parallel reads of the same file inject its memories once", async () => {
+    const { server, url, counters } = await createMockDaemonServer({ barrier: 4 });
+    try {
+      const blocks = await Promise.all([1, 2, 3, 4].map(() => runHook(url, "src/same.ts", "sess-same")));
+      assert.equal(counters.memoriesForFile, 4);
+      assert.deepEqual(blocks.flatMap(idsIn), ["mem-rule-1"], JSON.stringify(blocks));
+      assert.deepEqual(readdirSync(ledgerDir), ["race-ns--sess-same--main.json"], "no lock or temp file left");
+    } finally {
+      server.close();
     }
   });
 });

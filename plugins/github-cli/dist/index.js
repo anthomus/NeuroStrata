@@ -18,7 +18,7 @@
 // ──────────────────────────────────────────────────────────────────────
 // Node built-ins only (ESM). Zero require(), zero external runtime deps.
 // ──────────────────────────────────────────────────────────────────────
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 // ──────────────────────────────────────────────────────────────────────
@@ -1014,6 +1014,9 @@ function fileRecallLookupArgs(namespace, path) {
 /**
  * Recall governing memories for a touched file. LRU path dedup (no re-query within the
  * window) and injectedMemoryIds dedup (each memory injected once per session).
+ * With `ledger`, the dedup is decided against the session's file-recall ledger
+ * as it is after the daemon call, so parallel hook processes do not deliver
+ * the same memory twice.
  */
 export async function prefetchMemoriesForFile(namespace, filePath, opts) {
     const normalized = filePath.trim();
@@ -1063,11 +1066,15 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
         }
         const entries = parseRawFileRecallEntries(text, normalized);
         cacheSubagentFileRecall(key, entries);
-        const { snippets, added, dropped } = fillRecallBlock(entries, injectedMemoryIds);
-        // A memory left out for room is still owed: the next touch of this file
-        // queries again and delivers it (the delivered ones are deduped).
-        if (dropped)
-            prefetchedPaths.delete(key);
+        const fill = () => {
+            const filled = fillRecallBlock(entries, injectedMemoryIds);
+            // A memory left out for room is still owed: the next touch of this file
+            // queries again and delivers it (the delivered ones are deduped).
+            if (filled.dropped)
+                prefetchedPaths.delete(key);
+            return filled;
+        };
+        const { snippets, added } = opts?.ledger ? opts.ledger.deliver(fill) : fill();
         pendingPrefetchDeliveries.set(key, added);
         return snippets;
     }
@@ -1159,12 +1166,108 @@ function readFileRecallLedger(path) {
         return fresh;
     }
 }
+/**
+ * Write the whole ledger to a temp file and rename it into place, so a
+ * reader never sees a half-written ledger (which reads as empty and
+ * re-injects everything).
+ */
+function writeFileRecallLedger(path, ledger) {
+    const text = JSON.stringify(ledger);
+    try {
+        mkdirSync(dirname(path), { recursive: true });
+        const tmp = `${path}.${process.pid}.tmp`;
+        writeFileSync(tmp, text);
+        try {
+            renameSync(tmp, path);
+        }
+        catch {
+            // Windows can refuse the replace while another process has the file open.
+            writeFileSync(path, text);
+            try {
+                unlinkSync(tmp);
+            }
+            catch {
+                // pruned later
+            }
+        }
+    }
+    catch {
+        // best-effort: a lost ledger only means one repeated injection
+    }
+}
+/** How long a hook waits for another hook's ledger lock before it goes on without it. */
+export const FILE_RECALL_LOCK_WAIT_MS = 2000;
+/** A lock older than this was left by a hook that died; the next hook takes it over. */
+export const FILE_RECALL_LOCK_STALE_MS = 10_000;
+const fileRecallLockSleeper = new Int32Array(new SharedArrayBuffer(4));
+/**
+ * Run `fn` while holding the ledger's lock file. Claude Code runs the hooks of
+ * parallel tool calls as parallel processes, and each one reads, changes and
+ * writes the same session ledger. The lock covers file I/O only, never a
+ * daemon call. A hook that cannot get it within FILE_RECALL_LOCK_WAIT_MS goes
+ * on without it: a hook must never hang, and the cost is at worst one
+ * repeated injection.
+ */
+function withFileRecallLock(ledgerPath, fn) {
+    const lockPath = `${ledgerPath}.lock`;
+    const token = `${process.pid}:${Date.now()}:${Math.random()}`;
+    const deadline = Date.now() + FILE_RECALL_LOCK_WAIT_MS;
+    let held = false;
+    try {
+        mkdirSync(dirname(lockPath), { recursive: true });
+    }
+    catch {
+        // the create below fails and the hook goes on without the lock
+    }
+    for (;;) {
+        try {
+            writeFileSync(lockPath, token, { flag: "wx" });
+            held = true;
+            break;
+        }
+        catch (err) {
+            if (err.code === "EEXIST") {
+                try {
+                    if (Date.now() - statSync(lockPath).mtimeMs > FILE_RECALL_LOCK_STALE_MS)
+                        unlinkSync(lockPath);
+                }
+                catch {
+                    // released meanwhile
+                }
+            }
+            if (Date.now() >= deadline)
+                break;
+            try {
+                Atomics.wait(fileRecallLockSleeper, 0, 0, 5);
+            }
+            catch {
+                // a host that forbids blocking waits retries at once
+            }
+        }
+    }
+    try {
+        return fn();
+    }
+    finally {
+        if (held) {
+            try {
+                // Only our own lock: a stale takeover or a reset may have replaced it.
+                if (readFileSync(lockPath, "utf8") === token)
+                    unlinkSync(lockPath);
+            }
+            catch {
+                // already gone
+            }
+        }
+    }
+}
 function pruneFileRecallLedgers() {
     try {
         const dir = fileRecallLedgerDir();
         const cutoff = Date.now() - FILE_RECALL_LEDGER_TTL_MS;
         for (const name of readdirSync(dir)) {
-            if (!name.endsWith(".json"))
+            // Ledgers, and the temp and lock files a killed hook can leave behind.
+            if (!name.endsWith(".json") && !name.endsWith(".tmp") && !name.endsWith(".lock"))
                 continue;
             const full = join(dir, name);
             try {
@@ -1182,50 +1285,95 @@ function pruneFileRecallLedgers() {
 }
 /**
  * Load a session's ledger into the in-memory dedup state for one hook event
- * and count this file touch. `commit()` writes back what the event delivered:
- * a denied edit has already rolled its ids back (restorePrefetchDelivery), so
- * they are not recorded and the allowed retry still recalls them.
+ * and count this file touch.
+ *
+ * Every ledger change is a merge under the lock: the event adds the keys it
+ * delivered and removes the ones it rolled back, and leaves every other entry
+ * as it finds it. Writing the event's whole state instead dropped what a
+ * parallel hook had recorded in the meantime, and reading the ledger only at
+ * the start let two parallel hooks deliver the same memory.
  */
 export function beginFileRecallSession(namespace, sessionId, agentId) {
     const path = fileRecallLedgerPath(namespace, sessionId, agentId);
     if (!existsSync(path))
         pruneFileRecallLedgers();
-    const ledger = readFileRecallLedger(path);
-    ledger.touches += 1;
-    const now = ledger.touches;
-    const recent = (at) => typeof at === "number" && now - at < FILE_RECALL_REFRESH_TOUCHES;
     // The ledger is the only truth for this session: state left in memory by
     // another session (a long-lived host process) must not leak in.
     prefetchedPaths.clear();
     injectedMemoryIds.clear();
     pendingPrefetchDeliveries.clear();
-    for (const [key, at] of Object.entries(ledger.paths)) {
-        if (recent(at))
+    let now = 0;
+    const recent = (at) => typeof at === "number" && now - at < FILE_RECALL_REFRESH_TOUCHES;
+    // Keys taken in from the ledger, and keys this event wrote to it.
+    const known = { paths: new Set(), memories: new Set() };
+    const written = { paths: new Set(), memories: new Set() };
+    const pull = (ledger) => {
+        for (const [key, at] of Object.entries(ledger.paths)) {
+            if (known.paths.has(key) || written.paths.has(key) || !recent(at))
+                continue;
+            known.paths.add(key);
             recordPrefetchedPath(key);
-        else
-            delete ledger.paths[key];
-    }
-    for (const [key, at] of Object.entries(ledger.memories)) {
-        if (recent(at))
+        }
+        for (const [key, at] of Object.entries(ledger.memories)) {
+            if (known.memories.has(key) || written.memories.has(key) || !recent(at))
+                continue;
+            known.memories.add(key);
             injectedMemoryIds.add(key);
-        else
-            delete ledger.memories[key];
-    }
+        }
+    };
+    const push = (ledger) => {
+        let changed = false;
+        const merge = (kind, inMemory, has, entries) => {
+            // Rolled back since this event wrote it (a denied edit).
+            for (const key of written[kind]) {
+                if (!has(key)) {
+                    delete entries[key];
+                    written[kind].delete(key);
+                    changed = true;
+                }
+            }
+            // New in this event.
+            for (const key of inMemory) {
+                if (known[kind].has(key) || written[kind].has(key))
+                    continue;
+                entries[key] = now;
+                written[kind].add(key);
+                changed = true;
+            }
+        };
+        merge("paths", prefetchedPaths.keys(), (key) => prefetchedPaths.has(key), ledger.paths);
+        merge("memories", injectedMemoryIds, (key) => injectedMemoryIds.has(key), ledger.memories);
+        if (ledger.touches < now) {
+            ledger.touches = now;
+            changed = true;
+        }
+        return changed;
+    };
+    withFileRecallLock(path, () => {
+        const ledger = readFileRecallLedger(path);
+        ledger.touches += 1;
+        now = ledger.touches;
+        for (const [key, at] of Object.entries(ledger.paths))
+            if (!recent(at))
+                delete ledger.paths[key];
+        for (const [key, at] of Object.entries(ledger.memories))
+            if (!recent(at))
+                delete ledger.memories[key];
+        pull(ledger);
+        writeFileRecallLedger(path, ledger);
+    });
+    const update = (decide) => withFileRecallLock(path, () => {
+        const ledger = readFileRecallLedger(path);
+        pull(ledger);
+        const out = decide();
+        if (push(ledger))
+            writeFileRecallLedger(path, ledger);
+        return out;
+    });
     return {
+        deliver: update,
         commit() {
-            const paths = {};
-            for (const key of prefetchedPaths.keys())
-                paths[key] = ledger.paths[key] ?? now;
-            const memories = {};
-            for (const key of injectedMemoryIds)
-                memories[key] = ledger.memories[key] ?? now;
-            try {
-                mkdirSync(dirname(path), { recursive: true });
-                writeFileSync(path, JSON.stringify({ v: 1, touches: now, paths, memories }));
-            }
-            catch {
-                // best-effort: a lost ledger only means one repeated injection
-            }
+            update(() => undefined);
         },
     };
 }
@@ -1235,7 +1383,8 @@ export function resetFileRecallSession(namespace, sessionId) {
         const dir = fileRecallLedgerDir();
         const prefix = ledgerPrefix(namespace, sessionId);
         for (const name of readdirSync(dir)) {
-            if (name.startsWith(prefix)) {
+            // Ledgers only: a lock belongs to a hook that is still running.
+            if (name.startsWith(prefix) && name.endsWith(".json")) {
                 try {
                     unlinkSync(join(dir, name));
                 }
@@ -2313,7 +2462,7 @@ export async function handleHookEvent(event) {
             if (filePath) {
                 recalledFilePath = filePath;
                 try {
-                    const snippets = await prefetchMemoriesForFile(config.namespace, filePath);
+                    const snippets = await prefetchMemoriesForFile(config.namespace, filePath, recallSession ? { ledger: recallSession } : undefined);
                     if (snippets.length > 0)
                         recallBlock = formatFileTouchRecallBlock(filePath, snippets);
                 }
