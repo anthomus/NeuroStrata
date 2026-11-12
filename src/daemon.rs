@@ -472,14 +472,16 @@ pub async fn start_daemon(
     deduplication_config: Option<DeduplicationConfig>,
 ) -> anyhow::Result<()> {
     // Auto-install detected CLI/terminal harness plugins fail-soft at startup
-    // over the startup root and every configured project context directory, so
-    // existing workspaces are upgraded immediately on daemon boot. This runs
-    // here and not in `start_daemon_on` because the in-process test daemons
-    // start there: they would write `.claude/` and `.NeuroStrata/plugins/`
-    // into the directory `cargo test` runs in and into every configured
-    // project.
-    let startup_root = resolve_project_root();
-    let _ = crate::task::harness_plugins::auto_install_detected_plugins(&startup_root, "", None);
+    // over the configured project root and every configured project context
+    // directory, so existing workspaces are upgraded immediately on daemon
+    // boot. The working directory is not a project: nothing is installed there.
+    // This runs here and not in `start_daemon_on` because the in-process test
+    // daemons start there: they would write `.claude/` and
+    // `.NeuroStrata/plugins/` into the directory `cargo test` runs in and into
+    // every configured project.
+    if let Some(served) = served_project_root() {
+        let _ = crate::task::harness_plugins::auto_install_detected_plugins(&served, "", None);
+    }
     if let Ok(cfg) = crate::config::Config::load() {
         for dir in cfg.project_contexts.values() {
             let _ = crate::task::harness_plugins::auto_install_detected_plugins(dir, "", None);
@@ -521,11 +523,14 @@ pub(crate) const BUS_CAPACITY: usize = 10_000;
 pub(crate) fn build_thalamic_bus(
     vector_store: Arc<dyn VectorStore>,
     dimensions: usize,
-    project_root: impl Into<PathBuf>,
+    project_root: Option<PathBuf>,
 ) -> Arc<ThalamicBus> {
     let bus = Arc::new(ThalamicBus::new(BUS_CAPACITY));
     bus.attach_store(vector_store);
-    bus.register(Box::new(EpisodicPointerEcho::new(project_root)));
+    bus.register(Box::new(match project_root {
+        Some(root) => EpisodicPointerEcho::new(root),
+        None => EpisodicPointerEcho::unanchored(),
+    }));
     bus.register(Box::new(ExportFreshnessDirty::new(dimensions)));
     bus.register(Box::new(GuardEventLog::new(dimensions)));
     bus.register(Box::new(
@@ -537,13 +542,34 @@ pub(crate) fn build_thalamic_bus(
 /// Env var naming the project the daemon serves.
 const PROJECT_ROOT_ENV: &str = "NEUROSTRATA_PROJECT_ROOT";
 
-/// The project the daemon serves, named by the operator. Under
-/// `systemd --user` the daemon's cwd is `$HOME`, so the process directory is
-/// not the tree any pulse belongs to; an echo written there lands in the
-/// wrong project's buffer entirely (task-8 review, C2). The env var is what
-/// a unit file or wrapper shell sets; the cwd stays as the fallback so a
-/// plain `neurostrata-mcp daemon` on a developer's machine still serves the
-/// tree it was started from.
+/// The project the daemon serves, named by the operator through
+/// `NEUROSTRATA_PROJECT_ROOT`, validated by `crate::paths::validate_root`;
+/// `None` when the variable is unset or does not name an existing absolute
+/// directory.
+///
+/// The daemon's working directory is never a project. One daemon serves every
+/// console, and it starts wherever it happened to be launched: `$HOME` under
+/// `systemd --user`, `~/.cargo/bin`, or whichever project's MCP proxy spawned
+/// it first. Treating that directory as "the" project installed harness
+/// plugins there, wrote a `.NeuroStrata/session_queries.json` ledger there
+/// and echoed every namespace's pointers into its sessions buffer. Anything
+/// that writes project files (plugin install, ledger, sessions buffer) takes
+/// its root from here, and writes nothing when this is `None`.
+pub(crate) fn served_project_root() -> Option<PathBuf> {
+    let raw = std::env::var_os(PROJECT_ROOT_ENV).filter(|root| !root.is_empty())?;
+    match crate::paths::validate_root(&raw.to_string_lossy()) {
+        Ok(root) => Some(root),
+        Err(e) => {
+            tracing::warn!("{PROJECT_ROOT_ENV} is ignored: {e}");
+            None
+        }
+    }
+}
+
+/// The directory the daemon resolves caller paths and git reads against:
+/// `NEUROSTRATA_PROJECT_ROOT` as given, else the process's working directory.
+/// NOT a project root -- never write project files under it; use
+/// [`served_project_root`] for that.
 pub(crate) fn resolve_project_root() -> PathBuf {
     match std::env::var_os(PROJECT_ROOT_ENV) {
         Some(root) if !root.is_empty() => PathBuf::from(root),
@@ -691,7 +717,7 @@ pub(crate) fn daemon_bus(
     vector_store: Arc<dyn VectorStore>,
     dimensions: usize,
 ) -> Arc<ThalamicBus> {
-    build_thalamic_bus(vector_store, dimensions, resolve_project_root())
+    build_thalamic_bus(vector_store, dimensions, served_project_root())
 }
 
 /// How often the mesh-worker drains the outbox when no mutation wakes it first.
@@ -2380,7 +2406,7 @@ impl crate::traits::AsAny for RecordingStore {
     async fn daemon_builds_a_bus_of_four_subscribers_wired_to_its_store() {
         const DIMENSIONS: usize = 42;
         let store = Arc::new(RecordingStore::default());
-        let bus = build_thalamic_bus(store.clone(), DIMENSIONS, scratch_root("wiring"));
+        let bus = build_thalamic_bus(store.clone(), DIMENSIONS, Some(scratch_root("wiring")));
 
         // Step 1's subject: exactly the four production subscribers are
         // registered (the v1 trio plus post_ingest_normalize).
@@ -2500,6 +2526,7 @@ impl crate::traits::AsAny for RecordingStore {
 
         let store = Arc::new(RecordingStore::default());
         let root_a = scratch_root("anchor-a");
+        std::fs::create_dir_all(&root_a).unwrap();
         std::env::set_var(PROJECT_ROOT_ENV, &root_a);
 
         let bus = daemon_bus(store.clone(), DIMENSIONS);
@@ -2528,6 +2555,7 @@ impl crate::traits::AsAny for RecordingStore {
         // Re-point the env var: a bus built afterwards follows, and the
         // root that stopped being configured sees nothing new.
         let root_b = scratch_root("anchor-b");
+        std::fs::create_dir_all(&root_b).unwrap();
         std::env::set_var(PROJECT_ROOT_ENV, &root_b);
 
         let bus = daemon_bus(store.clone(), DIMENSIONS);
@@ -2555,6 +2583,67 @@ impl crate::traits::AsAny for RecordingStore {
             std::env::var_os(PROJECT_ROOT_ENV).is_none(),
             "the var is restored to unset so no later test observes this root"
         );
+    }
+
+    /// The daemon's working directory is never the served project: with
+    /// `NEUROSTRATA_PROJECT_ROOT` unset there is no project, even though the
+    /// test process runs inside a git checkout; a set but malformed or missing
+    /// root is ignored rather than created; a valid one comes back canonical.
+    #[test]
+    fn the_served_project_comes_only_from_a_valid_env_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(PROJECT_ROOT_ENV);
+        assert_eq!(served_project_root(), None, "the cwd is not a project");
+
+        let missing = scratch_root("served-missing");
+        std::env::set_var(PROJECT_ROOT_ENV, &missing);
+        assert_eq!(served_project_root(), None, "a missing root is not created");
+        assert!(!missing.exists());
+
+        std::env::set_var(PROJECT_ROOT_ENV, "relative/root");
+        assert_eq!(served_project_root(), None, "a relative root is refused");
+
+        let configured = scratch_root("served-ok");
+        std::fs::create_dir_all(&configured).unwrap();
+        std::env::set_var(PROJECT_ROOT_ENV, &configured);
+        assert_eq!(
+            served_project_root(),
+            Some(dunce::canonicalize(&configured).unwrap()),
+        );
+        std::env::remove_var(PROJECT_ROOT_ENV);
+    }
+
+    /// With no configured root, the daemon's bus echoes nothing into the
+    /// working directory's sessions buffer (it used to: the cwd was the
+    /// fallback project).
+    #[tokio::test]
+    async fn the_daemon_bus_without_a_configured_root_echoes_nothing_into_the_cwd() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(PROJECT_ROOT_ENV);
+        let cwd_buffer = std::env::current_dir()
+            .unwrap()
+            .join(".NeuroStrata")
+            .join("sessions")
+            .join("current.md");
+        let before = std::fs::read_to_string(&cwd_buffer).ok();
+
+        let store = Arc::new(RecordingStore::default());
+        let bus = daemon_bus(store, 8);
+        bus.emit(
+            ThalamicPulse::Created {
+                id: "cwd-not-a-project".into(),
+                namespace: "bus-test".into(),
+                kind: "fact".into(),
+            },
+            &RecursionToken::root(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bus.metrics().dispatcher_handled < 1 {
+            assert!(Instant::now() < deadline, "the dispatcher stalled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let after = std::fs::read_to_string(&cwd_buffer).ok();
+        assert_eq!(before, after, "nothing was echoed into the working directory");
     }
 
     /// The cheap proof the two env tests above are serialised, not merely
@@ -3696,7 +3785,7 @@ impl crate::traits::AsAny for RecordingStore {
         AppState {
             embedder: embedder.clone(),
             vector_store: store.clone(),
-            bus: build_thalamic_bus(store.clone(), 8, root.to_path_buf()),
+            bus: build_thalamic_bus(store.clone(), 8, Some(root.to_path_buf())),
             ingests: Arc::new(crate::ingest_jobs::IngestJobs::new()),
             shutdown: Arc::new(Mutex::new(None)),
             deduplication_checker: None,

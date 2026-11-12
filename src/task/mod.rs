@@ -992,23 +992,13 @@ pub async fn record_graph_query(
         }
     }
     if project_root.is_none() {
-        // Start from `resolve_project_root()` (which honors `NEUROSTRATA_PROJECT_ROOT`
-        // before falling back to `std::env::current_dir()`) and walk up through
-        // parent directories looking for `.git` or `.NeuroStrata`.
-        let start = crate::daemon::resolve_project_root();
-        if !start.as_os_str().is_empty() {
-            let mut cur = start;
-            loop {
-                if cur.join(".git").exists() || cur.join(".NeuroStrata").exists() {
-                    project_root = Some(cur.to_string_lossy().to_string());
-                    break;
-                }
-                match cur.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => cur = parent.to_path_buf(),
-                    _ => break,
-                }
-            }
-        }
+        // Last, the project the operator configured (`NEUROSTRATA_PROJECT_ROOT`).
+        // Never the daemon's working directory or a directory above it, and
+        // never a `.NeuroStrata` folder as a marker: `~/.NeuroStrata` exists on
+        // daemon hosts, and the cwd is wherever the daemon was launched. With no
+        // known root, no ledger is written.
+        project_root = crate::daemon::served_project_root()
+            .map(|root| root.to_string_lossy().to_string());
     }
     let governed_prefix = if query_hint.ends_with('/')
         || (project_root.is_some()
@@ -4700,6 +4690,29 @@ mod tests {
 
     fn emb() -> Arc<dyn Embedder> {
         Arc::new(StubEmbedder)
+    }
+
+    /// A namespace with no registered root and no ingested directory has no
+    /// project, so a lookup writes no ledger -- in particular not into the
+    /// daemon's working directory (here: the test process's, a git checkout),
+    /// which it used to find by walking up for `.git` or `.NeuroStrata`.
+    #[tokio::test]
+    async fn a_lookup_without_a_known_root_writes_no_ledger_in_the_cwd() {
+        let store = store_with_namespace("cwd-ledger-probe").await;
+        let ledger = std::env::current_dir()
+            .unwrap()
+            .join(".NeuroStrata")
+            .join("session_queries.json");
+        let before = std::fs::read_to_string(&ledger).ok();
+        // A configured project root would be the right place; this test is
+        // about the fallback, so it only runs when none is configured.
+        if crate::daemon::served_project_root().is_some() {
+            return;
+        }
+        record_graph_query(&store, "cwd-ledger-probe", "neurostrata_memories_for_file", "src/lib.rs")
+            .await;
+        let after = std::fs::read_to_string(&ledger).ok();
+        assert_eq!(before, after, "no ledger entry was written under the cwd");
     }
 
     /// A store whose `namespace` already holds one rule, so the namespace

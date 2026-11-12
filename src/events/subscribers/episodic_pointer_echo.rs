@@ -61,7 +61,10 @@ const ROLLOVER_BYTES: u64 = 500 * 1024;
 /// request has taught the cache resolves to the construction root, which
 /// keeps a single-project daemon's behavior byte-identical.
 pub struct EpisodicPointerEcho {
-    project_root: PathBuf,
+    /// `None` when the daemon serves no configured project (no
+    /// `NEUROSTRATA_PROJECT_ROOT`): its working directory is not a project, so
+    /// a pulse with no anchor is not echoed anywhere.
+    project_root: Option<PathBuf>,
     /// Namespace → project-root anchors, for a daemon that serves more than
     /// one project. [`Self::root_for`] consults it first and falls back to
     /// the automatic `.NeuroStrata` marker lookup, then to the construction
@@ -85,6 +88,17 @@ impl EpisodicPointerEcho {
         Self::with_anchors(project_root, std::collections::HashMap::new())
     }
 
+    /// The subscriber for a daemon with no configured project root: only an
+    /// explicit anchor could place an echo, and there are none, so nothing is
+    /// written -- in particular nothing under the daemon's working directory.
+    pub fn unanchored() -> Self {
+        Self {
+            project_root: None,
+            anchors: std::collections::HashMap::new(),
+            load_config: buffer::load_config,
+        }
+    }
+
     /// The subscriber over an explicit namespace → project-root anchor map.
     ///
     /// `anchors` is keyed by the pulse's namespace — the only project signal
@@ -98,7 +112,7 @@ impl EpisodicPointerEcho {
         anchors: std::collections::HashMap<String, PathBuf>,
     ) -> Self {
         Self {
-            project_root: project_root.into(),
+            project_root: Some(project_root.into()),
             anchors,
             load_config: buffer::load_config,
         }
@@ -113,7 +127,7 @@ impl EpisodicPointerEcho {
         load_config: fn() -> buffer::BufferConfig,
     ) -> Self {
         Self {
-            project_root: project_root.into(),
+            project_root: Some(project_root.into()),
             anchors: std::collections::HashMap::new(),
             load_config,
         }
@@ -126,15 +140,14 @@ impl EpisodicPointerEcho {
     /// sibling checkout whose directory name is the namespace and which
     /// carries a `.NeuroStrata` marker — while an unresolvable namespace
     /// stays on the construction root, exactly where a single-project daemon
-    /// always wrote.
-    fn root_for(&self, namespace: &str) -> PathBuf {
-        self.anchors
-            .get(namespace)
-            .cloned()
-            .unwrap_or_else(|| {
-                resolve_anchor_for_namespace(namespace, &self.project_root)
-                    .unwrap_or_else(|| self.project_root.clone())
-            })
+    /// always wrote. `None` when there is neither an anchor nor a
+    /// construction root (an [`unanchored`](Self::unanchored) subscriber).
+    fn root_for(&self, namespace: &str) -> Option<PathBuf> {
+        if let Some(anchor) = self.anchors.get(namespace) {
+            return Some(anchor.clone());
+        }
+        let root = self.project_root.as_ref()?;
+        Some(resolve_anchor_for_namespace(namespace, root).unwrap_or_else(|| root.clone()))
     }
 }
 
@@ -207,7 +220,14 @@ impl MemorySubscriber for EpisodicPointerEcho {
             return Ok(());
         }
 
-        let project_root = self.root_for(namespace);
+        let Some(project_root) = self.root_for(namespace) else {
+            tracing::debug!(
+                subscriber = self.name(),
+                namespace,
+                "no configured project root; no pointer written"
+            );
+            return Ok(());
+        };
         let buffer_file = current_log(&project_root);
         if already_echoed(&buffer_file, id, kind) {
             tracing::debug!(
@@ -740,12 +760,31 @@ mod tests {
         for hostile in ["", ".", "..", "a/b", r"a\b"] {
             assert_eq!(
                 echo.root_for(hostile),
-                project,
+                Some(project.clone()),
                 "a path-like namespace stays on the construction root: {hostile:?}"
             );
         }
-        assert_eq!(echo.root_for("AnchoredSecondProject"), project,
+        assert_eq!(echo.root_for("AnchoredSecondProject"), Some(project),
             "no sibling and no anchor: construction root");
+    }
+
+    /// A daemon with no configured project root has no construction root: the
+    /// working directory it was started from is not a project, so a pulse is
+    /// echoed nowhere -- not into `<cwd>/.NeuroStrata/sessions/`.
+    #[tokio::test]
+    async fn an_unanchored_echo_writes_nothing() {
+        let echo = EpisodicPointerEcho::unanchored();
+        assert_eq!(echo.root_for("AnyNamespace"), None);
+        let cwd_buffer = buffer_file(&std::env::current_dir().unwrap());
+        let before = std::fs::read_to_string(&cwd_buffer).ok();
+
+        let bus = ThalamicBus::new(16);
+        bus.register(Box::new(echo));
+        bus.emit(created("unanchored-1", "fact"), &RecursionToken::root());
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let after = std::fs::read_to_string(&cwd_buffer).ok();
+        assert_eq!(before, after, "the working directory's buffer is untouched");
     }
 
     /// The production constructor, checked against the machine it runs on. The
