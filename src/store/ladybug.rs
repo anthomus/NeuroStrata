@@ -7566,6 +7566,39 @@ impl VectorStore for LadybugStore {
         self.list_rows(namespace, None, None, Some("pinned")).await
     }
 
+    /// One query, at most one row back. Metadata is stored as the
+    /// `serde_json` text of the row's metadata, which writes object keys
+    /// unescaped, so a key's name is a substring of that text; `list_pinned`
+    /// relies on the same property.
+    async fn any_metadata_contains(
+        &self,
+        namespaces: &[&str],
+        memory_types: &[&str],
+        needle: &str,
+    ) -> Result<Option<bool>> {
+        if namespaces.is_empty() || memory_types.is_empty() {
+            return Ok(Some(false));
+        }
+        let quoted = |values: &[&str]| {
+            values
+                .iter()
+                .map(|v| format!("'{}'", escape_ladybug_string(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let query = format!(
+            "MATCH (m:Memory) WHERE m.namespace IN [{}] AND m.memory_type IN [{}] AND m.metadata CONTAINS '{}' RETURN m.id LIMIT 1",
+            quoted(namespaces),
+            quoted(memory_types),
+            escape_ladybug_string(needle)
+        );
+        self.with_conn(move |conn| {
+            let mut rows = conn.query(&query)?;
+            Ok(Some(rows.next().is_some()))
+        })
+        .await
+    }
+
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
         let namespace = namespace.to_string();
         let id = id.to_string();
