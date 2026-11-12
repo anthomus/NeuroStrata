@@ -12326,7 +12326,7 @@ mod tests {
             }]),
         );
         let text = render_search_results(&[r]);
-        let expected = format_memory(
+        let mut expected = format_memory(
             "probe::src/a.rs::run",
             &MemoryPayload {
                 content: "symbol".into(),
@@ -12338,9 +12338,13 @@ mod tests {
                 metadata: serde_json::json!({}),
             },
         );
+        // Every result carries the score line; a direct match adds nothing else.
+        expected.push_str(
+            "\nScore: 10.000 (distance after ranking bonus, lower is closer) access_count: 0",
+        );
         assert_eq!(
             text, expected,
-            "direct match should produce byte-identical output to format_memory"
+            "direct match should produce format_memory plus the score line, nothing more"
         );
     }
 
@@ -12431,9 +12435,18 @@ mod tests {
             .collect();
         let text = render_search_results(&results);
         // Account for varying ID lengths ("mem-0" vs "mem-19") and separators.
+        // The score line is part of each result, not evidence, so it is not
+        // charged to the evidence budget.
         let max_per_result_len = results
             .iter()
-            .map(|r| format_memory(&r.id, &r.payload).len())
+            .map(|r| {
+                format_memory(&r.id, &r.payload).len()
+                    + format!(
+                        "\nScore: {:.3} (distance after ranking bonus, lower is closer) access_count: {}",
+                        r.score, 0
+                    )
+                    .len()
+            })
             .max()
             .unwrap();
         let separator_overhead = (results.len() - 1) * 2; // "\n\n" between results
