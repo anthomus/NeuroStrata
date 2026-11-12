@@ -3017,14 +3017,41 @@ pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # Install with:  neurostrata-mcp hooks install
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-LEDGER="$ROOT/.NeuroStrata/session_queries.json"
+# Linked worktrees (`git worktree add`, `.claude/worktrees/...`) share ONE
+# ledger: the main checkout's. The common git dir of a linked worktree is the
+# main checkout's `.git`; for the main checkout itself git prints `.git`,
+# relative to the top level, where hooks run.
+MAIN_ROOT="$ROOT"
+COMMON=$(git rev-parse --git-common-dir 2>/dev/null)
+case "$COMMON" in
+    /*|[A-Za-z]:*) ;;
+    "") ;;
+    *) COMMON="$ROOT/$COMMON" ;;
+esac
+case "$COMMON" in
+    */.git) MAIN_ROOT="${COMMON%/.git}" ;;
+esac
+LEDGER="$MAIN_ROOT/.NeuroStrata/session_queries.json"
 NAMESPACE=""
 if [ -f "$LEDGER" ]; then
     NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
 fi
 if [ -z "$NAMESPACE" ]; then
-    NAMESPACE=$(basename "$ROOT")
+    NAMESPACE=$(basename "$MAIN_ROOT")
 fi
+
+# Windows roots (`C:/...`) compare case-insensitively, like the file system.
+FOLD=0
+case "$ROOT" in
+    [A-Za-z]:*) FOLD=1 ;;
+esac
+fold_case() {
+    if [ "$FOLD" = "1" ]; then
+        printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+    else
+        printf '%s' "$1"
+    fi
+}
 
 # ── Collect staged file paths (excluding .NeuroStrata/ internal files) ───────
 StagedFiles=()
@@ -3044,9 +3071,12 @@ if [ "${#StagedFiles[@]}" -eq 0 ]; then
 fi
 
 # ── Path normalization for ledger matching ─────────────────────────────────
-# $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`), but the
-# ledger may have recorded `"$ROOT/$file"` (absolute), `"./$file"` (dot-slash),
-# or the bare `"$file"`. Match all three spellings.
+# $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`). A ledger
+# entry may carry `path` (already project-relative, written by newer daemons;
+# preferred), or only the raw `query`: `"$ROOT/$file"` or the main checkout's
+# absolute path, with `/` or `\`, `\\?\` or Git Bash `/c/` prefixes and any
+# drive-letter case on Windows, `"./$file"`, or the bare `"$file"`. All of them
+# are reduced to the repo-relative form below.
 normalize_rel_path() {
     local p="$1"
     p="${p#"$ROOT"/}"
@@ -3063,26 +3093,39 @@ dump_ledger_paths() {
     if [ ! -f "$LEDGER" ]; then
         return 0
     fi
-    export LEDGER ROOT
+    export LEDGER ROOT MAIN_ROOT FOLD
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
           const ledger = process.env.LEDGER;
-          const root = process.env.ROOT || "";
+          const win = process.env.FOLD === "1";
+          const fold = (s) => (win ? s.toLowerCase() : s);
+          // C:\x | C:/x | \\?\C:\x | /c/x (Windows only) -> C:/x ; no trailing /
+          const normAbs = (p) => {
+            p = p.replace(/\\/g, "/").replace(/^\/\/[?.]\//, "");
+            const m = win ? /^\/([A-Za-z])(\/.*)?$/.exec(p) : null;
+            if (m) p = m[1] + ":" + (m[2] || "/");
+            return p.length > 1 ? p.replace(/\/+$/, "") : p;
+          };
+          const roots = [process.env.ROOT, process.env.MAIN_ROOT].filter(Boolean).map(normAbs);
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
           const queries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.queries) ? parsed.queries : []);
           const out = new Set();
-          const norm = (p) => {
-            if (typeof p !== "string" || !p) return;
-            if (root && (p === root || p.startsWith(root + "/"))) p = p.slice(root.length).replace(/^\//, "");
+          const norm = (raw) => {
+            if (typeof raw !== "string" || !raw) return;
+            let p = normAbs(raw);
+            for (const r of roots) {
+              if (fold(p) === fold(r)) return;
+              if (fold(p).startsWith(fold(r) + "/")) { p = p.slice(r.length + 1); break; }
+            }
+            if (/^[A-Za-z]:\//.test(p) || p.startsWith("/")) return; // another project
             while (p.startsWith("./")) p = p.slice(2);
-            if (p.endsWith("/")) p = p.slice(0, -1);
-            if (p) out.add(p);
+            if (p) out.add(fold(p));
           };
           for (const q of queries) {
             if (!q || typeof q !== "object") continue;
-            norm(q.query);
+            if (typeof q.path === "string" && q.path) norm(q.path); else norm(q.query);
             for (const k of ["domains", "governed_prefixes"]) {
               if (Array.isArray(q[k])) q[k].forEach(norm);
             }
@@ -3091,11 +3134,20 @@ dump_ledger_paths() {
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys
+import json, os, re, sys
 ledger = os.environ["LEDGER"]
-root = os.environ.get("ROOT") or ""
+win = os.environ.get("FOLD") == "1"
+def fold(s):
+    return s.lower() if win else s
+def norm_abs(p):
+    p = re.sub(r"^//[?.]/", "", p.replace("\\", "/"))
+    m = re.match(r"^/([A-Za-z])(/.*)?$", p) if win else None
+    if m:
+        p = m.group(1) + ":" + (m.group(2) or "/")
+    return p.rstrip("/") if len(p) > 1 else p
+roots = [norm_abs(r) for r in (os.environ.get("ROOT"), os.environ.get("MAIN_ROOT")) if r]
 try:
-    with open(ledger) as f:
+    with open(ledger, encoding="utf-8") as f:
         parsed = json.load(f)
 except Exception:
     sys.exit(0)
@@ -3103,20 +3155,29 @@ queries = parsed if isinstance(parsed, list) else (parsed.get("queries") if isin
 if not isinstance(queries, list):
     queries = []
 out = set()
-def norm(p):
-    if not isinstance(p, str) or not p:
+def norm(raw):
+    if not isinstance(raw, str) or not raw:
         return
-    if root and (p == root or p.startswith(root + "/")):
-        p = p[len(root):].lstrip("/")
+    p = norm_abs(raw)
+    for r in roots:
+        if fold(p) == fold(r):
+            return
+        if fold(p).startswith(fold(r) + "/"):
+            p = p[len(r) + 1:]
+            break
+    if re.match(r"^[A-Za-z]:/", p) or p.startswith("/"):
+        return
     while p.startswith("./"):
         p = p[2:]
-    p = p.rstrip("/")
     if p:
-        out.add(p)
+        out.add(fold(p))
 for q in queries:
     if not isinstance(q, dict):
         continue
-    norm(q.get("query"))
+    if isinstance(q.get("path"), str) and q.get("path"):
+        norm(q.get("path"))
+    else:
+        norm(q.get("query"))
     for k in ("domains", "governed_prefixes"):
         v = q.get(k)
         if isinstance(v, list):
@@ -3133,7 +3194,7 @@ LEDGER_PATHS=$(dump_ledger_paths)
 ledger_has_file() {
     local rel="$1"
     if [ -n "$LEDGER_PATHS" ]; then
-        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel"
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel")"
         return $?
     fi
     [ -f "$LEDGER" ] || return 1
@@ -3145,7 +3206,7 @@ ledger_has_file() {
 ledger_has_dir() {
     local rel_dir="${1%/}"
     if [ -n "$LEDGER_PATHS" ]; then
-        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel_dir"
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel_dir")"
         return $?
     fi
     [ -f "$LEDGER" ] || return 1
@@ -3193,7 +3254,7 @@ for raw_file in "${StagedFiles[@]}"; do
     file=$(normalize_rel_path "$raw_file")
     [ -z "$file" ] && continue
     if [ -n "$LEDGER_PATHS" ]; then
-        if printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$file"; then
+        if printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$file")"; then
             continue
         fi
     fi
@@ -4934,6 +4995,131 @@ mod tests {
         assert_eq!(entry["path"], json!("src/lib.rs"));
         assert_eq!(entry["root"], json!(root.to_string_lossy()));
         assert_eq!(entry["governed_prefixes"], json!([raw]), "unchanged for older hooks");
+    }
+
+    /// Git's own bash: on Windows `bash` on PATH may be WSL's launcher, which
+    /// cannot run a hook against a Windows checkout.
+    fn hook_bash() -> Option<std::path::PathBuf> {
+        if cfg!(windows) {
+            let out = std::process::Command::new("git").arg("--exec-path").output().ok()?;
+            let exec = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            // <git>/mingw64/libexec/git-core -> <git>
+            let git_root = exec.parent()?.parent()?.parent()?.to_path_buf();
+            ["usr/bin/bash.exe", "bin/bash.exe"]
+                .iter()
+                .map(|rel| git_root.join(rel))
+                .find(|p| p.is_file())
+        } else {
+            Some(std::path::PathBuf::from("bash"))
+        }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Runs the scaffolded pre-commit hook in `dir`; returns its stderr.
+    fn run_pre_commit(bash: &std::path::Path, hook: &std::path::Path, dir: &std::path::Path) -> String {
+        let out = std::process::Command::new(bash)
+            .arg(hook)
+            .current_dir(dir)
+            .output()
+            .expect("the hook runs");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    }
+
+    /// The pre-commit hook used to strip only `"$ROOT/"` with forward slashes,
+    /// so on Windows every lookup the hooks recorded (`C:\...\x.rs`) read as
+    /// "no recorded lookup". Every spelling of a recorded file now matches;
+    /// a linked worktree reads and writes the main checkout's ledger.
+    #[test]
+    fn the_pre_commit_hook_matches_every_spelling_of_a_recorded_path() {
+        let Some(bash) = hook_bash() else {
+            eprintln!("skipped: no bash to run the hook with");
+            return;
+        };
+        let has = |tool: &str| {
+            std::process::Command::new(&bash)
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !has("node") && !has("python3") {
+            eprintln!("skipped: the hook needs node or python3 to read the ledger");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("example-project");
+        let hooks_off = base.join("no-hooks");
+        std::fs::create_dir_all(repo.join("src").join("a")).unwrap();
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
+        std::fs::create_dir_all(&hooks_off).unwrap();
+        git_in(&repo, &["init", "-q"]);
+        git_in(&repo, &["config", "user.email", "t@example.invalid"]);
+        git_in(&repo, &["config", "user.name", "t"]);
+        git_in(&repo, &["config", "core.hooksPath", &hooks_off.to_string_lossy()]);
+        for f in ["a1", "a2", "a3", "a4", "a5", "a6"] {
+            std::fs::write(repo.join("src").join("a").join(format!("{f}.rs")), "x").unwrap();
+        }
+        std::fs::write(repo.join("none.rs"), "x").unwrap();
+
+        let root = git_in(&repo, &["rev-parse", "--show-toplevel"]);
+        let back = root.replace('/', "\\");
+        let mut queries = vec![
+            json!({"tool": "neurostrata_memories_for_file", "query": format!(r"{back}\src\a\a1.rs")}),
+            json!({"tool": "t", "query": format!("{root}/src/a/a2.rs")}),
+        ];
+        if cfg!(windows) {
+            let msys = format!("/{}{}", root[..1].to_lowercase(), &root[2..]);
+            queries.push(json!({"tool": "t", "query": format!("{msys}/src/a/a3.rs")}));
+            queries.push(json!({"tool": "t", "query": format!(r"\\?\{back}\src\a\a4.rs")}));
+            queries.push(json!({"tool": "t", "query": format!("{}/SRC/A/A5.RS", root.to_uppercase())}));
+        } else {
+            queries.push(json!({"tool": "t", "query": "./src/a/a3.rs"}));
+            queries.push(json!({"tool": "t", "query": "src/a/a4.rs/"}));
+            queries.push(json!({"tool": "t", "query": "src/a/a5.rs"}));
+        }
+        // `path` wins over a query naming another checkout's absolute path.
+        queries.push(json!({"tool": "t", "query": "/elsewhere/src/a/a6.rs", "path": "src/a/a6.rs"}));
+        queries.push(json!({"tool": "t", "query": "/elsewhere/none.rs"}));
+        let ledger = repo.join(".NeuroStrata").join("session_queries.json");
+        std::fs::write(
+            &ledger,
+            serde_json::to_string_pretty(&json!({"namespace": "example-project", "queries": queries})).unwrap(),
+        )
+        .unwrap();
+        let hook = base.join("pre-commit");
+        std::fs::write(&hook, SCAFFOLDED_PRE_COMMIT_HOOK).unwrap();
+
+        git_in(&repo, &["add", "src", "none.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &repo);
+        assert!(stderr.contains("file 'none.rs' has no recorded"), "{stderr}");
+        for f in ["a1", "a2", "a3", "a4", "a5", "a6"] {
+            assert!(!stderr.contains(&format!("src/a/{f}.rs' has no recorded")), "{f}: {stderr}");
+        }
+
+        // A linked worktree: the main checkout's ledger answers, and the
+        // worktree gets no ledger of its own.
+        git_in(&repo, &["commit", "-q", "-m", "seed"]);
+        let wt = base.join("example-project-wt");
+        git_in(&repo, &["worktree", "add", "-q", &wt.to_string_lossy()]);
+        std::fs::write(wt.join("src").join("a").join("a1.rs"), "y").unwrap();
+        std::fs::write(wt.join("fresh.rs"), "y").unwrap();
+        git_in(&wt, &["add", "src", "fresh.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &wt);
+        assert!(stderr.contains("file 'fresh.rs' has no recorded"), "{stderr}");
+        assert!(!stderr.contains("a1.rs' has no recorded"), "{stderr}");
+        assert!(!wt.join(".NeuroStrata").exists(), "the worktree has no ledger of its own");
+        let main_ledger = std::fs::read_to_string(&ledger).unwrap();
+        assert!(main_ledger.contains("\"fresh.rs\""), "recorded in the main checkout's ledger");
     }
 
     /// A store whose `namespace` already holds one rule, so the namespace
