@@ -3148,13 +3148,27 @@ pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # Install with:  neurostrata-mcp hooks install
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-LEDGER="$ROOT/.NeuroStrata/session_queries.json"
+# Linked worktrees (`git worktree add`, `.claude/worktrees/...`) share ONE
+# ledger: the main checkout's. The common git dir of a linked worktree is the
+# main checkout's `.git`; for the main checkout itself git prints `.git`,
+# relative to the top level, where hooks run.
+MAIN_ROOT="$ROOT"
+COMMON=$(git rev-parse --git-common-dir 2>/dev/null)
+case "$COMMON" in
+    /*|[A-Za-z]:*) ;;
+    "") ;;
+    *) COMMON="$ROOT/$COMMON" ;;
+esac
+case "$COMMON" in
+    */.git) MAIN_ROOT="${COMMON%/.git}" ;;
+esac
+LEDGER="$MAIN_ROOT/.NeuroStrata/session_queries.json"
 NAMESPACE=""
 if [ -f "$LEDGER" ]; then
     NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
 fi
 if [ -z "$NAMESPACE" ]; then
-    NAMESPACE=$(basename "$ROOT")
+    NAMESPACE=$(basename "$MAIN_ROOT")
 fi
 
 # Windows roots (`C:/...`) compare case-insensitively, like the file system.
@@ -3192,8 +3206,8 @@ fi
 # ── Path normalization for ledger matching ─────────────────────────────────
 # $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`). A ledger
 # entry may carry `path` (already project-relative, written by newer daemons;
-# preferred), or only the raw `query`: `"$ROOT/$file"` as an absolute path,
-# with `/` or `\`, `\\?\` or Git Bash `/c/` prefixes and any
+# preferred), or only the raw `query`: `"$ROOT/$file"` or the main checkout's
+# absolute path, with `/` or `\`, `\\?\` or Git Bash `/c/` prefixes and any
 # drive-letter case on Windows, `"./$file"`, or the bare `"$file"`. All of them
 # are reduced to the repo-relative form below.
 normalize_rel_path() {
@@ -3212,7 +3226,7 @@ dump_ledger_paths() {
     if [ ! -f "$LEDGER" ]; then
         return 0
     fi
-    export LEDGER ROOT FOLD
+    export LEDGER ROOT MAIN_ROOT FOLD
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -3226,7 +3240,7 @@ dump_ledger_paths() {
             if (m) p = m[1] + ":" + (m[2] || "/");
             return p.length > 1 ? p.replace(/\/+$/, "") : p;
           };
-          const roots = [process.env.ROOT].filter(Boolean).map(normAbs);
+          const roots = [process.env.ROOT, process.env.MAIN_ROOT].filter(Boolean).map(normAbs);
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
           const queries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.queries) ? parsed.queries : []);
@@ -3268,7 +3282,7 @@ def norm_abs(p):
     if m:
         p = m.group(1) + ":" + (m.group(2) or "/")
     return p.rstrip("/") if len(p) > 1 else p
-roots = [norm_abs(r) for r in (os.environ.get("ROOT"),) if r]
+roots = [norm_abs(r) for r in (os.environ.get("ROOT"), os.environ.get("MAIN_ROOT")) if r]
 try:
     with open(ledger, encoding="utf-8") as f:
         parsed = json.load(f)
@@ -5112,6 +5126,21 @@ mod tests {
         for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
             assert!(!stderr.contains(&format!("src/a/{f}.rs' has no recorded")), "{f}: {stderr}");
         }
+
+        // A linked worktree: the main checkout's ledger answers, and the
+        // worktree gets no ledger of its own.
+        git_stdout_in(&repo, &["commit", "-q", "-m", "seed"]);
+        let wt = base.join("example-project-wt");
+        git_stdout_in(&repo, &["worktree", "add", "-q", &wt.to_string_lossy()]);
+        std::fs::write(wt.join("src").join("a").join("a1.rs"), "y").unwrap();
+        std::fs::write(wt.join("fresh.rs"), "y").unwrap();
+        git_stdout_in(&wt, &["add", "src", "fresh.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &wt);
+        assert!(stderr.contains("file 'fresh.rs' has no recorded"), "{stderr}");
+        assert!(!stderr.contains("a1.rs' has no recorded"), "{stderr}");
+        assert!(!wt.join(".NeuroStrata").exists(), "the worktree has no ledger of its own");
+        let main_ledger = std::fs::read_to_string(&ledger).unwrap();
+        assert!(main_ledger.contains("\"fresh.rs\""), "recorded in the main checkout's ledger");
     }
 
     /// A store whose `namespace` already holds one rule, so the namespace
