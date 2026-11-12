@@ -6,24 +6,20 @@
 //! about (concurrent worktrees must not conflate source identity).
 
 use super::model::SourceIdentity;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Normalize a path the same way `parser::ingest::normalize_node_path` does,
-/// so the context layer and ingestion can never drift on path spelling.
-pub fn normalize_node_path(path: &str) -> String {
-    let forward = path.replace('\\', "/");
-    let trimmed = forward.strip_prefix("./").unwrap_or(&forward);
-    trimmed.trim_end_matches('/').to_string()
-}
+// All path handling goes through crate::paths. Do not normalize, join or
+// compare paths by hand. This module used to carry its own copy of
+// `normalize_node_path`; it now names the one in crate::paths, so the context
+// layer and ingestion cannot drift on path spelling.
+pub use crate::paths::normalize_node_path;
 
 /// Canonical absolute form of a path, falling back to the input on failure.
+/// The same spelling as the ingest source key (`crate::paths::source_key`),
+/// which `worktree_id` must match.
 pub fn canonical(path: &str) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| PathBuf::from(path))
-        .to_string_lossy()
-        .to_string()
+    crate::paths::source_key(Path::new(path))
 }
 
 fn git_output(root: &str, args: &[&str]) -> Option<String> {

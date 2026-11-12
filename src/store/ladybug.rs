@@ -9298,7 +9298,7 @@ fn materialize_stub_file_node(
     // directory must materialise as `directory` so the graph-read's
     // `AncestorDirectory` match finds it.
     let is_directory = declared.ends_with('/');
-    let node_path = crate::parser::ingest::normalize_node_path(declared);
+    let node_path = crate::paths::normalize_node_path(declared);
     if node_path.is_empty() {
         anyhow::bail!("cannot materialise a stub node for an empty path");
     }
@@ -9655,7 +9655,7 @@ fn add_metadata_fallback_conn(
             _ => continue,
         };
         for declared in governs {
-            let normalized = crate::parser::ingest::normalize_node_path(declared);
+            let normalized = crate::paths::normalize_node_path(declared);
             let matched =
                 normalized == path || (include_ancestors && is_ancestor_of(&normalized, path));
             if matched {
@@ -9714,7 +9714,7 @@ impl GraphRead for LadybugStore {
         limit: usize,
     ) -> Result<Vec<MemoryHit>> {
         let namespace = namespace.to_string();
-        let path = crate::parser::ingest::normalize_node_path(path);
+        let path = crate::paths::normalize_node_path(path);
         let symbol = symbol.map(|s| s.to_string());
         let memory_types = memory_types.to_vec();
         let exclude_ids = exclude_ids.to_vec();
@@ -10078,7 +10078,7 @@ fn fetch_related_subgraph(
     }
 
     if seed_id.is_none() {
-        let normalized = crate::parser::ingest::normalize_node_path(seed);
+        let normalized = crate::paths::normalize_node_path(seed);
         let loc_q = format!(
             "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.location = '{}' RETURN m.id, m.memory_type, m.content, m.metadata ORDER BY m.memory_type ASC",
             safe_ns,
@@ -10328,7 +10328,7 @@ impl LadybugStore {
         governing_ids: &[String],
     ) -> Result<(Vec<Value>, Value)> {
         let namespace = namespace.to_string();
-        let path = crate::parser::ingest::normalize_node_path(path);
+        let path = crate::paths::normalize_node_path(path);
         let governing_ids = governing_ids.to_vec();
         let source_str = source.map(|s| s.to_string());
 

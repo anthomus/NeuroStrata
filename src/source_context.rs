@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 /// A legacy, process-provided project root scoped to one source identity.
@@ -49,8 +49,11 @@ pub(crate) fn export_absolute_path(
     if location.is_empty() {
         return stored_absolute_path.to_string();
     }
+    // All path handling goes through crate::paths. Do not normalize, join or
+    // compare paths by hand: the absolute test and the `..`-safe relative
+    // normalization below used to be private copies in this file.
     let location_path = Path::new(location);
-    if is_absolute_location(location, location_path) {
+    if crate::paths::is_absolute_location(location) {
         return location.to_string();
     }
 
@@ -89,7 +92,7 @@ pub(crate) fn export_absolute_path(
         return stored_absolute_path.to_string();
     };
 
-    let Some(normalized_location) = normalize_relative(location_path) else {
+    let Some(normalized_location) = crate::paths::normalize_relative(location_path) else {
         return stored_absolute_path.to_string();
     };
     project_root
@@ -171,49 +174,13 @@ fn is_valid_marker_directory(marker: &Path) -> bool {
     canonical_marker == canonical_parent.join(".NeuroStrata")
 }
 
-fn is_absolute_location(location: &str, path: &Path) -> bool {
-    if path.is_absolute() {
-        return true;
-    }
-    let bytes = location.as_bytes();
-    let windows_drive_absolute = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\');
-    let windows_unc_absolute = bytes.starts_with(b"\\\\");
-    // A rooted POSIX location stored by a Linux peer is absolute data on a
-    // Windows host even though the OS calls it rooted-but-relative.
-    let posix_absolute = bytes.first() == Some(&b'/');
-    windows_drive_absolute || windows_unc_absolute || posix_absolute
-}
-
-fn normalize_relative(path: &Path) -> Option<PathBuf> {
-    let mut normalized = PathBuf::new();
-    let mut depth = 0usize;
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => {
-                normalized.push(part);
-                depth += 1;
-            }
-            Component::CurDir => {}
-            Component::ParentDir if depth > 0 => {
-                normalized.pop();
-                depth -= 1;
-            }
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(normalized)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
 
     fn project(root: &Path) -> PathBuf {
         let marker = root.join(".NeuroStrata");

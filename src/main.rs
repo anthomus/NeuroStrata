@@ -32,6 +32,7 @@ mod multimodal;
 mod ontology_grounding;
 mod learning;
 mod parser;
+mod paths;
 mod rag_chat;
 mod rebac;
 mod recall_metrics;

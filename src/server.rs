@@ -2583,7 +2583,7 @@ pub(crate) fn derive_governs_from_locations(locations: &[Value]) -> Vec<serde_js
         .filter(|p| !p.is_empty())
         // Same normalisation the ingester applies to its node ids, so a
         // path written by hand lands on the file node it names.
-        .map(crate::parser::ingest::normalize_node_path)
+        .map(crate::paths::normalize_node_path)
         .fold(Vec::new(), |mut acc: Vec<String>, path| {
             if !acc.contains(&path) {
                 acc.push(path);
@@ -11782,7 +11782,7 @@ mod tests {
             row_a.metadata["refs"][0]["file"],
             serde_json::json!("live/new.go")
         );
-        let expected = crate::parser::ingest::normalize_node_path("live/new.go");
+        let expected = crate::paths::normalize_node_path("live/new.go");
         assert_eq!(row_a.metadata["governs"], serde_json::json!([expected]));
 
         // B: no parameters -- the prose's single Governs line is the author's

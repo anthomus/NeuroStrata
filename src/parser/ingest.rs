@@ -50,15 +50,11 @@ fn truncate_for_embedding(body: &str) -> String {
     )
 }
 
-/// Node ids are paths, and a memory written by an agent names a file the way a
-/// human does: `src/parser/ingest.rs`. The walker yields a platform path with
-/// backslashes and a leading `./` on Windows, and an edge only forms when the
-/// two strings match exactly, so every id goes through here first.
-pub fn normalize_node_path(path: &str) -> String {
-    let forward = path.replace('\\', "/");
-    let trimmed = forward.strip_prefix("./").unwrap_or(&forward);
-    trimmed.trim_end_matches('/').to_string()
-}
+// All path handling goes through crate::paths. Do not normalize, join or
+// compare paths by hand. `normalize_node_path` used to be defined here (and a
+// byte-identical copy in context/source.rs); it is re-exported so existing
+// callers keep their path.
+pub use crate::paths::normalize_node_path;
 
 /// The stable key identifying the source (worktree) being ingested.
 ///
@@ -67,11 +63,11 @@ pub fn normalize_node_path(path: &str) -> String {
 /// its own key, so publishing one worktree cannot overwrite the other's active
 /// pointer. It doubles as `SourceIdentity.worktree_id` until Task 2's
 /// `source::resolve` fills repo/revision from a real checkout.
+///
+/// All path handling goes through crate::paths. Do not normalize, join or
+/// compare paths by hand: the key is built by `crate::paths::source_key`.
 pub fn source_key_for(dir_path: &Path) -> String {
-    std::fs::canonicalize(dir_path)
-        .unwrap_or_else(|_| dir_path.to_path_buf())
-        .to_string_lossy()
-        .to_string()
+    crate::paths::source_key(dir_path)
 }
 
 // The separator between a namespace and the path it qualifies (`NAMESPACE_SEPARATOR`)

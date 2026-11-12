@@ -8,7 +8,7 @@
 //! `tests/ingest/staged_publication_test.rs`).
 //!
 //! Path normalization is NOT redefined here: it lives once in
-//! `crate::parser::ingest::normalize_node_path`, which both ingestion and the
+//! `crate::paths::normalize_node_path`, which both ingestion and the
 //! `GraphRead` implementation call, so the two cannot drift.
 
 use serde::{Deserialize, Serialize};
