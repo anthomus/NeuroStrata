@@ -36,6 +36,8 @@ pub struct MockStore {
     search_fails: Mutex<bool>,
     /// Track which (namespace, id) pairs have had increment_access_count called.
     incremented_ids: Mutex<Vec<(String, String)>>,
+    /// How many times `list` ran.
+    list_calls: Mutex<usize>,
 }
 
 impl MockStore {
@@ -44,7 +46,13 @@ impl MockStore {
             rows: Mutex::new(Vec::new()),
             search_fails: Mutex::new(false),
             incremented_ids: Mutex::new(Vec::new()),
+            list_calls: Mutex::new(0),
         }
+    }
+
+    /// How many times `list` ran, for tests about what a call reads.
+    pub(crate) fn list_calls(&self) -> usize {
+        *self.list_calls.lock().expect("mock store lock")
     }
 
     /// The `hit_count` the store holds for a row, exactly as it is persisted.
@@ -295,7 +303,26 @@ impl VectorStore for MockStore {
         Ok(0)
     }
 
+    /// Answers like the real store: a substring test on the metadata's JSON
+    /// text, over every row of those namespaces and types.
+    async fn any_metadata_contains(
+        &self,
+        namespaces: &[&str],
+        memory_types: &[&str],
+        needle: &str,
+    ) -> Result<Option<bool>> {
+        let rows = self.rows.lock().expect("mock store lock");
+        Ok(Some(rows.iter().any(|r| {
+            namespaces.contains(&r.namespace.as_str())
+                && memory_types.contains(&r.payload.memory_type.as_str())
+                && serde_json::to_string(&r.payload.metadata)
+                    .map(|text| text.contains(needle))
+                    .unwrap_or(true)
+        })))
+    }
+
     async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
+        *self.list_calls.lock().expect("mock store lock") += 1;
         let rows = self.rows.lock().expect("mock store lock");
         Ok(rows
             .iter()
