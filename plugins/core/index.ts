@@ -1178,6 +1178,18 @@ function parseRawFileRecallEntries(text: string, normalized: string): RawFileRec
 }
 
 /**
+ * Arguments of every file-recall lookup. `include_ast_edges` (daemon default
+ * true) adds the governing memories' 1-hop related memories and an AST
+ * summary of the file. A recall block can show them only as one line of node
+ * ids and counts, with no text, and only when the memories leave room in the
+ * block, while computing and sending them took about a third of each reply
+ * and of the daemon's time per lookup.
+ */
+function fileRecallLookupArgs(namespace: string, path: string): Record<string, unknown> {
+  return { namespace, path, limit: 5, include_ast_edges: false };
+}
+
+/**
  * Recall governing memories for a touched file. LRU path dedup (no re-query within the
  * window) and injectedMemoryIds dedup (each memory injected once per session).
  */
@@ -1195,11 +1207,7 @@ export async function prefetchMemoriesForFile(
   }
   if (!mcpClient) return [];
   try {
-    const text = await mcpClient.callTool("neurostrata_memories_for_file", {
-      namespace,
-      path: normalized,
-      limit: 5,
-    });
+    const text = await mcpClient.callTool("neurostrata_memories_for_file", fileRecallLookupArgs(namespace, normalized));
     recordPrefetchedPath(key);
     // Persist conceptual bridges from the hits into active_session.json so
     // sessionContextHandler can inject them as [NeuroStrata Conceptual Bridges].
@@ -1435,11 +1443,7 @@ async function recallMemoriesForSubagentFile(
   if (!entries) {
     if (!mcpClient) return [];
     try {
-      const text = await mcpClient.callTool("neurostrata_memories_for_file", {
-        namespace,
-        path: normalized,
-        limit: 5,
-      });
+      const text = await mcpClient.callTool("neurostrata_memories_for_file", fileRecallLookupArgs(namespace, normalized));
       try {
         recordLocalSessionQuery(namespace, "neurostrata_memories_for_file", normalized);
       } catch {

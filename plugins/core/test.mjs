@@ -154,7 +154,7 @@ function createMockDaemonServer({
   memoryContent = "Always claim a task before editing files.",
   hits = null,
 } = {}) {
-  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
+  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [], memoriesForFileArgs: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -196,6 +196,7 @@ function createMockDaemonServer({
             counters.memoriesForFile++;
             const args = params.arguments ?? {};
             if (typeof args.path === "string") counters.memoriesForFilePaths.push(args.path);
+            counters.memoriesForFileArgs.push(args);
             respond({
               content: [
                 {
@@ -2799,6 +2800,24 @@ describe("file-recall ledger across hook processes", () => {
       assert.deepEqual(ledgerIds(), longHits.map((h) => h.id));
       assert.equal(await touch("src/long.ts"), "", "all delivered: nothing more");
       assert.equal(counters.memoriesForFile, 2, "and no further daemon call");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("asks the daemon for the governing memories only, not the AST expansion", async () => {
+    const { server, counters } = await start();
+    try {
+      await touch("src/a.ts");
+      await enrichAndInjectSubagentPrompt({ prompt: "Fix the bug in src/sub.ts" }, "ledger-ns", "task-ast");
+      assert.deepEqual(
+        counters.memoriesForFileArgs.map((args) => [args.path, args.limit, args.include_ast_edges]),
+        [
+          ["src/a.ts", 5, false],
+          ["src/sub.ts", 5, false],
+        ],
+      );
     } finally {
       server.close();
       resetModuleState();
