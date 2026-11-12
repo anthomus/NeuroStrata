@@ -28,6 +28,14 @@ impl GuardValidator {
         }
     }
 
+    /// Tests only: list the candidate rules on every call, without the
+    /// existence check in `SemanticEvaluator::candidate_rules`.
+    #[cfg(test)]
+    pub(crate) fn listing_every_time(mut self) -> Self {
+        self.semantic = self.semantic.listing_every_time();
+        self
+    }
+
     /// Validate an action against behavioral rules and optionally sandbox
     ///
     /// # Arguments

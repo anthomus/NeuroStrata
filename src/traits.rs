@@ -492,6 +492,25 @@ pub trait VectorStore: Send + Sync + AsAny {
         self.list(namespace, None, None).await
     }
 
+    /// Whether any row in one of `namespaces`, with one of `memory_types`, has
+    /// stored metadata text that contains `needle`.
+    ///
+    /// For a caller that lists those rows only to keep the ones carrying a
+    /// metadata key: when this answers `Some(false)`, that listing would keep
+    /// nothing, so the caller can skip it. The test ignores generations,
+    /// retirement and every other row filter, so `Some(true)` is a superset
+    /// answer, never a promise that a listing returns the row. `None` means
+    /// the store cannot answer without listing, and the caller must list; that
+    /// is the default.
+    async fn any_metadata_contains(
+        &self,
+        _namespaces: &[&str],
+        _memory_types: &[&str],
+        _needle: &str,
+    ) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
 

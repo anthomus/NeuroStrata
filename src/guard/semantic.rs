@@ -36,10 +36,18 @@ use std::sync::Arc;
 /// rules seeded through the normal memory surface stay visible to the guard.
 const RULE_MEMORY_TYPES: [&str; 2] = ["rule", "guard_rule"];
 
+/// A metadata key every guard rule carries (`try_parse_rule_row` requires
+/// it). A rule row whose stored metadata text lacks it cannot be a rule.
+const GUARD_RULE_KEY: &str = "trigger_pattern";
+
 pub struct SemanticEvaluator {
     store: Arc<dyn VectorStore>,
     embedder: Arc<dyn Embedder>,
     namespace: String,
+    /// Tests only: skip the existence check, so a test can compare the
+    /// checked path with the plain listing on the same store.
+    #[cfg(test)]
+    list_only: bool,
 }
 
 impl SemanticEvaluator {
@@ -48,7 +56,16 @@ impl SemanticEvaluator {
             store,
             embedder,
             namespace: namespace.to_string(),
+            #[cfg(test)]
+            list_only: false,
         }
+    }
+
+    /// Tests only: always list, as the guard did before the existence check.
+    #[cfg(test)]
+    pub(crate) fn listing_every_time(mut self) -> Self {
+        self.list_only = true;
+        self
     }
 
     /// Add a behavioral rule to the guard namespace
@@ -118,17 +135,55 @@ impl SemanticEvaluator {
     /// A store failure listing this namespace is an error, so the validator
     /// rejects instead of passing with fewer rules than exist. A failure
     /// listing `global` is logged and the namespace's own rules still apply.
+    ///
+    /// Before listing, one existence query asks the store whether any rule
+    /// row in these namespaces carries `trigger_pattern` in its metadata. A
+    /// row without that key never becomes a rule (`try_parse_rule_row`), so
+    /// when the answer is no, the four listings would return no candidates
+    /// and are skipped; the result is the same empty list. The skip also
+    /// drops the per-row "missing required metadata field" warning that
+    /// `rules_from_rows` logs for such rows. If the store cannot answer, or
+    /// the query fails, the guard lists as before.
     pub async fn candidate_rules(&self) -> Result<Vec<BehavioralRule>> {
-        let now = chrono::Utc::now().timestamp();
+        let namespaces = self.rule_namespaces();
+        #[cfg(test)]
+        let probe = !self.list_only;
+        #[cfg(not(test))]
+        let probe = true;
+        if probe {
+            match self
+                .store
+                .any_metadata_contains(&namespaces, &RULE_MEMORY_TYPES, GUARD_RULE_KEY)
+                .await
+            {
+                Ok(Some(false)) => return Ok(Vec::new()),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!("guard rule existence check failed, listing instead: {e}");
+                }
+            }
+        }
+        self.candidate_rules_by_listing(&namespaces).await
+    }
+
+    /// This namespace, then `global` (once, when they are the same).
+    fn rule_namespaces(&self) -> Vec<&str> {
         let own = self.namespace.as_str();
         let mut namespaces = vec![own];
         if own != "global" {
             namespaces.push("global");
         }
+        namespaces
+    }
+
+    /// The listing behind `candidate_rules`, without the existence check.
+    async fn candidate_rules_by_listing(&self, namespaces: &[&str]) -> Result<Vec<BehavioralRule>> {
+        let now = chrono::Utc::now().timestamp();
+        let own = self.namespace.as_str();
 
         let mut rows: Vec<SearchResult> = Vec::new();
         let mut seen_ids: HashSet<String> = HashSet::new();
-        for namespace in namespaces {
+        for &namespace in namespaces {
             for memory_type in RULE_MEMORY_TYPES {
                 let listed = match self.store.list(namespace, None, Some(memory_type)).await {
                     Ok(listed) => listed,
@@ -416,6 +471,222 @@ mod tests {
             vec!["g-guard".to_string(), "g-rule".to_string()],
             "the global namespace is listed once, not twice"
         );
+    }
+
+    /// The existence check: when no rule row in the namespace or `global`
+    /// carries the guard's trigger key, the rule rows are not listed at all.
+    /// Rows that look close (the key on a non-rule type, the word in the
+    /// content, the key in another namespace) do not turn the listing back on;
+    /// one real candidate does.
+    #[tokio::test]
+    async fn rule_rows_are_listed_only_when_one_carries_the_trigger_key() {
+        use crate::guard::testkit::MockStore;
+        let mock = Arc::new(MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        for i in 0..40 {
+            seed(&store, "proj", &format!("plain-{i}"), "rule", json!({ "source": "seed" })).await;
+        }
+        seed(&store, "proj", "a-fact", "fact", guard_fields("a-fact", "docker")).await;
+        seed(&store, "elsewhere", "other-ns", "guard_rule", guard_fields("other-ns", "docker")).await;
+        let mut wordy = rule_row("wordy", 0.0, "rule").payload;
+        wordy.content = "explains what a trigger_pattern is".to_string();
+        wordy.metadata = json!({});
+        store.upsert("proj", "wordy", vec![0.0; 4], wordy).await.unwrap();
+
+        assert!(candidates(store.clone(), "proj").await.is_empty());
+        assert_eq!(mock.list_calls(), 0, "no rule row carries the key, so nothing is listed");
+
+        seed(&store, "global", "g-guard", "guard_rule", guard_fields("g-guard", "rm -rf")).await;
+        assert_eq!(candidates(store.clone(), "proj").await, vec!["g-guard".to_string()]);
+        assert_eq!(mock.list_calls(), 4, "one listing per rule type in proj and global");
+    }
+
+    async fn checked_and_listed(
+        store: &Arc<dyn VectorStore>,
+        namespace: &str,
+    ) -> (String, String) {
+        use crate::guard::testkit::StubEmbedder;
+        let checked = SemanticEvaluator::new(store.clone(), Arc::new(StubEmbedder), namespace)
+            .candidate_rules()
+            .await;
+        let listed = SemanticEvaluator::new(store.clone(), Arc::new(StubEmbedder), namespace)
+            .listing_every_time()
+            .candidate_rules()
+            .await;
+        (format!("{checked:?}"), format!("{listed:?}"))
+    }
+
+    /// Old path (list every time) against new path (existence check first) on
+    /// a real store, over store states that grow from empty to one with
+    /// project and global rules: the candidates, and the verdicts built from
+    /// them, are the same at every step. The states where the check answers
+    /// "no" are asserted, so the comparison covers the skipped listing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_existence_check_never_changes_candidates_or_verdicts_on_a_real_store() {
+        use crate::guard::testkit::StubEmbedder;
+        use crate::guard::validator::GuardValidator;
+        let dir = std::env::temp_dir().join(format!("guard-rule-check-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
+        for ns in ["proj", "global", "other", "elsewhere"] {
+            store.init(ns).await.expect("create the schema");
+        }
+
+        let payloads = [
+            ("bash", "cargo test --release"),
+            ("bash", "docker run alpine"),
+            ("bash", "rm -rf /tmp/x"),
+            ("write", "scripts/helper.py"),
+            ("edit", "{\"old_string\":\"a\",\"new_string\":\"git push --force\"}"),
+            ("read", "src/lib.rs"),
+        ];
+        let probe = |store: Arc<dyn VectorStore>, ns: &'static str| async move {
+            let mut namespaces = vec![ns];
+            if ns != "global" {
+                namespaces.push("global");
+            }
+            store
+                .any_metadata_contains(&namespaces, &RULE_MEMORY_TYPES, GUARD_RULE_KEY)
+                .await
+                .expect("the check answers")
+        };
+
+        let mut states: Vec<(&str, Vec<(&str, &str, &str, serde_json::Value)>)> = vec![
+            ("empty", vec![]),
+            (
+                "ordinary rows only",
+                vec![
+                    ("proj", "fact-1", "fact", json!({ "source": "seed" })),
+                    ("proj", "plain-rule", "rule", json!({ "source": "seed" })),
+                    ("proj", "half-rule", "rule", json!({ "id": "half-rule", "version": 1 })),
+                    ("proj", "fact-with-fields", "fact", guard_fields("fact-with-fields", "docker")),
+                    ("elsewhere", "other-ns-rule", "guard_rule", guard_fields("other-ns-rule", "docker")),
+                    ("global", "global-fact", "decision", json!({ "note": "no rules here" })),
+                ],
+            ),
+        ];
+        let mut retired = guard_fields("retired-rule", "docker");
+        retired["valid_to"] = json!(1);
+        let mut nested = json!({ "source": "seed" });
+        nested["note"] = json!({ "trigger_pattern": "docker" });
+        states.push(("retired rule with fields", vec![("proj", "retired-rule", "rule", retired)]));
+        states.push(("key nested, not a rule", vec![("proj", "nested-rule", "rule", nested)]));
+        states.push((
+            "global guard rule",
+            vec![("global", "g-guard", "guard_rule", guard_fields("g-guard", "rm -rf"))],
+        ));
+        states.push((
+            "project rule with fields",
+            vec![("proj", "p-rule", "rule", guard_fields("p-rule", "docker|.py"))],
+        ));
+
+        for (step, (label, rows)) in states.into_iter().enumerate() {
+            for (ns, id, memory_type, metadata) in rows {
+                seed(&store, ns, id, memory_type, metadata).await;
+            }
+            if step < 2 {
+                assert_eq!(probe(store.clone(), "proj").await, Some(false), "{label}: check says no");
+                assert_eq!(probe(store.clone(), "global").await, Some(false), "{label}: check says no");
+            } else {
+                assert_eq!(probe(store.clone(), "proj").await, Some(true), "{label}: check says yes");
+            }
+            for ns in ["proj", "global", "other"] {
+                let (checked, listed) = checked_and_listed(&store, ns).await;
+                assert_eq!(checked, listed, "{label}, {ns}: candidates differ");
+                for (action, payload) in payloads {
+                    // Each path gets its own validator; a firing rule bumps its
+                    // hit_count, which the verdict does not carry.
+                    let new = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), ns).await;
+                    let old = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), ns)
+                        .await
+                        .listing_every_time();
+                    let new = serde_json::to_string(&new.validate(action, payload, "/tmp", false).await)
+                        .unwrap();
+                    let old = serde_json::to_string(&old.validate(action, payload, "/tmp", false).await)
+                        .unwrap();
+                    assert_eq!(new, old, "{label}, {ns}, {action} {payload}: verdicts differ");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same comparison on a copy of a real store, over recorded guard
+    /// inputs (JSON lines with `namespace`, `tool` and `payload`), first as the
+    /// store is and then with one global guard rule added. Writes to the copy.
+    ///
+    /// ```text
+    /// NEUROSTRATA_GUARD_EQUIV_DB=<copy of ladybug.db> NEUROSTRATA_GUARD_EQUIV_INPUTS=<a.jsonl;b.jsonl> \
+    /// NEUROSTRATA_GUARD_EQUIV_DIMS=<the store's embedding width, default 384> \
+    ///   cargo test --release --bin neurostrata-mcp -- --ignored --nocapture recorded_guard_inputs
+    /// ```
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs NEUROSTRATA_GUARD_EQUIV_DB (a copy of a real store)"]
+    async fn recorded_guard_inputs_get_the_same_verdict_on_both_paths() {
+        use crate::guard::testkit::StubEmbedder;
+        use crate::guard::validator::GuardValidator;
+        let (Ok(db), Ok(inputs)) = (
+            std::env::var("NEUROSTRATA_GUARD_EQUIV_DB"),
+            std::env::var("NEUROSTRATA_GUARD_EQUIV_INPUTS"),
+        ) else {
+            eprintln!("NEUROSTRATA_GUARD_EQUIV_DB / _INPUTS not set; nothing to compare");
+            return;
+        };
+        let dims: usize = std::env::var("NEUROSTRATA_GUARD_EQUIV_DIMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(384);
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::new(db.as_str(), dims).expect("open the copy"));
+        let mut cases: Vec<(String, String, String)> = Vec::new();
+        for file in inputs.split(';').filter(|f| !f.is_empty()) {
+            let text = std::fs::read_to_string(file).expect("read the inputs");
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let v: serde_json::Value = serde_json::from_str(line).expect("a JSON line");
+                cases.push((
+                    v["namespace"].as_str().unwrap_or("global").to_string(),
+                    v["tool"].as_str().unwrap_or("Bash").to_string(),
+                    v["payload"].as_str().unwrap_or("").to_string(),
+                ));
+            }
+        }
+        assert!(!cases.is_empty(), "no recorded inputs");
+
+        for phase in ["as recorded", "with a global guard rule"] {
+            if phase != "as recorded" {
+                let mut payload = rule_row("equiv-global-rule", 0.0, "guard_rule").payload;
+                payload.metadata = guard_fields("equiv-global-rule", "git push --force|cargo publish|.py");
+                store.init("global").await.expect("open the global namespace");
+                if let Err(e) = store
+                    .upsert("global", "equiv-global-rule", vec![0.0; dims], payload)
+                    .await
+                {
+                    panic!("seed a global rule: {e:#}");
+                }
+            }
+            let (mut checked_ms, mut listed_ms, mut rejects) = (0.0, 0.0, 0);
+            for (ns, tool, payload) in &cases {
+                let checked = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), ns).await;
+                let listed = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), ns)
+                    .await
+                    .listing_every_time();
+                let started = std::time::Instant::now();
+                let new = checked.validate(tool, payload, "", false).await;
+                checked_ms += started.elapsed().as_secs_f64() * 1000.0;
+                let started = std::time::Instant::now();
+                let old = listed.validate(tool, payload, "", false).await;
+                listed_ms += started.elapsed().as_secs_f64() * 1000.0;
+                let (new, old) = (serde_json::to_string(&new).unwrap(), serde_json::to_string(&old).unwrap());
+                assert_eq!(new, old, "{phase}: {ns} {tool} verdicts differ");
+                if new.contains("DeterministicReject") {
+                    rejects += 1;
+                }
+            }
+            eprintln!(
+                "COMPARED {} inputs ({phase}): identical; {rejects} rejected; checked {checked_ms:.0} ms total, listed {listed_ms:.0} ms total",
+                cases.len()
+            );
+        }
     }
 
     /// Row conversion keeps rule types with complete guard fields and nothing
