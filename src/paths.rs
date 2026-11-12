@@ -286,6 +286,48 @@ fn depth(rel: &str) -> usize {
     rel.split('/').count()
 }
 
+/// The git root of a DIRECTORY: `dir` itself when it holds `.git`, else its
+/// nearest ancestor that does ([`find_git_root`] looks only above its input).
+pub fn git_root_of_dir(dir: &str) -> Option<String> {
+    if host_path(dir).is_some_and(|d| d.join(".git").exists()) {
+        Some(dir.to_string())
+    } else {
+        find_git_root(dir)
+    }
+}
+
+/// The main checkout of the git repository holding `dir` (a directory): `dir`'s
+/// own `.git` root when that is a regular checkout, or, for a linked worktree
+/// (whose `.git` is a file with `gitdir: <main>/.git/worktrees/<name>`), the
+/// checkout that owns it. A submodule or a worktree of a bare repository has no
+/// main checkout to borrow from and answers its own root. `None` outside git.
+/// Returned in this host's plain spelling (`dunce`).
+pub fn main_checkout_root(dir: &str) -> Option<PathBuf> {
+    let own_root = git_root_of_dir(dir)?;
+    let own = host_path(&own_root)?;
+    let dot_git = own.join(".git");
+    if dot_git.is_dir() {
+        return canonical(&own);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:")).map(str::trim)?;
+    let gitdir = if is_absolute_any(gitdir) {
+        gitdir.to_string()
+    } else {
+        own.join(gitdir).to_string_lossy().to_string()
+    };
+    let parsed = parse_absolute(&gitdir)?;
+    let main = parsed
+        .parts
+        .windows(2)
+        .position(|w| w[0] == ".git" && w[1] == "worktrees")
+        .map(|at| AbsPath { parts: parsed.parts[..at].to_vec(), ..parsed.clone() });
+    match main {
+        Some(main) => canonical(&host_path(&main.to_path_string())?),
+        None => canonical(&own),
+    }
+}
+
 /// Where the root that relativized a lookup path came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootSource {
@@ -1124,5 +1166,26 @@ mod tests {
             (l.path.as_str(), l.source),
             ("src/lib.rs", RootSource::Marker)
         );
+    }
+
+    #[test]
+    fn the_main_checkout_of_a_linked_worktree_is_the_checkout_that_owns_it() {
+        let (tmp, root, worktree) = project_with_worktree();
+        assert_eq!(main_checkout_root(&s(&root)), Some(root.clone()));
+        assert_eq!(main_checkout_root(&s(&root.join("src"))), Some(root.clone()));
+        assert_eq!(main_checkout_root(&s(&worktree)), Some(root.clone()));
+        assert_eq!(main_checkout_root(&s(&worktree.join("src"))), Some(root.clone()));
+        // A submodule's gitdir is <super>/.git/modules/<name>: its own root.
+        let sub = canonical(tmp.path()).unwrap().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../example-project/.git/modules/sub\n").unwrap();
+        assert_eq!(main_checkout_root(&s(&sub)), Some(sub.clone()));
+        let outside = canonical(tmp.path()).unwrap().join("plain");
+        std::fs::create_dir_all(&outside).unwrap();
+        let above_has_git = std::iter::successors(Some(outside.as_path()), |p| p.parent())
+            .any(|p| p.join(".git").exists());
+        if !above_has_git {
+            assert_eq!(main_checkout_root(&s(&outside)), None);
+        }
     }
 }

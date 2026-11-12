@@ -14,7 +14,10 @@ if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     exit 0
 fi
 
-NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
+# The namespace configured for this project (harness settings; folder name
+# last), resolved in one place: `neurostrata-mcp namespace resolve`.
+NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null)
+[ -n "$NAMESPACE" ] || NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
@@ -52,4 +55,4 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
-# neurostrata-hook-sha256: cb1c385835cfe2ddc026878074e34ea3661674f44d314679c8c85764ef7d70b7
+# neurostrata-hook-sha256: f4e93b082075d74edb226cb31692b8b38ac79a430f32c0cba5e6ca69f422ac65
