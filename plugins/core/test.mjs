@@ -131,6 +131,9 @@ import {
   resetAdvisoryStateForTesting,
   extractDaemonMemoryAdvisory,
   daemonTokenPath,
+  FILE_RECALL_REFRESH_TOUCHES,
+  MEMORY_SNIPPET_MAX_CHARS,
+  fileRecallLedgerPath,
 } from "./dist/index.js";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -145,7 +148,11 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
   });
 }
 
-function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
+function createMockDaemonServer({
+  returnTask = null,
+  guardReject = false,
+  memoryContent = "Always claim a task before editing files.",
+} = {}) {
   const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
@@ -198,7 +205,7 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
                         id: "mem-rule-1",
                         valid_from: "2026-01-01T00:00:00Z",
                         memory_type: "rule",
-                        content: "Always claim a task before editing files.",
+                        content: memoryContent,
                       },
                     ],
                   }),
@@ -2643,5 +2650,112 @@ describe("daemon memory advisory (#140)", () => {
     assert.equal(extractDaemonMemoryAdvisory(text, 10_000_001), null);
     resetAdvisoryStateForTesting();
     assert.notEqual(extractDaemonMemoryAdvisory(text, 10_000_002), null);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Per-session file-recall ledger (one hook process per Claude Code event)
+// ──────────────────────────────────────────────────────────────────────
+
+describe("file-recall ledger across hook processes", () => {
+  let ledgerDir;
+  beforeEach(() => {
+    ledgerDir = mkdtempSync(join(tmpdir(), "ns-file-recall-"));
+    process.env.NEUROSTRATA_FILE_RECALL_DIR = ledgerDir;
+  });
+  afterEach(() => {
+    delete process.env.NEUROSTRATA_FILE_RECALL_DIR;
+    rmSync(ledgerDir, { recursive: true, force: true });
+  });
+
+  async function start(opts = {}) {
+    const mock = await createMockDaemonServer(opts);
+    resetClientForTesting();
+    await initialize({
+      config: { namespace: "ledger-ns", endpoint: mock.url, bearerToken: "tok", strictMode: opts.strictMode ?? false, requestTimeoutMs: 500 },
+      tool: { hook: async () => {} },
+      hooks: {},
+    });
+    return mock;
+  }
+
+  // Each call stands for a fresh `cli-hook.mjs` process: nothing survives in
+  // memory between two Claude Code hook events.
+  async function touch(file, extra = {}) {
+    prefetchedPaths.clear();
+    injectedMemoryIds.clear();
+    const out = await handleHookEvent({
+      hook_event_name: "PreToolUse",
+      tool_name: extra.tool ?? "Read",
+      tool_input: { file_path: file },
+      session_id: "sess-ledger",
+      ...extra.event,
+    });
+    return out.hookSpecificOutput?.additionalContext ?? "";
+  }
+
+  it("injects a memory once per session, per subagent, and again after compaction", async () => {
+    const { server, counters } = await start();
+    try {
+      assert.ok((await touch("src/a.ts")).includes("mem-rule-1"), "first touch injects");
+      assert.equal(await touch("src/a.ts"), "", "same file again: nothing, and no daemon call");
+      assert.equal(counters.memoriesForFile, 1);
+      assert.ok(!(await touch("src/b.ts")).includes("mem-rule-1"), "another file: the memory is not repeated");
+      assert.equal(counters.memoriesForFile, 2);
+      assert.ok(
+        (await touch("src/b.ts", { event: { agent_id: "agent-1" } })).includes("mem-rule-1"),
+        "a subagent has its own context, so its own ledger",
+      );
+      assert.ok(existsSync(fileRecallLedgerPath("ledger-ns", "sess-ledger")));
+      assert.ok(existsSync(fileRecallLedgerPath("ledger-ns", "sess-ledger", "agent-1")));
+
+      await handleHookEvent({ hook_event_name: "SessionStart", source: "compact", session_id: "sess-ledger" });
+      assert.ok(!existsSync(fileRecallLedgerPath("ledger-ns", "sess-ledger")), "compaction resets the ledger");
+      assert.ok((await touch("src/a.ts")).includes("mem-rule-1"), "re-injected after compaction");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("recalls again after FILE_RECALL_REFRESH_TOUCHES further touches", async () => {
+    const { server } = await start();
+    try {
+      assert.ok((await touch("src/a.ts")).includes("mem-rule-1"));
+      for (let i = 1; i < FILE_RECALL_REFRESH_TOUCHES; i++) {
+        assert.ok(!(await touch(`src/other-${i}.ts`)).includes("mem-rule-1"), `touch ${i}`);
+      }
+      assert.ok((await touch("src/a.ts")).includes("mem-rule-1"), "refreshed after the window");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("a denied edit does not mark its memories as delivered", async () => {
+    let reject = true;
+    const { server } = await start({ strictMode: true, guardReject: () => reject });
+    try {
+      const denied = await touch("src/a.ts", { tool: "Edit" });
+      assert.ok(denied.includes("mem-rule-1"), "the denial carries the rule that blocked it");
+      reject = false;
+      assert.ok((await touch("src/a.ts", { tool: "Edit" })).includes("mem-rule-1"), "the allowed retry still gets it");
+      assert.equal(await touch("src/a.ts", { tool: "Edit" }), "", "and then it is delivered");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("truncates a long memory and names the id that has the rest", async () => {
+    const { server } = await start({ memoryContent: "x".repeat(3465) });
+    try {
+      const [snippet] = await prefetchMemoriesForFile("ledger-ns", "src/long.ts");
+      assert.ok(snippet.length < MEMORY_SNIPPET_MAX_CHARS + 200, `snippet length ${snippet.length}`);
+      assert.ok(snippet.includes("truncated from 3465 chars; neurostrata_get_memory id=mem-rule-1"));
+    } finally {
+      server.close();
+      resetModuleState();
+    }
   });
 });

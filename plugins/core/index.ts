@@ -20,8 +20,8 @@
 // Node built-ins only (ESM). Zero require(), zero external runtime deps.
 // ──────────────────────────────────────────────────────────────────────
 
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -999,9 +999,22 @@ export function parseFileMemoryHits(text: string): FileMemoryHit[] {
   return out;
 }
 
+/**
+ * Longest memory text a file-touch recall carries. One long memory used to
+ * fill the whole PREFETCH_MAX_CHARS block on its own and push the others out;
+ * the rest stays one `neurostrata_get_memory` call away.
+ */
+export const MEMORY_SNIPPET_MAX_CHARS = 400;
+
 function formatFileMemorySnippet(hit: FileMemoryHit): string {
   const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : "";
-  return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${hit.content}`;
+  let content = hit.content;
+  if (content.length > MEMORY_SNIPPET_MAX_CHARS) {
+    content =
+      `${content.slice(0, MEMORY_SNIPPET_MAX_CHARS).trimEnd()} ... ` +
+      `[truncated from ${hit.content.length} chars; neurostrata_get_memory id=${hit.id} has the rest]`;
+  }
+  return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${content}`;
 }
 
 function capSnippets(snippets: string[]): string[] {
@@ -1245,6 +1258,156 @@ export function restorePrefetchDelivery(namespace: string, filePath: string): vo
   for (const id of added) injectedMemoryIds.delete(id);
   pendingPrefetchDeliveries.delete(key);
   prefetchedPaths.delete(key);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Per-session file-recall ledger
+// ──────────────────────────────────────────────────────────────────────
+//
+// prefetchedPaths and injectedMemoryIds only dedupe within one process. A
+// Claude Code hook is a new process per event, so without this ledger every
+// file touch re-injected the same memories (one file read twice = the same
+// ~2k chars twice). The ledger carries that state from one hook process to
+// the next, per session and per subagent (Claude Code sends `agent_id` for a
+// subagent's events, with the parent's `session_id`; a subagent has its own
+// context, so it gets its own ledger).
+
+/**
+ * A file or memory already recalled is recalled again once this many further
+ * file touches have passed in the same session: compaction can drop it from
+ * the context, and not every install wires SessionStart, which resets the
+ * ledger on `compact` and `clear`.
+ */
+export const FILE_RECALL_REFRESH_TOUCHES = 40;
+
+/** Ledgers untouched for this long are deleted when a new session starts one. */
+export const FILE_RECALL_LEDGER_TTL_MS = 48 * 60 * 60 * 1000;
+
+interface FileRecallLedger {
+  v: 1;
+  /** File touches counted in this session so far. */
+  touches: number;
+  /** prefetchedPaths key -> touch number it was recalled at. */
+  paths: Record<string, number>;
+  /** injectedMemoryIds key -> touch number it was injected at. */
+  memories: Record<string, number>;
+}
+
+/** Session-scoped, so it lives in the temp dir: never in a checkout or worktree. */
+export function fileRecallLedgerDir(): string {
+  return process.env.NEUROSTRATA_FILE_RECALL_DIR || join(tmpdir(), "neurostrata-file-recall");
+}
+
+function ledgerSafeName(part: string): string {
+  return part.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 120);
+}
+
+function ledgerPrefix(namespace: string, sessionId: string): string {
+  return `${ledgerSafeName(namespace)}--${ledgerSafeName(sessionId)}--`;
+}
+
+export function fileRecallLedgerPath(namespace: string, sessionId: string, agentId?: string | null): string {
+  return join(fileRecallLedgerDir(), `${ledgerPrefix(namespace, sessionId)}${ledgerSafeName(agentId || "main")}.json`);
+}
+
+function readFileRecallLedger(path: string): FileRecallLedger {
+  const fresh: FileRecallLedger = { v: 1, touches: 0, paths: {}, memories: {} };
+  try {
+    if (!existsSync(path)) return fresh;
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<FileRecallLedger>;
+    if (parsed?.v !== 1 || typeof parsed.touches !== "number") return fresh;
+    return {
+      v: 1,
+      touches: parsed.touches,
+      paths: parsed.paths && typeof parsed.paths === "object" ? parsed.paths : {},
+      memories: parsed.memories && typeof parsed.memories === "object" ? parsed.memories : {},
+    };
+  } catch {
+    return fresh;
+  }
+}
+
+function pruneFileRecallLedgers(): void {
+  try {
+    const dir = fileRecallLedgerDir();
+    const cutoff = Date.now() - FILE_RECALL_LEDGER_TTL_MS;
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".json")) continue;
+      const full = join(dir, name);
+      try {
+        if (statSync(full).mtimeMs < cutoff) unlinkSync(full);
+      } catch {
+        // another hook may have removed it
+      }
+    }
+  } catch {
+    // no ledger dir yet
+  }
+}
+
+/**
+ * Load a session's ledger into the in-memory dedup state for one hook event
+ * and count this file touch. `commit()` writes back what the event delivered:
+ * a denied edit has already rolled its ids back (restorePrefetchDelivery), so
+ * they are not recorded and the allowed retry still recalls them.
+ */
+export function beginFileRecallSession(
+  namespace: string,
+  sessionId: string,
+  agentId?: string | null,
+): { commit: () => void } {
+  const path = fileRecallLedgerPath(namespace, sessionId, agentId);
+  if (!existsSync(path)) pruneFileRecallLedgers();
+  const ledger = readFileRecallLedger(path);
+  ledger.touches += 1;
+  const now = ledger.touches;
+  const recent = (at: unknown) => typeof at === "number" && now - at < FILE_RECALL_REFRESH_TOUCHES;
+  // The ledger is the only truth for this session: state left in memory by
+  // another session (a long-lived host process) must not leak in.
+  prefetchedPaths.clear();
+  injectedMemoryIds.clear();
+  pendingPrefetchDeliveries.clear();
+  for (const [key, at] of Object.entries(ledger.paths)) {
+    if (recent(at)) recordPrefetchedPath(key);
+    else delete ledger.paths[key];
+  }
+  for (const [key, at] of Object.entries(ledger.memories)) {
+    if (recent(at)) injectedMemoryIds.add(key);
+    else delete ledger.memories[key];
+  }
+  return {
+    commit() {
+      const paths: Record<string, number> = {};
+      for (const key of prefetchedPaths.keys()) paths[key] = ledger.paths[key] ?? now;
+      const memories: Record<string, number> = {};
+      for (const key of injectedMemoryIds) memories[key] = ledger.memories[key] ?? now;
+      try {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, JSON.stringify({ v: 1, touches: now, paths, memories }));
+      } catch {
+        // best-effort: a lost ledger only means one repeated injection
+      }
+    },
+  };
+}
+
+/** Forget what a session was given (SessionStart `compact` / `clear`). */
+export function resetFileRecallSession(namespace: string, sessionId: string): void {
+  try {
+    const dir = fileRecallLedgerDir();
+    const prefix = ledgerPrefix(namespace, sessionId);
+    for (const name of readdirSync(dir)) {
+      if (name.startsWith(prefix)) {
+        try {
+          unlinkSync(join(dir, name));
+        } catch {
+          // already gone
+        }
+      }
+    }
+  } catch {
+    // no ledger dir yet
+  }
 }
 
 async function recallMemoriesForSubagentFile(
@@ -2410,6 +2573,13 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
     // File-touch tools: prefetch governing memories, build recall block.
     let recallBlock: string | undefined;
     let recalledFilePath: string | undefined;
+    // One hook process per event: the session's ledger carries the dedup
+    // state across them (see beginFileRecallSession).
+    const recallSessionId = asString(event.session_id);
+    const recallSession =
+      recallSessionId && isFileTouchTool(toolNameRaw)
+        ? beginFileRecallSession(config.namespace, recallSessionId, asString(event.agent_id))
+        : undefined;
     if (isFileTouchTool(toolNameRaw)) {
       const filePath = extractFilePath(toolInput, undefined, toolInputRaw);
       if (filePath) {
@@ -2429,6 +2599,7 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
     // the rules that blocked it.
     const denyWithRecall = (reason: string) => {
       if (recalledFilePath) restorePrefetchDelivery(config.namespace, recalledFilePath);
+      recallSession?.commit();
       return {
         ...(recallBlock ? { systemMessage: recallBlock } : {}),
         hookSpecificOutput: {
@@ -2490,6 +2661,7 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
       mutationsSinceNote++;
     }
     if (recalledFilePath) confirmPrefetchDelivery(config.namespace, recalledFilePath);
+    recallSession?.commit();
     return {
       continue: true,
       ...(recallBlock ? { systemMessage: recallBlock } : {}),
@@ -2500,6 +2672,17 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
         ...(recallBlock ? { additionalContext: recallBlock } : {}),
       },
     };
+  }
+
+  // After a compaction or /clear the context no longer holds what the ledger
+  // says was injected, so the session starts recalling from scratch.
+  if (hookEventName === "SessionStart") {
+    const source = asString(event.source);
+    const sessionId = asString(event.session_id);
+    if (sessionId && (source === "compact" || source === "clear")) {
+      resetFileRecallSession(config.namespace, sessionId);
+    }
+    return { hookSpecificOutput: { hookEventName, permissionDecision: "allow" } };
   }
 
   if (["Stop", "SubagentStop"].includes(hookEventName)) {

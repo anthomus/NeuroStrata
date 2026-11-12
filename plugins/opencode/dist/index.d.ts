@@ -254,6 +254,12 @@ export interface FileMemoryHit {
 }
 export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
 /**
+ * Longest memory text a file-touch recall carries. One long memory used to
+ * fill the whole PREFETCH_MAX_CHARS block on its own and push the others out;
+ * the rest stays one `neurostrata_get_memory` call away.
+ */
+export declare const MEMORY_SNIPPET_MAX_CHARS = 400;
+/**
  * Recall governing memories for a touched file. LRU path dedup (no re-query within the
  * window) and injectedMemoryIds dedup (each memory injected once per session).
  */
@@ -274,6 +280,29 @@ export declare function confirmPrefetchDelivery(namespace: string, filePath: str
  * governing rules.
  */
 export declare function restorePrefetchDelivery(namespace: string, filePath: string): void;
+/**
+ * A file or memory already recalled is recalled again once this many further
+ * file touches have passed in the same session: compaction can drop it from
+ * the context, and not every install wires SessionStart, which resets the
+ * ledger on `compact` and `clear`.
+ */
+export declare const FILE_RECALL_REFRESH_TOUCHES = 40;
+/** Ledgers untouched for this long are deleted when a new session starts one. */
+export declare const FILE_RECALL_LEDGER_TTL_MS: number;
+/** Session-scoped, so it lives in the temp dir: never in a checkout or worktree. */
+export declare function fileRecallLedgerDir(): string;
+export declare function fileRecallLedgerPath(namespace: string, sessionId: string, agentId?: string | null): string;
+/**
+ * Load a session's ledger into the in-memory dedup state for one hook event
+ * and count this file touch. `commit()` writes back what the event delivered:
+ * a denied edit has already rolled its ids back (restorePrefetchDelivery), so
+ * they are not recorded and the allowed retry still recalls them.
+ */
+export declare function beginFileRecallSession(namespace: string, sessionId: string, agentId?: string | null): {
+    commit: () => void;
+};
+/** Forget what a session was given (SessionStart `compact` / `clear`). */
+export declare function resetFileRecallSession(namespace: string, sessionId: string): void;
 export declare function formatFileTouchRecallBlock(filePath: string, snippets: string[]): string;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
 export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string): string;
