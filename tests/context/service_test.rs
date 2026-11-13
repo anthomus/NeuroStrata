@@ -4,6 +4,9 @@
 
 #[path = "../../src/context/model.rs"]
 mod model;
+// source.rs calls crate::paths, so this test crate needs the module too.
+#[path = "../../src/paths.rs"]
+mod paths;
 #[path = "../../src/context/source.rs"]
 mod source;
 #[path = "../../src/context/freshness.rs"]
