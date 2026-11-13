@@ -635,6 +635,27 @@ pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
     out
 }
 
+/// The active task's payload with its `subagent_prompt_injection` rebuilt from
+/// the store as it is now, the way `handle_task_list` does. The cached block
+/// is written once at claim time and keeps quoting rules that were superseded
+/// or archived since; `get_snapshot` hands that block to every session start
+/// through `active_session.json`, so it has to be current there too.
+pub(crate) async fn task_payload_with_fresh_context(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+    payload: &MemoryPayload,
+) -> MemoryPayload {
+    let vector = load_task(store, namespace, task_id)
+        .await
+        .map(|(_task, vec)| vec)
+        .unwrap_or_default();
+    let (_hits, prompt) = build_task_graph_context(store, namespace, task_id, &vector, payload).await;
+    let mut fresh = payload.clone();
+    task_obj_mut(&mut fresh).insert("subagent_prompt_injection".to_string(), json!(prompt));
+    fresh
+}
+
 /// Best-effort persistence of `.NeuroStrata/active_session.json` so harness
 /// plugins can inject Golden Rules and active task context on session startup
 /// (`sessionContextHandler`) even before the first tool call.
