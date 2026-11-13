@@ -688,6 +688,13 @@ pub fn persist_active_session_file(
             active.insert("subagent_prompt_injection".to_string(), json!(inj));
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
+    } else {
+        // No task is in progress: drop the fields a finished (completed or
+        // released) task left behind, or the session-start hook keeps
+        // announcing it as the active task.
+        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+            active.remove(key);
+        }
     }
 
     if std::fs::create_dir_all(&ns_dir).is_ok() {
