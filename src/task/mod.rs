@@ -1857,7 +1857,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
 /// Lock 2, so the failure is also the instruction for fixing it.
 pub(crate) fn blocked_message(id: &str) -> String {
     format!(
-        "BLOCKED (Lock 2): task {} cannot complete without an extracted memory. Either call neurostrata_add_memory with metadata extracted_from: [\"{}\"], or retry neurostrata_task_complete with `memory.content` (what did you learn? what rule does this task prove?) or `link_memory_id`.",
+        "BLOCKED (Lock 2): task {} cannot complete without an extracted memory. Either call neurostrata_add_memory with metadata extracted_from: [\"{}\"], or retry neurostrata_task_complete with `memory.content` (what did you learn? what rule does this task prove? clear and concise) or `link_memory_id`.",
         id, id
     )
 }
@@ -2640,6 +2640,7 @@ Tier-3 task memory -- recover a session with `neurostrata_task_list` +
 ## 4. Memory & Automatic Graph-First Propagation
 Architectural rules, decisions, and fixes -> `neurostrata_add_memory`
 (correct outdated rules via `neurostrata_supersede_memory`; never bulk-delete).
+- **Memory text:** clear and concise. Status, next steps and progress go on the task (`neurostrata_task_update` note), not in memories. When a decision or the code changes, supersede the memory.
 - **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_trace_call_chain`, `neurostrata_impact_analysis`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
 - **Subagent Prompt Propagation:** Subagents start with a blank context window. Write the Graph-First rule into your session plan on init, and paste the `subagent_prompt_injection` block returned by `neurostrata_task_claim` into EVERY subagent prompt you spawn.
 - **Zero-Touch Harness Plugin Auto-Install & Hooks:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`), installs/wires the zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`, and self-heals both `.git/hooks/pre-push` and `.git/hooks/pre-commit`.
@@ -6050,7 +6051,7 @@ mod tests {
         .expect_err("Lock 2 must refuse a completion with nothing extracted");
 
         let expected = format!(
-            "BLOCKED (Lock 2): task {} cannot complete without an extracted memory. Either call neurostrata_add_memory with metadata extracted_from: [\"{}\"], or retry neurostrata_task_complete with `memory.content` (what did you learn? what rule does this task prove?) or `link_memory_id`.",
+            "BLOCKED (Lock 2): task {} cannot complete without an extracted memory. Either call neurostrata_add_memory with metadata extracted_from: [\"{}\"], or retry neurostrata_task_complete with `memory.content` (what did you learn? what rule does this task prove? clear and concise) or `link_memory_id`.",
             id, id
         );
         assert_eq!(
