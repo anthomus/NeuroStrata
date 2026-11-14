@@ -35,6 +35,11 @@
 #   scripts/build.sh --debug         debug build
 #   scripts/build.sh --no-locked     allow resolving away from Cargo.lock
 #   scripts/build.sh -- --features x anything after -- goes to cargo
+#   scripts/build.sh --test          run cargo test instead of cargo build
+#   scripts/build.sh --test -- store::ladybug -- --nocapture
+#                                    filter, then flags for the test binary
+#   scripts/build.sh --project-root DIR
+#                                    build or test another checkout
 #
 # Environment:
 #   CXX                      C++ compiler to probe and use (default: c++)
@@ -44,6 +49,8 @@
 
 set -euo pipefail
 
+command="build"
+project_root=""
 profile="release"
 check_only=0
 locked="--locked"
@@ -55,13 +62,22 @@ while [ $# -gt 0 ]; do
         --release)   profile="release"; shift ;;
         --check)     check_only=1; shift ;;
         --no-locked) locked=""; shift ;;
-        -h|--help)   sed -n '2,50p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'; exit 0 ;;
+        --test)      command="test"; shift ;;
+        --project-root)
+            [ $# -ge 2 ] || { echo "--project-root needs a directory" >&2; exit 2; }
+            project_root="$2"; shift 2 ;;
+        -h|--help)   sed -n '2,48p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'; exit 0 ;;
         --)          shift; cargo_passthrough+=("$@"); break ;;
         *)           cargo_passthrough+=("$1"); shift ;;
     esac
 done
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -n "$project_root" ]; then
+    [ -f "$project_root/Cargo.toml" ] || { echo "--project-root has no Cargo.toml: $project_root" >&2; exit 2; }
+    repo_root="$(cd "$project_root" && pwd)"
+else
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
 os="$(uname -s)"
 
 # Git Bash / MSYS / Cygwin run this file happily but build for the MSVC target,
@@ -269,9 +285,9 @@ if [ "$check_only" -eq 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Build
+# 7. Build or test
 # ---------------------------------------------------------------------------
-cargo_args=(build)
+cargo_args=("$command")
 if [ "$profile" = "release" ]; then cargo_args+=(--release); fi
 if [ -n "$locked" ]; then cargo_args+=("$locked"); fi
 if [ "${#cargo_passthrough[@]}" -gt 0 ]; then cargo_args+=("${cargo_passthrough[@]}"); fi
@@ -283,7 +299,10 @@ printf '%s    A cold build compiles lbug'"'"'s C++ engine from source. Expect se
 cd "$repo_root"
 "$cargo_bin" "${cargo_args[@]}"
 
-binary="$repo_root/target/$profile/neurostrata-mcp"
+[ "$command" = "build" ] || exit 0
+
+binary="${CARGO_TARGET_DIR:-target}/$profile/neurostrata-mcp"
+case "$binary" in /*) ;; *) binary="$repo_root/$binary" ;; esac
 printf '\n'
 if [ -x "$binary" ]; then
     size="$(du -h "$binary" | cut -f1)"
