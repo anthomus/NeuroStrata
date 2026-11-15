@@ -16,6 +16,9 @@ use crate::task::intake::{
     ListCandidatesRequest, ProvenanceSpan, ResolveCandidateRequest, ReviewState, SourceKind,
 };
 
+/// Memory-writing guidance returned on initialize for clients to show agents.
+pub(crate) const SERVER_INSTRUCTIONS: &str = "Memory text: Be concise but complete. Preserve necessary conditions, exceptions, rationale, and actionable detail. Remove repetition.";
+
 #[derive(Deserialize)]
 pub struct JsonRpcRequest {
     jsonrpc: String,
@@ -108,7 +111,8 @@ pub async fn process_mcp_request(
                 },
                 "capabilities": {
                     "tools": {}
-                }
+                },
+                "instructions": SERVER_INSTRUCTIONS
             });
             serde_json::to_value(JsonRpcResponse::success(id.clone(), result)).unwrap_or_else(|e| {
                 serde_json::json!({
@@ -129,11 +133,11 @@ pub async fn process_mcp_request(
                 "tools": [
                     {
                         "name": "neurostrata_add_memory",
-                        "description": "Store a domain fact, knowledge-base entry, architectural rule, project pattern, procedure, or task insight. NeuroStrata is a general-purpose, project-oriented memory and ontology system — memories do not require code or documents and can capture pure conversational or domain knowledge. Task recognition: if the content contains a task-shaped statement (TODO:, 'we should also', 'later we need to', 'remaining work:', 'defer'/'deferred'), consider neurostrata_task_create instead of or in addition to storing it as a memory.",
+                        "description": "Store a domain fact, knowledge-base entry, architectural rule, project pattern, procedure, or task insight. NeuroStrata is a general-purpose, project-oriented memory and ontology system — memories do not require code or documents and can capture pure conversational or domain knowledge. Be concise but complete. Preserve necessary conditions, exceptions, rationale, and actionable detail. Remove repetition. Task recognition: if the content contains a task-shaped statement (TODO:, 'we should also', 'later we need to', 'remaining work:', 'defer'/'deferred'), consider neurostrata_task_create instead of or in addition to storing it as a memory.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "content": { "type": "string", "description": "The text of the memory to save." },
+                                "content": { "type": "string", "description": "The text of the memory to save. Be concise but complete. Preserve necessary conditions, exceptions, rationale, and actionable detail. Remove repetition." },
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
                                 "project_root": { "type": "string", "description": "The absolute path to the project root directory where the agent is currently working." },
                                 "memory_type": { "type": "string", "description": "Use rule or fact; task for tracked work; procedure for a knowing-how routine that fires on a trigger or a repetition budget (perform it with neurostrata_procedure_perform); a fact may carry metadata.topology (component, target_system, channel, credential_boundary, reason), the access path the fact describes; a fact may also carry metadata.attempt (approach, outcome, failure_mode, context) with outcome \"failed\", evidence of one failed episode and not a rule; the namespace's registry row carries metadata.domain_registry.domains, the sorted list of the domain slugs the namespace uses; structural types are directory/file/markdown/symbol; custom types remain valid; default context. (This description is overlaid at runtime from src/schemas/memory-vocabulary.v3.json tool_summaries.memory_type; if it has drifted from the shipped vocab, the overlay wins, but the static value should stay in sync so the source is not misleading.)" },
@@ -372,7 +376,7 @@ pub async fn process_mcp_request(
                             "properties": {
                                 "id": { "type": "string", "description": "The id of the memory being corrected. Get it from a search result or neurostrata_get_memory." },
                                 "namespace": { "type": "string", "description": "The namespace the memory lives in." },
-                                "content": { "type": "string", "description": "The corrected text, written in full. It replaces the old wording rather than being appended to it." },
+                                "content": { "type": "string", "description": "The corrected text, written in full. It replaces the old wording rather than being appended to it. Be concise but complete. Preserve necessary conditions, exceptions, rationale, and actionable detail. Remove repetition." },
                                 "governs": { "type": "array", "items": { "type": "string" }, "description": "Replacement structural pointers. Passed = replaces the inherited value wholesale; absent = the old value carries over and the reply names it." },
                                 "related_to": { "type": "array", "items": { "type": "string" }, "description": "Replacement related_to ids. Passed = replaces; absent = carries over and is reported." },
                                 "contained_by": { "type": "array", "items": { "type": "string" }, "description": "Replacement contained_by ids. Passed = replaces; absent = carries over and is reported." },
@@ -496,7 +500,7 @@ pub async fn process_mcp_request(
                                     "type": "object",
                                     "description": "Write the extraction inline; it lands with the completion, through the same pipeline as neurostrata_add_memory.",
                                     "properties": {
-                                        "content": { "type": "string", "description": "What did you learn? What rule does this task prove?" },
+                                        "content": { "type": "string", "description": "What did you learn? What rule does this task prove? Be concise but complete. Preserve necessary conditions, exceptions, rationale, and actionable detail. Remove repetition." },
                                         "memory_type": { "type": "string", "description": "Defaults to 'fact'." },
                                         "metadata": { "type": "object", "description": "Optional key-value map persisted exactly as neurostrata_add_memory persists one (e.g. source {kind, ref, captured_at} for a Source-necessary rule); extracted_from is stamped with this task if absent." },
                                         "locations": { "type": "array", "items": { "type": "object" }, "description": "Optional file/symbol location anchors (same as neurostrata_add_memory; omit for conversational or documentless knowledge-base memories)." }
@@ -15146,6 +15150,74 @@ mod tests {
             "expected the canonical no-mesh answer, got: {text}"
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_concise_complete_memory_guidance() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "initialize".to_string(),
+            params: Some(json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        assert_eq!(
+            response["result"]["instructions"],
+            "Memory text: Be concise but complete. Preserve necessary conditions, exceptions, rationale, and actionable detail. Remove repetition."
+        );
+        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+    }
+
+    #[tokio::test]
+    async fn memory_prompts_preserve_scope_without_new_policy_bans() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        let tool = |name: &str| tools.iter().find(|t| t["name"] == name).expect("tool exists");
+        let guidance = "Be concise but complete. Preserve necessary conditions, exceptions, rationale, and actionable detail. Remove repetition.";
+        let add = tool("neurostrata_add_memory");
+        let original_add = "Store a domain fact, knowledge-base entry, architectural rule, project pattern, procedure, or task insight. NeuroStrata is a general-purpose, project-oriented memory and ontology system — memories do not require code or documents and can capture pure conversational or domain knowledge.";
+        let recognition = "Task recognition: if the content contains a task-shaped statement (TODO:, 'we should also', 'later we need to', 'remaining work:', 'defer'/'deferred'), consider neurostrata_task_create instead of or in addition to storing it as a memory.";
+        let vocabulary = crate::traits::memory_vocabulary();
+        let summary = vocabulary["tool_summaries"]["add"].as_str().expect("add summary");
+        assert_eq!(
+            add["description"],
+            format!("{original_add} {guidance} {recognition} {summary}")
+        );
+        assert_eq!(
+            add["inputSchema"]["properties"]["content"]["description"],
+            format!("The text of the memory to save. {guidance}")
+        );
+        assert_eq!(
+            tool("neurostrata_supersede_memory")["inputSchema"]["properties"]["content"]["description"],
+            format!("The corrected text, written in full. It replaces the old wording rather than being appended to it. {guidance}")
+        );
+        assert_eq!(
+            tool("neurostrata_task_complete")["inputSchema"]["properties"]["memory"]["properties"]["content"]["description"],
+            format!("What did you learn? What rule does this task prove? {guidance}")
+        );
+        for schema in [
+            &add["inputSchema"]["properties"]["content"],
+            &tool("neurostrata_supersede_memory")["inputSchema"]["properties"]["content"],
+            &tool("neurostrata_task_complete")["inputSchema"]["properties"]["memory"]["properties"]["content"],
+        ] {
+            assert!(schema.get("maxLength").is_none(), "no hard length cap");
+        }
+        assert!(add["inputSchema"]["properties"]["locations"]["items"]["properties"]["symbol"].is_object());
+        assert!(tool("neurostrata_task_complete")["inputSchema"]["properties"]["memory"]["properties"]["locations"].is_object());
     }
 
     /// Every tool the surface exposes, in the order tools/list returns them.
