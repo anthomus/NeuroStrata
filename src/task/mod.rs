@@ -2793,6 +2793,7 @@ Domain facts, user-told knowledge, entities, digital twins, architectural rules,
 decisions, and fixes -> `neurostrata_add_memory` (`locations` are optional and
 used only when anchoring to specific files or code symbols; correct outdated
 records via `neurostrata_supersede_memory`; never bulk-delete).
+- **Memory text:** Be concise but complete. Preserve necessary conditions, exceptions, rationale, and actionable detail. Remove repetition.
 - **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_trace_call_chain`, `neurostrata_impact_analysis`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
 - **Subagent Prompt Propagation:** Subagents start with a blank context window. Write the Graph-First rule into your session plan on init, and paste the `subagent_prompt_injection` block returned by `neurostrata_task_claim` into EVERY subagent prompt you spawn.
 - **Zero-Touch Harness Plugin Auto-Install & Hooks:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`), installs/wires the zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`, and self-heals both `.git/hooks/pre-push` and `.git/hooks/pre-commit`.
@@ -8735,5 +8736,16 @@ impl crate::traits::AsAny for ListHidingStore {
             golden.iter().any(|g| g["id"] == "pinned-local-1"),
             "golden_rules must include local pinned rule: {golden:?}"
         );
+    }
+
+    #[test]
+    fn memory_text_guidance_matches_template_and_skill_without_policy_bans() {
+        let bullet = "- **Memory text:** Be concise but complete. Preserve necessary conditions, exceptions, rationale, and actionable detail. Remove repetition.";
+        let template = agents_template("example-project");
+        let skill = include_str!("../../.agents/skills/neurostrata/SKILL.md");
+        for text in [template.as_str(), skill] {
+            let lines: Vec<_> = text.lines().filter(|line| line.starts_with("- **Memory text:**")).collect();
+            assert_eq!(lines, vec![bullet]);
+        }
     }
 }
