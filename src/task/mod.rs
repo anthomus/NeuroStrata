@@ -567,9 +567,11 @@ pub(crate) async fn task_payload_with_fresh_context(
         .await
         .map(|(_task, vec)| vec)
         .unwrap_or_default();
-    let (_hits, prompt) = build_task_graph_context(store, namespace, task_id, &vector, payload).await;
+    let (hits, prompt) = build_task_graph_context(store, namespace, task_id, &vector, payload).await;
     let mut fresh = payload.clone();
-    task_obj_mut(&mut fresh).insert("subagent_prompt_injection".to_string(), json!(prompt));
+    let task = task_obj_mut(&mut fresh);
+    task.insert("auto_retrieved_context".to_string(), hits);
+    task.insert("subagent_prompt_injection".to_string(), json!(prompt));
     fresh
 }
 
@@ -604,6 +606,15 @@ pub fn persist_active_session_file(
         })
         .collect();
     active.insert("golden_rules".to_string(), json!(golden_strings));
+    // Each write replaces the task fields and bridges instead of inheriting them:
+    // a finished task, or bridges written before a memory was retired, must not
+    // linger in the file.
+    for key in ["task_id", "status", "session_id", "subagent_prompt_injection", "conceptual_bridges"] {
+        active.remove(key);
+    }
+    // A new value on every write lets a plugin tell a refresh it just asked for
+    // from a file left over from an earlier write.
+    active.insert("context_revision".to_string(), json!(uuid::Uuid::new_v4().to_string()));
 
     if let Some((tid, payload)) = active_task {
         active.insert("task_id".to_string(), json!(tid));
@@ -625,14 +636,14 @@ pub fn persist_active_session_file(
         {
             active.insert("subagent_prompt_injection".to_string(), json!(inj));
         }
-        active.insert("updated_at".to_string(), json!(machine::timestamp()));
-    } else {
-        // No task is in progress: drop the fields a finished (completed or
-        // released) task left behind, or the session-start hook keeps
-        // announcing it as the active task.
-        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
-            active.remove(key);
+        if let Some(bridges) = task_obj
+            .and_then(|t| t.get("auto_retrieved_context"))
+            .and_then(|ctx| ctx.get("conceptual_bridges"))
+            .filter(|v| v.is_array())
+        {
+            active.insert("conceptual_bridges".to_string(), bridges.clone());
         }
+        active.insert("updated_at".to_string(), json!(machine::timestamp()));
     }
 
     if std::fs::create_dir_all(&ns_dir).is_ok() {
@@ -4773,6 +4784,53 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::store::LadybugStore;
+
+    fn read_session_file(root: &std::path::Path) -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(root.join(".NeuroStrata/active_session.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Each write stamps a new context_revision, replaces the bridges with the
+    /// task's current ones, and keeps unrelated keys. The plugin injects the
+    /// file only when the revision changed after its own refresh.
+    #[test]
+    fn session_file_write_stamps_revision_and_replaces_bridges() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            tmp.path().join(".NeuroStrata/active_session.json"),
+            json!({ "host_key": "keep", "conceptual_bridges": ["OLD BRIDGE"] }).to_string(),
+        )
+        .unwrap();
+        let task = MemoryPayload {
+            content: "the work".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({ "task": {
+                "status": "in_progress",
+                "subagent_prompt_injection": "BLOCK",
+                "auto_retrieved_context": { "conceptual_bridges": [{ "id": "b1", "content": "CURRENT BRIDGE" }] }
+            } }),
+        };
+        persist_active_session_file(tmp.path(), "probe", &[], Some(("t1", &task)));
+        let first = read_session_file(tmp.path());
+        assert_eq!(first["conceptual_bridges"][0]["content"], "CURRENT BRIDGE");
+        assert!(!first.to_string().contains("OLD BRIDGE"), "{first}");
+        assert_eq!(first["host_key"], "keep");
+        let rev1 = first["context_revision"].as_str().expect("revision").to_string();
+
+        persist_active_session_file(tmp.path(), "probe", &[], None);
+        let second = read_session_file(tmp.path());
+        assert!(second.get("conceptual_bridges").is_none(), "{second}");
+        assert!(second.get("task_id").is_none(), "{second}");
+        assert_ne!(second["context_revision"].as_str().unwrap(), rev1);
+        assert_eq!(second["host_key"], "keep");
+    }
 
     /// R5: an "installed" hook must carry the executable bit, so fixtures
     /// asserting `hook_installed: true` install it the way the installer does.
