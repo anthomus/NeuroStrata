@@ -57,7 +57,9 @@ async fn search_inner(
     query_text: Option<String>,
     exact: bool,
     search_mode: crate::traits::SearchMode,
+    review_lexical: Option<Vec<SearchResult>>,
 ) -> Result<DomainSearchOutcome> {
+    let read_only = review_lexical.is_some();
     // Every vector search funnels through
     // here, including the paths that never init (the fallback CLI's
     // chat ask): a data-bearing store refuses a query embedded under
@@ -172,8 +174,8 @@ async fn search_inner(
         }
     }
 
-    let mut hybrid_lexical_primaries: Vec<SearchResult> = Vec::new();
-    if search_mode == crate::traits::SearchMode::Hybrid {
+    let mut hybrid_lexical_primaries = review_lexical.unwrap_or_default();
+    if !read_only && search_mode == crate::traits::SearchMode::Hybrid {
         if let Some(ref q) = query_text {
             if !q.trim().is_empty() {
                 let domain_vec: Vec<String> = domain_keys.iter().cloned().collect();
@@ -1421,6 +1423,9 @@ let incomplete = result_count >= fetch_limit;
         })
         .await;
     let outcome = outcome?;
+    if read_only {
+        return Ok(outcome);
+    }
     // Time-series metrics for this search: REAL measurements rather than the
     // old hardcoded placeholders (0.0 distance / 1.0 latency). The best
     // (lowest) retrieval distance across the final result set and the
@@ -1496,6 +1501,8 @@ impl OpenProvenance {
 }
 
 pub struct LadybugStore {
+    #[cfg(test)]
+    write_attempts: std::sync::atomic::AtomicU64,
     local_path: PathBuf,
     dimensions: usize,
     db: Arc<Database>,
@@ -3130,6 +3137,8 @@ impl LadybugStore {
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
+            #[cfg(test)]
+            write_attempts: std::sync::atomic::AtomicU64::new(0),
             checkpoints_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
@@ -3747,6 +3756,8 @@ impl LadybugStore {
         T: Send + 'static,
         F: Fn(&Connection) -> Result<T> + Clone + Send + 'static,
     {
+        #[cfg(test)]
+        self.write_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
         let stopped = Arc::clone(&self.checkpoints_stopped);
@@ -6586,6 +6597,68 @@ impl LadybugStore {
 }
 
 impl LadybugStore {
+    /// Correction review uses the native hybrid kernel without search metrics
+    /// or lazy disk-index initialization. The lexical view is request-local.
+    pub(crate) async fn review_correction_search(
+        &self,
+        namespace: &str,
+        vector: Vec<f32>,
+        query: &str,
+        principal: &str,
+        source_id: &str,
+    ) -> Result<(DomainSearchOutcome, bool)> {
+        const LEXICAL_SCAN: usize = 512;
+        let ns = namespace.to_string();
+        let rows = self.with_conn(move |conn| {
+            let excluded = STRUCTURAL_MEMORY_TYPES.iter().copied()
+                .chain(["task", "structural", "symbol", "code_ast", "doc_section"])
+                .map(|t| format!("m.memory_type <> '{t}'")).collect::<Vec<_>>().join(" AND ");
+            let sql = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND {excluded} RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY m.id LIMIT {}",
+                escape_ladybug_string(&ns), LEXICAL_SCAN + 1
+            );
+            let mut rows = Vec::new();
+            for row in conn.query(&sql)? {
+                rows.push((format!("{}", row[0]), MemoryPayload {
+                    content: format!("{}", row[1]),
+                    user_id: format!("{}", row[2]),
+                    memory_type: format!("{}", row[3]),
+                    agent_name: Some(format!("{}", row[4])),
+                    location: format!("{}", row[5]),
+                    location_lines: format!("{}", row[6]),
+                    metadata: serde_json::from_str(&format!("{}", row[7]))?,
+                }));
+            }
+            Ok(rows)
+        }).await?;
+        let lexical_incomplete = rows.len() > LEXICAL_SCAN;
+        let index = crate::lexical::TantivyLexicalIndex::open_in_ram()?;
+        let mut payloads = HashMap::new();
+        let mut documents = Vec::new();
+        for (id, payload) in rows.into_iter().take(LEXICAL_SCAN) {
+            if id != source_id && !is_archived(&payload.metadata) && !is_retired(&payload.metadata)
+                && !is_registry_row(&payload.metadata) && !is_mesh_conflicting(&payload.metadata)
+                && crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
+                documents.push((namespace.to_string(), id.clone(), payload.clone()));
+                payloads.insert(id, payload);
+            }
+        }
+        index.rebuild(&documents)?;
+        let lexical = index.search(namespace, query, 160, false, false, None)?
+            .into_iter().filter_map(|hit| payloads.remove(&hit.id).map(|payload| SearchResult {
+                id: hit.id, score: hit.score, payload, evidence: None,
+            })).collect();
+        let outcome = search_inner(self, namespace, vector, 40, false, false, false,
+            HashSet::new(), Some(query.to_string()), false,
+            crate::traits::SearchMode::Hybrid, Some(lexical)).await?;
+        Ok((outcome, lexical_incomplete))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_attempts(&self) -> u64 {
+        self.write_attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Build the lexical view of one stored row. The engine deliberately does
     /// not parse JSON, so every filter flag is decided here, next to the store's
     /// other row-class predicates.
@@ -6787,6 +6860,7 @@ impl LadybugStore {
             query_owned,
             exact,
             search_mode,
+            None,
         )
         .await?;
         if outcome.incomplete {
@@ -9028,6 +9102,7 @@ impl VectorStore for LadybugStore {
             None,
             true,
             crate::traits::SearchMode::Default,
+            None,
         )
         .await?;
         Ok(outcome.results)

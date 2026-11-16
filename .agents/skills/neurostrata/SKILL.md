@@ -60,7 +60,8 @@ NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust bi
   3. Task Stratum — Task working memory stored on the task record via `neurostrata_task_update` (`note`) and linked via `EXTRACTED_FROM`.
 - **Pointer-Wiki Engrams & Anchors:** Pass `locations: [{path, lines, symbol}]` and `metadata.governs: ["<Namespace>::<rel_path>"]` on `neurostrata_add_memory` so rules attach directly to file and symbol nodes in the graph.
 - **Negative Exemplars (Failed Attempts):** Record dead-end approaches using `metadata.attempt: { approach, outcome: "failed", failure_mode }` so future sessions never repeat a failed experiment.
-- **Non-Destructive Corrections:** Never use `bd remember` or `MEMORY.md`. Correct outdated memories with `neurostrata_supersede_memory` (`old_id`, `new_content`, `reason`) or retire with `neurostrata_archive_memory`. Deletion is deliberately absent from MCP.
+- **Non-Destructive Corrections:** Never use `bd remember` or `MEMORY.md`. Correct outdated memories with `neurostrata_supersede_memory` (`id`, `namespace`, `content`, `reason`) or retire with `neurostrata_archive_memory`. Deletion is deliberately absent from MCP.
+- **Changed-claim review:** Before superseding, call read-only `neurostrata_review_correction` (`namespace`, `id`, complete `new_content`, specific `changed_claim`). Inspect full candidates and source/code anchors where needed; similarity is not proof of contradiction or obsolescence, and bounded retrieval is not exhaustive. Preserve unaffected clauses, exceptions and rationale in the full replacement, then supersede separately and explicitly. Review never retires candidates automatically and is not a deterministic semantic-truth gate.
 - **Episodic Buffer:** Maintain a running session log using `neurostrata_append_log` (`namespace`, `project_root`, `content`, `tags`), which writes rolling 500 KB transcripts to `.NeuroStrata/sessions/` and returns `task_intent_signals`.
 
 ---

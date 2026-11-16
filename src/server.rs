@@ -350,8 +350,23 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_review_correction",
+                        "description": "Read-only changed-claim review BEFORE superseding a memory. Returns complete old/proposed text, inherited source/code anchors and up to five native hybrid memory candidates. Bounded, not exhaustive; similarity is not proof of contradiction or obsolescence. Inspect candidates and preserve unaffected clauses, exceptions and rationale before a separate explicit supersede. No retirement, access-count, cache, ledger or event writes.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "minLength": 1 },
+                                "id": { "type": "string", "minLength": 1, "description": "Old memory id." },
+                                "new_content": { "type": "string", "minLength": 1, "description": "Complete proposed replacement, not just the changed clause." },
+                                "changed_claim": { "type": "string", "minLength": 1, "description": "The specific claim being corrected; native retrieval query." },
+                                "principal": { "type": "string", "description": "Resolved principal for visible_to checks; local default admin." }
+                            },
+                            "required": ["namespace", "id", "new_content", "changed_claim"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_supersede_memory",
-                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced.",
+                        "description": "Correct a memory that is wrong or out of date. First review the changed claim with neurostrata_review_correction; inspect full candidates where needed and preserve unaffected clauses, exceptions and rationale in the full replacement. Review is guidance, not a semantic gate. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -1426,6 +1441,9 @@ pub async fn process_mcp_request(
                         "neurostrata_related" => {
                             result_text = handle_related(arguments, store.clone()).await;
                         }
+                        "neurostrata_review_correction" => {
+                            result_text = handle_review_correction(&arguments, "admin", emb.clone(), store.clone()).await;
+                        }
                         "neurostrata_supersede_memory" => {
                             result_text = handle_supersede_memory(
                                 arguments,
@@ -1787,6 +1805,7 @@ pub async fn process_mcp_request(
             let drained_notices = request
                 .params
                 .as_ref()
+                .filter(|p| p.get("name").and_then(Value::as_str) != Some("neurostrata_review_correction"))
                 .and_then(|p| p.get("arguments"))
                 .map(|args| {
                     crate::synaptic_mesh::attention::global_attention_filter()
@@ -8331,6 +8350,110 @@ async fn handle_domain_registry(
 /// were destructive rewrites, and `/edit` additionally kept the old embedding.
 /// This is the writing half. It adds rather than overwrites, so it is reachable
 /// over MCP where edit, delete and move are not.
+fn correction_review_memory(id: &str, payload: &crate::traits::MemoryPayload) -> Value {
+    fn select(value: &Value, keys: &[&str]) -> Value {
+        let mut out = serde_json::Map::new();
+        for key in keys {
+            if let Some(v) = value.get(*key) {
+                // Provenance fields are scalar; arbitrary nested metadata is private.
+                if v.is_string() || v.is_number() {
+                    out.insert((*key).to_string(), v.clone());
+                }
+            }
+        }
+        Value::Object(out)
+    }
+    let source = match payload.metadata.get("source") {
+        Some(v @ Value::String(_)) => v.clone(),
+        Some(v @ Value::Object(_)) => select(v, &["kind", "ref", "captured_at"]),
+        _ => Value::Null,
+    };
+    let refs: Vec<Value> = payload.metadata.get("refs").and_then(Value::as_array)
+        .into_iter().flatten().map(|v| select(v, &["file", "path", "lines", "symbol"])).collect();
+    json!({"id": id, "content": payload.content, "memory_type": payload.memory_type,
+        "location": payload.location, "location_lines": payload.location_lines,
+        "source": source, "refs": refs})
+}
+
+async fn handle_review_correction(
+    arguments: &Value,
+    authenticated_principal: &str,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let error = |code: &str| json!({"ok": false, "error": code,
+        "errors": [code], "read_only": true, "incomplete": true,
+        "bounded_not_exhaustive": true,
+        "budget": {"native_candidates": 40, "vector_scan_rows": 400,
+            "lexical_scan_rows": 512, "lexical_candidates": 160, "max_output": 5,
+            "retrieval_budget_exhausted": null, "lexical_scan_exhausted": null,
+            "output_truncated": null}}).to_string();
+    for key in ["namespace", "id", "new_content", "changed_claim"] {
+        if arguments.get(key).and_then(Value::as_str).is_none_or(|s| s.trim().is_empty()) {
+            return error(&format!("non-empty {key} required"));
+        }
+    }
+    let namespace = resolve_namespace(&store, arguments["namespace"].as_str().unwrap()).await;
+    let id = arguments["id"].as_str().unwrap();
+    let principal = crate::rebac::resolve_principal(authenticated_principal,
+        arguments.get("principal").and_then(Value::as_str));
+    let old = match store.get(&namespace, id).await {
+        Ok(Some((_, p))) if crate::rebac::can_read_memory(&principal, &p.user_id, &p.metadata) => p,
+        Ok(_) => return error("source not found or not visible"),
+        Err(_) => return error("source read failed"),
+    };
+    let Some(lb) = VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() else {
+        return error("read-only native hybrid review unsupported by backend");
+    };
+    let query = arguments["changed_claim"].as_str().unwrap();
+    let vector = match emb.embed(query).await {
+        Ok(v) => v,
+        Err(_) => return error("changed-claim embedding failed"),
+    };
+    let (outcome, lexical_incomplete) = match lb.review_correction_search(&namespace, vector, query, &principal, id).await {
+        Ok(v) => v,
+        Err(_) => return error("read-only native hybrid retrieval failed"),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut candidates = Vec::new();
+    for hit in outcome.results.iter() {
+        let p = &hit.payload;
+        if hit.id == id || matches!(p.memory_type.as_str(), "task" | "structural" | "code_ast" | "doc_section")
+            || p.metadata.get("archived").and_then(Value::as_bool).unwrap_or(false)
+            || matches!(p.memory_type.as_str(), "directory" | "file" | "markdown" | "symbol"
+                | "freshness_flag" | "guard_event" | "community_summary" | "digital_twin"
+                | "digital_twin_schema" | "action_type" | "action_receipt")
+            || crate::store::ladybug::is_retired_at(&p.metadata, now)
+            || !crate::rebac::can_read_memory(&principal, &p.user_id, &p.metadata) {
+            continue;
+        }
+        let mut item = correction_review_memory(&hit.id, p);
+        item["review_not_obsolete"] = json!(true);
+        item["retrieval_evidence"] = json!({"distance": hit.score,
+            "method": "native_hybrid", "query": query,
+            "channels": hit.evidence.as_ref().into_iter().flatten()
+                .flat_map(|e| e.derivation.iter())
+                .filter(|s| matches!(s.as_str(), "vector" | "lexical" | "rrf"))
+                .collect::<std::collections::BTreeSet<_>>(),
+            "kinds": hit.evidence.as_ref().map(|e| e.iter().map(|e| &e.kind).collect::<Vec<_>>()).unwrap_or_default()});
+        candidates.push(item);
+    }
+    let output_truncated = candidates.len() > 5;
+    candidates.truncate(5);
+    json!({"ok": true, "read_only": true, "namespace": namespace,
+        "old_memory": correction_review_memory(id, &old),
+        "proposed_content": arguments["new_content"], "changed_claim": query,
+        "inheritance_summary": "Ordinary supersede replaces the complete content, inherits omitted metadata and code anchors, refreshes lineage/valid_from and resets access_count; scheduled future expiry carries over. Explicit source/pointer/location overrides replace inherited values. Opaque/private metadata is not displayed here. This review is not a write or a guarantee that supersede will accept the proposal.",
+        "candidates": candidates, "bounded_not_exhaustive": true,
+        "incomplete": outcome.incomplete || lexical_incomplete || output_truncated,
+        "budget": {"native_candidates": 40, "vector_scan_rows": 400,
+            "lexical_scan_rows": 512, "lexical_candidates": 160, "max_output": 5,
+            "retrieval_budget_exhausted": outcome.incomplete, "lexical_scan_exhausted": lexical_incomplete,
+            "output_truncated": output_truncated},
+        "errors": [],
+        "guidance": "Similarity is not proof of contradiction or obsolescence. Candidates require agent review, not retirement. Bounded retrieval is not exhaustive and does not deterministically check semantic truth. Inspect full memories/source/code anchors where needed; preserve unaffected clauses, exceptions and rationale in a full replacement. Then call supersede separately and explicitly; no automatic propagated retirement."}).to_string()
+}
+
 async fn handle_supersede_memory(
     arguments: Value,
     emb: Arc<dyn Embedder>,
@@ -12827,6 +12950,206 @@ mod tests {
             .to_string()
     }
 
+    #[tokio::test]
+    async fn review_correction_normal_mcp_is_read_only_and_preserves_compound_text() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let (_, mut old) = store.get("probe", &old_id).await.unwrap().unwrap();
+        old.content = format!("Timeout is 70 minutes. {} Keep backups unless storage is offline.", "Necessary context. ".repeat(180));
+        old.location = "src/client.rs".to_string();
+        old.metadata = json!({"access_count": 7, "source": {"kind": "doc", "ref": "docs/client.md", "private_note": "NEVER_EXPOSE_PRIVATE_METADATA"}, "refs": [{"file": "src/client.rs", "symbol": "send", "private_note": "NEVER_EXPOSE_PRIVATE_METADATA"}], "private_note": "NEVER_EXPOSE_PRIVATE_METADATA"});
+        store.upsert("probe", &old_id, vec![0.1; 4], old.clone()).await.unwrap();
+        let mut candidate = payload("Timeout is 70 minutes; retries remain three attempts.");
+        candidate.metadata = json!({"access_count": 11, "source": "docs/config.md"});
+        store.upsert("probe", "broader", vec![0.1; 4], candidate).await.unwrap();
+        let before = store.list("probe", None, None).await.unwrap();
+        let lb = VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>().unwrap();
+        let metrics_before = lb.metrics().list_keys("probe");
+        let writes_before = lb.write_attempts();
+        assert!(writes_before > 0, "write-attempt instrumentation covers fixture mutations");
+        let index_existed = lb.tantivy_index_dir().exists();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".NeuroStrata")).unwrap();
+        for name in ["active_session.json", "session_queries.json", "hook_log.jsonl"] {
+            std::fs::write(root.path().join(".NeuroStrata").join(name), "UNCHANGED").unwrap();
+        }
+        let proposed = old.content.replace("70 minutes", "60 minutes");
+        let request: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "neurostrata_review_correction", "arguments": {
+                    "namespace": "probe", "id": old_id, "new_content": proposed,
+                    "changed_claim": "Timeout minutes", "principal": "tester",
+                    "project_root": root.path().to_str().unwrap()
+                }
+            }
+        })).unwrap();
+        let (bus, seen) = recording_bus();
+        let response = process_mcp_request(request, Arc::new(StubEmbedder), store.clone(),
+            Arc::new(crate::ingest_jobs::IngestJobs::new()), None, bus).await;
+        assert_eq!(before.len(), store.list("probe", None, None).await.unwrap().len());
+        for row in before {
+            let (_, current) = store.get("probe", &row.id).await.unwrap().unwrap();
+            assert_eq!(serde_json::to_value(current).unwrap(), serde_json::to_value(row.payload).unwrap());
+        }
+        assert_eq!(metrics_before, lb.metrics().list_keys("probe"), "review must not queue metrics");
+        assert_eq!(writes_before, lb.write_attempts(), "review must not attempt store writes");
+        for name in ["active_session.json", "session_queries.json", "hook_log.jsonl"] {
+            assert_eq!(std::fs::read_to_string(root.path().join(".NeuroStrata").join(name)).unwrap(), "UNCHANGED");
+        }
+        assert_eq!(index_existed, lb.tantivy_index_dir().exists(), "review must not create persistent caches");
+        assert!(seen.lock().unwrap().is_empty(), "review must not emit mutation events");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let review: Value = serde_json::from_str(text).expect("new read-only tool returns review JSON, not unsupported-tool text");
+        assert_eq!(review["ok"], true, "{review}");
+        assert_eq!(review["old_memory"]["content"], old.content);
+        assert_eq!(review["proposed_content"], proposed);
+        assert_eq!(review["old_memory"]["location"], "src/client.rs");
+        assert!(!text.contains("NEVER_EXPOSE_PRIVATE_METADATA"));
+        assert!(review["candidates"].as_array().unwrap().len() <= 5);
+        assert!(review["candidates"].as_array().unwrap().iter().any(|c| c["id"] == "broader"));
+        assert!(review["guidance"].as_str().unwrap().contains("not proof"));
+        assert!(store.get("probe", &old_id).await.unwrap().unwrap().1.metadata.get("valid_to").is_none());
+    }
+
+    #[tokio::test]
+    async fn review_correction_filters_acl_namespace_history_tasks_and_structural() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        for (id, kind, meta) in [
+            ("allowed", "rule", json!({"visible_to": [{"principal": "reviewer", "role": "viewer"}]})),
+            ("private", "rule", json!({"visible_to": ["someone-else"]})),
+            ("malformed-acl", "rule", json!({"visible_to": [42]})),
+            ("expired", "rule", json!({"valid_to": 1})),
+            ("malformed-expiry", "rule", json!({"valid_to": "yesterday"})),
+            ("archived", "rule", json!({"archived": true})),
+            ("task", "task", json!({})),
+            ("structural", "structural", json!({})),
+            ("file", "file", json!({})),
+            ("symbol", "symbol", json!({})),
+            ("ast", "code_ast", json!({})),
+            ("document", "doc_section", json!({})),
+        ] {
+            let mut p = payload("Timeout minutes. Keep unaffected retries and offline exception.");
+            p.memory_type = kind.to_string();
+            p.metadata = meta;
+            store.upsert("probe", id, vec![0.1; 4], p).await.unwrap();
+        }
+        store.init("other").await.unwrap();
+        store.upsert("other", "other-namespace", vec![0.1; 4], payload("Timeout minutes")).await.unwrap();
+        // A non-admin caller cannot escalate to admin through the argument.
+        let text = handle_review_correction(&json!({"namespace": "probe", "id": old_id,
+            "new_content": "Timeout 60 minutes; keep other clauses.", "changed_claim": "Timeout minutes",
+            "principal": "admin"}), "reviewer", Arc::new(StubEmbedder), store).await;
+        let review: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(review["ok"], true, "{review}");
+        let ids: Vec<&str> = review["candidates"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["allowed"], "{review}");
+    }
+
+    #[tokio::test]
+    async fn review_correction_empty_missing_denied_and_budget_are_explicit() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let args = json!({"namespace": "probe", "id": old_id,
+            "new_content": "Corrected wording", "changed_claim": "Timeout minutes"});
+        for key in ["namespace", "id", "new_content", "changed_claim"] {
+            for value in [Value::Null, json!("  ")] {
+                let mut invalid = args.clone();
+                invalid[key] = value;
+                let text = handle_review_correction(&invalid, "tester", Arc::new(StubEmbedder), store.clone()).await;
+                let review: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(review["ok"], false);
+                assert!(review["error"].as_str().unwrap().contains(key));
+                assert_eq!(review["incomplete"], true);
+            }
+        }
+        let mut missing = args.clone();
+        missing["id"] = json!("absent");
+        let text = handle_review_correction(&missing, "tester", Arc::new(StubEmbedder), store.clone()).await;
+        assert!(text.contains("source not found or not visible"));
+        let empty: Value = serde_json::from_str(&handle_review_correction(&args, "tester",
+            Arc::new(StubEmbedder), store.clone()).await).unwrap();
+        assert_eq!(empty["ok"], true);
+        assert_eq!(empty["candidates"], json!([]));
+        assert_eq!(empty["bounded_not_exhaustive"], true);
+        for n in 0..8 {
+            let mut p = payload(&format!("Timeout minutes. {} End of full candidate.", "Necessary rationale and exceptions. ".repeat(100)));
+            p.location = "src/client.rs".to_string();
+            p.location_lines = "10-20".to_string();
+            p.metadata = json!({"source": {"kind": "doc", "ref": "docs/client.md", "private": "DO_NOT_SHOW"},
+                "refs": [{"file": "src/client.rs", "symbol": "send", "lines": "10-20", "private": "DO_NOT_SHOW"}]});
+            store.upsert("probe", &format!("candidate-{n}"), vec![0.1; 4], p).await.unwrap();
+        }
+        let text = handle_review_correction(&args, "tester", Arc::new(StubEmbedder), store.clone()).await;
+        let review: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(review["candidates"].as_array().unwrap().len(), 5);
+        assert_eq!(review["incomplete"], true);
+        assert_eq!(review["budget"]["output_truncated"], true);
+        assert!(!text.contains("DO_NOT_SHOW"));
+        for c in review["candidates"].as_array().unwrap() {
+            let (_, p) = store.get("probe", c["id"].as_str().unwrap()).await.unwrap().unwrap();
+            assert_eq!(c["content"], p.content);
+            assert_eq!(c["location_lines"], "10-20");
+            assert_eq!(c["refs"][0]["symbol"], "send");
+            assert_eq!(c["source"]["ref"], "docs/client.md");
+        }
+        let (_, mut old) = store.get("probe", &old_id).await.unwrap().unwrap();
+        old.metadata = json!({"visible_to": ["owner-only"]});
+        store.upsert("probe", &old_id, vec![0.1; 4], old).await.unwrap();
+        let denied = handle_review_correction(&args, "reviewer", Arc::new(StubEmbedder), store).await;
+        assert!(denied.contains("source not found or not visible"));
+        assert!(!denied.contains("always use podman"));
+    }
+
+    #[tokio::test]
+    async fn review_correction_reports_native_and_lexical_budget_exhaustion() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        for n in 0..512 {
+            store.upsert("probe", &format!("candidate-{n:04}"), vec![0.1; 4],
+                payload("Timeout minutes; keep retries unless offline.")).await.unwrap();
+        }
+        let lb = VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>().unwrap();
+        let writes = lb.write_attempts();
+        let text = handle_review_correction(&json!({"namespace": "probe", "id": old_id,
+            "new_content": "Timeout 60 minutes; keep retries unless offline.",
+            "changed_claim": "Timeout minutes"}), "tester", Arc::new(StubEmbedder), store.clone()).await;
+        let review: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(review["ok"], true, "{review}");
+        assert_eq!(review["incomplete"], true);
+        assert_eq!(review["budget"]["retrieval_budget_exhausted"], true);
+        assert_eq!(review["budget"]["lexical_scan_exhausted"], true);
+        assert_eq!(review["candidates"].as_array().unwrap().len(), 5);
+        assert_eq!(writes, lb.write_attempts());
+    }
+
+    #[tokio::test]
+    async fn review_correction_errors_are_read_only_and_not_empty_successes() {
+        struct UnavailableEmbedder;
+        #[async_trait::async_trait]
+        impl Embedder for UnavailableEmbedder {
+            async fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+                anyhow::bail!("private provider diagnostic must not escape")
+            }
+            fn dimensions(&self) -> usize { 4 }
+        }
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let lb = VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>().unwrap();
+        let writes = lb.write_attempts();
+        let args = json!({"namespace": "probe", "id": old_id,
+            "new_content": "Corrected wording", "changed_claim": "Timeout minutes"});
+        let text = handle_review_correction(&args, "tester", Arc::new(UnavailableEmbedder), store.clone()).await;
+        let review: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(review["ok"], false);
+        assert_eq!(review["error"], "changed-claim embedding failed");
+        assert_eq!(review["incomplete"], true);
+        assert_eq!(review["read_only"], true);
+        assert_eq!(review["budget"]["max_output"], 5);
+        assert_eq!(review["budget"]["retrieval_budget_exhausted"], Value::Null);
+        assert!(!text.contains("private provider"));
+        let failed: Value = serde_json::from_str(&handle_review_correction(&args, "tester",
+            Arc::new(WrongWidthEmbedder), store.clone()).await).unwrap();
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["error"], "read-only native hybrid retrieval failed");
+        assert_eq!(writes, lb.write_attempts());
+    }
+
     /// The bi-temporal contract: the old wording survives, stamped with the
     /// moment it stopped being true, and the correction is a separate row.
     #[tokio::test]
@@ -14863,6 +15186,7 @@ mod tests {
                 "neurostrata_find_duplicate_candidates",
                 "neurostrata_memories_for_file",
                 "neurostrata_related",
+                "neurostrata_review_correction",
                 "neurostrata_supersede_memory",
                 "neurostrata_procedure_perform",
                 "neurostrata_task_create",
@@ -14934,6 +15258,11 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "neurostrata_supersede_memory")
             .expect("the correction tool is exposed");
+        let review = tools.iter().find(|t| t["name"] == "neurostrata_review_correction")
+            .expect("read-only review is discoverable separately from supersede");
+        assert_eq!(review["inputSchema"]["required"], json!(["namespace", "id", "new_content", "changed_claim"]));
+        assert!(review["description"].as_str().unwrap().contains("Read-only"));
+        assert!(supersede["description"].as_str().unwrap().contains("neurostrata_review_correction"));
         assert!(
             supersede["inputSchema"]["properties"]["reason"].is_object(),
             "supersede takes a reason"
