@@ -568,7 +568,7 @@ describe("resolveActiveTaskFromDaemon", () => {
     assert.equal(res.promptInjection, null);
   });
 
-  it("queries task_list, caches task/session/injection, and re-resolves when daemon changes", async () => {
+  it("queries task_list for identity but omits unrefreshed claim-time prose", async () => {
     const { server, url, counters } = await createMockDaemonServer({ returnTask: [{ id: "task-d1", session_id: "sess-d1", status: "in_progress", subagent_prompt_injection: "### Injected daemon context" }] });
     try {
       const ctx = {
@@ -580,9 +580,9 @@ describe("resolveActiveTaskFromDaemon", () => {
       const res = await resolveActiveTaskFromDaemon("ns");
       assert.equal(res.taskId, "task-d1");
       assert.equal(res.sessionId, "sess-d1");
-      assert.equal(res.promptInjection, "### Injected daemon context");
-      assert.equal(cachedTaskInjection.get("task-d1"), "### Injected daemon context");
-      // Second call re-queries (function always queries) but cache holds the injection.
+      assert.equal(res.promptInjection, null);
+      assert.equal(cachedTaskInjection.get("task-d1"), null);
+      // Identity remains available, but old prose is not evidence of currency.
       assert.equal(counters.taskList, 1);
     } finally {
       server.close();
@@ -709,7 +709,7 @@ describe("enrichAndInjectSubagentPrompt", () => {
     }
   });
 
-  it("uses cached injection without re-resolving when task id given", async () => {
+  it("revalidates instead of replaying cached injection when task id given", async () => {
     const { server, url, counters } = await createMockDaemonServer({
       returnTask: [{ id: "task-c", session_id: "sess-c", status: "in_progress", subagent_prompt_injection: "### Cached injection" }],
     });
@@ -719,13 +719,13 @@ describe("enrichAndInjectSubagentPrompt", () => {
       await initialize(ctx);
       // Prime the cache via resolveActiveTaskFromDaemon.
       await resolveActiveTaskFromDaemon("ns");
+      cachedTaskInjection.set("task-c", "### Cached injection");
       const callsBefore = counters.taskList;
       const target = { prompt: "hello" };
       const changed = await enrichAndInjectSubagentPrompt(target, "ns", "task-c");
       assert.equal(changed, true);
-      assert.ok(target.prompt.includes("### Cached injection"));
-      // enrich with a known taskId does NOT call task_list again (uses cache).
-      assert.equal(counters.taskList, callsBefore);
+      assert.ok(!target.prompt.includes("### Cached injection"));
+      assert.equal(counters.taskList, callsBefore + 1);
     } finally {
       server.close();
       resetModuleState();
@@ -1470,7 +1470,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
     assert.equal(res.note, "checkpoint");
   });
 
-  it("enrichAndInjectSubagentPrompt resolves daemon injection on cache miss after native claim and preserves file recall across parent and children", async () => {
+  it("enrichAndInjectSubagentPrompt omits unrefreshed claim prose and preserves file recall across parent and children", async () => {
     const { server, url, counters } = await createMockDaemonServer({
       returnTask: [
         {
@@ -1516,12 +1516,12 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
         "beforeToolExec routes read through file-touch recall",
       );
 
-      // 3. First child subagent mentions src/shared.rs -> gets both daemon injection AND src/shared.rs memories
+      // 3. First child gets current file recall, not unrefreshed claim prose.
       const child1 = { prompt: "Inspect src/shared.rs" };
       await beforeExecFn({ name: "subagent", input: child1 });
       assert.ok(
-        child1.prompt.includes("### Native claimed daemon injection"),
-        "fetches and injects daemon prompt injection on cache miss",
+        !child1.prompt.includes("### Native claimed daemon injection"),
+        "task_list claim-time prose cannot establish currency",
       );
       assert.ok(
         child1.prompt.includes("mem-rule-1"),
@@ -1774,8 +1774,9 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
       };
       await initialize(ctx);
 
-      // Prime the cache via resolveActiveTaskFromDaemon
+      // Prime a historical cache entry to test native invalidation directly.
       await resolveActiveTaskFromDaemon("r6-ns");
+      cachedTaskInjection.set("task-update-title", "### Original daemon injection");
       assert.equal(cachedTaskInjection.get("task-update-title"), "### Original daemon injection");
 
       // Execute native task_update with title (should invalidate cache)
@@ -1808,11 +1809,10 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
         };
         await initialize(ctx2);
 
-        // Provide task id so enrich uses cachedTaskInjection
+        // Even changed task_list prose needs freshly persisted context.
         const target = { prompt: "Do something" };
         await enrichAndInjectSubagentPrompt(target, "r6-ns", "task-update-title");
-        // Should have used the new injection since cache was invalidated
-        assert.ok(target.prompt.includes("### Updated daemon injection"), "next subagent call re-fetches updated prompt");
+        assert.ok(!target.prompt.includes("### Updated daemon injection"), "unrefreshed task_list prose stays omitted");
       } finally {
         server2.close();
         resetModuleState();
@@ -2208,7 +2208,7 @@ describe("round-9: denied edit restores prefetch dedup state", () => {
 });
 
 describe("round-9: CLI hook runners flush stdout before exiting", () => {
-  it("awaits the stdout write before process.exit(0)", () => {
+  it("awaits the stdout write before exiting or returning", () => {
     const sources = [
       "../claude/cli-hook.mjs",
       "../codex/cli-hook.mjs",
@@ -2227,8 +2227,8 @@ describe("round-9: CLI hook runners flush stdout before exiting", () => {
       );
       const after = src.slice(idx + marker.length);
       assert.ok(
-        /^\s*process\.exit\(0\);/.test(after),
-        `${rel}: process.exit(0) must directly follow the awaited write`,
+        /^\s*(?:process\.exit\(0\)|return);/.test(after),
+        `${rel}: completion must directly follow the awaited write`,
       );
       assert.ok(
         src.includes("const writeStdout = (text) =>"),

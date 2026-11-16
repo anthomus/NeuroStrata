@@ -22,21 +22,21 @@ async function main() {
   try {
     raw = readFileSync(0, "utf8");
   } catch {
-    process.exit(0);
+    return;
   }
-  if (!raw.trim()) process.exit(0);
+  if (!raw.trim()) return;
   let event;
   try {
     event = JSON.parse(raw);
   } catch {
-    process.exit(0);
+    return;
   }
   await initialize({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
   const handler = plugin.handleHookEvent ?? plugin.handleClaudeHookEvent ?? plugin;
   if (typeof handler === "function") {
     const out = await handler(event);
     await writeStdout(JSON.stringify(out));
-    process.exit(0);
+    return;
   }
   if (event.hook_event_name === "Stop" && typeof event.transcript === "string") {
     await onTurnEnd({ role: "assistant", content: event.transcript });

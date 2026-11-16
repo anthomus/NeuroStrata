@@ -38,25 +38,32 @@ Register the plugin on Claude Code hook events:
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "node /path/to/@neurostrata/claude-plugin/cli-hook.mjs",
+          "timeout": 30
+        }]
+      }
+    ],
     "PreToolUse": [
       {
-        "matcher": "",
-        "command": "node /path/to/@neurostrata/claude-plugin/dist/index.js handle-claude-hook-event",
-        "timeout": 30
+        "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
+        "hooks": [{
+          "type": "command",
+          "command": "node /path/to/@neurostrata/claude-plugin/cli-hook.mjs",
+          "timeout": 30
+        }]
       }
     ],
     "Stop": [
       {
-        "matcher": "",
-        "command": "node /path/to/@neurostrata/claude-plugin/dist/index.js handle-claude-hook-event",
-        "timeout": 30
-      }
-    ],
-    "SubagentStop": [
-      {
-        "matcher": "",
-        "command": "node /path/to/@neurostrata/claude-plugin/dist/index.js handle-claude-hook-event",
-        "timeout": 30
+        "hooks": [{
+          "type": "command",
+          "command": "node /path/to/@neurostrata/claude-plugin/cli-hook.mjs",
+          "timeout": 30
+        }]
       }
     ]
   }
@@ -68,6 +75,22 @@ stdin. The plugin reads it, processes it, and returns JSON on stdout with
 `hookSpecificOutput`.
 
 ## Behavior by hook event
+
+### SessionStart
+
+Refreshes the snapshot before injecting the current task/rules baseline through
+`hookSpecificOutput.additionalContext`. Includes startup, resume and
+`source: "compact"` (after compaction); no matcher is needed. `PreCompact` does
+not inject prose that the host could discard during compaction.
+
+Requires a newly persisted, matching-namespace `context_revision`; unavailable
+refresh, unchanged persistence or older daemons omit cached recall without
+blocking the session. Host-provided context remains intact. Subagent task context
+is refreshed too: claim-time prose from `task_list` is not replayed.
+
+Contract: [Claude Code hooks reference](https://code.claude.com/docs/en/hooks#sessionstart).
+The installer registers the same CLI runner on `SessionStart`; existing custom
+runner commands remain user-owned. This does not upgrade an installed custom copy.
 
 ### PreToolUse
 

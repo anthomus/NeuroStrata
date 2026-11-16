@@ -53,14 +53,14 @@ async function main() {
   try {
     raw = readFileSync(0, "utf8");
   } catch {
-    process.exit(0);
+    return;
   }
-  if (!raw.trim()) process.exit(0);
+  if (!raw.trim()) return;
   let event;
   try {
     event = JSON.parse(raw);
   } catch {
-    process.exit(0);
+    return;
   }
   const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
   if (typeof init === "function") {
@@ -74,7 +74,7 @@ async function main() {
   if (typeof handler === "function") {
     const out = await handler(event);
     await writeStdout(JSON.stringify(out));
-    process.exit(0);
+    return;
   }
   if (event.hook_event_name === "Stop" && typeof event.transcript === "string") {
     const turnEnd = mod.onTurnEnd ?? plugin?.onTurnEnd;
@@ -680,6 +680,26 @@ fn wire_harness_config(
                                     "hooks": [{ "type": "command", "command": cmd.clone() }]
                                 }])
                             });
+                            // Add lifecycle wiring alongside unrelated user hooks.
+                            // A custom CLI runner remains user-owned, as below.
+                            let starts = h_obj.entry("SessionStart").or_insert_with(|| json!([]));
+                            if let Some(entries) = starts.as_array_mut() {
+                                let has_runner = entries.iter().any(|entry| {
+                                    entry["hooks"].as_array().is_some_and(|hooks| {
+                                        hooks.iter().any(|hook| {
+                                            hook["command"].as_str().is_some_and(|command| {
+                                                command.starts_with(&format!("NEUROSTRATA_NAMESPACE={namespace} node \""))
+                                                    && command.contains("cli-hook.mjs\"")
+                                            })
+                                        })
+                                    })
+                                });
+                                if !has_runner {
+                                    entries.push(json!({
+                                        "hooks": [{ "type": "command", "command": cmd.clone() }]
+                                    }));
+                                }
+                            }
                             // Repair commands written by an older installer that
                             // embedded a Windows verbatim path. Only rewrite our
                             // own hook commands; user hooks, including ones that
@@ -778,6 +798,68 @@ fn wire_harness_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_lifecycle_wiring_registers_all_session_start_sources_on_fresh_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        wire_harness_config(tmp.path(), "example-project", "claude", true,
+            "unused-dist", "/installer/cli-hook.mjs");
+        let cfg = tmp.path().join(".claude/settings.local.json");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let starts = doc["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert!(starts[0].get("matcher").is_none());
+        assert_eq!(starts[0]["hooks"][0]["type"], "command");
+        assert_eq!(starts[0]["hooks"][0]["command"],
+            "NEUROSTRATA_NAMESPACE=example-project node \"/installer/cli-hook.mjs\"");
+        assert!(doc["hooks"].get("PreCompact").is_none());
+    }
+
+    #[test]
+    fn claude_lifecycle_wiring_adds_session_start_without_changing_user_hooks() {
+        // Only the local wiring function: no auto-install, HOME or global config.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = tmp.path().join(".claude/settings.local.json");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        let user = json!({ "matcher": "startup", "hooks": [{
+            "type": "command", "command": "echo user-context"
+        }] });
+        std::fs::write(&cfg, json!({ "hooks": {
+            "SessionStart": [user.clone()], "PreCompact": [user.clone()]
+        }, "userSetting": true }).to_string()).unwrap();
+        let runner = tmp.path().join("cli-hook.mjs");
+        std::fs::write(&runner, CLI_HOOK_RUNNER_MJS).unwrap();
+        let runner = plain_abs_path(&runner);
+        for _ in 0..2 {
+            wire_harness_config(tmp.path(), "example-project", "claude", true,
+                "unused-dist", &runner);
+        }
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let starts = doc["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(starts.len(), 2, "idempotent lifecycle wiring");
+        assert_eq!(starts[0], user);
+        assert_eq!(doc["hooks"]["PreCompact"], json!([user]));
+        assert_eq!(doc["userSetting"], true);
+        assert!(starts[1].get("matcher").is_none(), "all SessionStart sources, including compact");
+        assert_eq!(starts[1]["hooks"][0]["command"],
+            format!("NEUROSTRATA_NAMESPACE=example-project node \"{runner}\""));
+    }
+
+    #[test]
+    fn claude_lifecycle_wiring_preserves_custom_session_runner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = tmp.path().join(".claude/settings.local.json");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        let custom = tmp.path().join("custom/cli-hook.mjs");
+        std::fs::create_dir_all(custom.parent().unwrap()).unwrap();
+        std::fs::write(&custom, "// user-owned runner").unwrap();
+        let original = settings_with_runner(&plain_abs_path(&custom));
+        std::fs::write(&cfg, original.to_string()).unwrap();
+        wire_harness_config(tmp.path(), "TestProj", "claude", true,
+            "unused-dist", "/installer/cli-hook.mjs");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(doc["hooks"]["SessionStart"], original["hooks"]["SessionStart"]);
+    }
 
     #[test]
     fn auto_install_detected_plugins_writes_bundles_and_wires_explicit_harness() {

@@ -1232,9 +1232,6 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
                 continue;
             const rec = item;
             const recId = asString(rec.id);
-            if (recId) {
-                cachedTaskInjection.set(recId, asString(rec.subagent_prompt_injection) ?? null);
-            }
             if (preferredTaskId && recId === preferredTaskId) {
                 target = rec;
                 break;
@@ -1251,7 +1248,10 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
             const sessionId = asString(target.session_id) ??
                 asString(target.claim?.session_id) ??
                 null;
-            const promptInjection = asString(target.subagent_prompt_injection) ?? null;
+            // task_list contains claim-time prose, not current memory evidence.
+            const fresh = await refreshActiveSession({ ...config, namespace });
+            const promptInjection = fresh && asString(fresh.task_id) === taskId
+                ? asString(fresh.subagent_prompt_injection) ?? null : null;
             if (taskId) {
                 if (!preferredTaskId || taskId === preferredTaskId) {
                     activeTaskId = taskId;
@@ -1259,13 +1259,10 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
                 }
                 cachedTaskInjection.set(taskId, promptInjection);
             }
-            if (preferredTaskId && !cachedTaskInjection.has(preferredTaskId)) {
-                cachedTaskInjection.set(preferredTaskId, promptInjection);
-            }
             return {
                 taskId: preferredTaskId ?? taskId ?? null,
                 sessionId: sessionId ?? activeSessionId,
-                promptInjection: preferredTaskId ? (cachedTaskInjection.get(preferredTaskId) ?? promptInjection) : promptInjection,
+                promptInjection: !preferredTaskId || preferredTaskId === taskId ? promptInjection : null,
             };
         }
         if (preferredTaskId && !cachedTaskInjection.has(preferredTaskId)) {
@@ -1286,20 +1283,12 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
     if (typeof target.prompt !== "string" || target.prompt.includes(SUBAGENT_CONTEXT_MARKER)) {
         return false;
     }
-    let effectiveTaskId = taskId ?? null;
-    let injection = null;
-    if (!effectiveTaskId) {
-        const resolved = await resolveActiveTaskFromDaemon(namespace);
-        effectiveTaskId = resolved.taskId;
-        injection = resolved.promptInjection;
-    }
-    else if (!cachedTaskInjection.has(effectiveTaskId)) {
-        const resolved = await resolveActiveTaskFromDaemon(namespace, effectiveTaskId);
-        injection = cachedTaskInjection.get(effectiveTaskId) ?? resolved.promptInjection ?? null;
-    }
-    else {
-        injection = cachedTaskInjection.get(effectiveTaskId) ?? null;
-    }
+    // A cached claim or previous dispatch cannot certify current memory lifecycle.
+    cachedTaskInjection.clear();
+    subagentFileRecallCache.clear();
+    const resolved = await resolveActiveTaskFromDaemon(namespace, taskId);
+    const effectiveTaskId = taskId ?? resolved.taskId;
+    const injection = resolved.promptInjection;
     const extraLines = [];
     if (injection)
         extraLines.push(injection);
@@ -1459,17 +1448,9 @@ export function resetSessionEpoch(sessionId) {
 export function resetAllSessionEpochs() {
     sessionEpochs.clear();
 }
-/**
- * Refresh the snapshot before injecting its session baseline once per epoch.
- * Unavailable refresh or unchanged persistence leaves host context untouched;
- * cached prose is not proof that its memories remain current.
- */
-export async function sessionContextHandler(event, config) {
-    const sessionId = asString(event?.sessionID ?? event?.session_id);
-    const st = sessionEpochState(sessionId);
+/** Return only newly persisted recall, never claim-time or offline cache prose. */
+async function refreshActiveSession(config) {
     const projectRoot = effectiveProjectRoot(config);
-    if (st.baselineInjectedEpoch === st.epoch)
-        return;
     // Long-lived adapters must not reintroduce old recall through a later
     // subagent dispatch, even if this epoch's refresh fails.
     cachedTaskInjection.clear();
@@ -1495,7 +1476,7 @@ export async function sessionContextHandler(event, config) {
         });
     }
     catch {
-        return;
+        return null;
     }
     if (existsSync(sessionPath)) {
         try {
@@ -1507,6 +1488,21 @@ export async function sessionContextHandler(event, config) {
     }
     if (!active || asString(active.namespace)?.toLowerCase() !== config.namespace.toLowerCase() ||
         !asString(active.context_revision) || active.context_revision === previousRevision)
+        return null;
+    return active;
+}
+/**
+ * Refresh the snapshot before injecting its session baseline once per epoch.
+ * Unavailable refresh or unchanged persistence leaves host context untouched;
+ * cached prose is not proof that its memories remain current.
+ */
+export async function sessionContextHandler(event, config) {
+    const sessionId = asString(event?.sessionID ?? event?.session_id);
+    const st = sessionEpochState(sessionId);
+    if (st.baselineInjectedEpoch === st.epoch)
+        return;
+    const active = await refreshActiveSession(config);
+    if (!active)
         return;
     const taskId = asString(active?.task_id);
     const goldenRules = Array.isArray(active?.golden_rules)
@@ -2122,6 +2118,20 @@ export async function handleHookEvent(event) {
     const toolNameRaw = asString(event.tool_name) ?? asString(event.toolName) ?? "";
     const toolInputRaw = event.tool_input ?? event.input ?? event.args ?? {};
     const toolInput = firstRecord(toolInputRaw);
+    if (hookEventName === "SessionStart") {
+        // Claude fires SessionStart(source=compact) after compaction. PreCompact
+        // prose would be discarded; reuse the same refreshed baseline as OpenCode.
+        await sessionCompactionHandler(event, config);
+        const contextEvent = { ...event };
+        await sessionContextHandler(contextEvent, config);
+        return { continue: true, hookSpecificOutput: {
+                hookEventName,
+                ...(typeof contextEvent.additionalContext === "string"
+                    ? { additionalContext: contextEvent.additionalContext } : {}),
+            } };
+    }
+    if (hookEventName === "PreCompact")
+        return { continue: true };
     if (hookEventName === "PreToolUse") {
         // Track native task mutation tools (claim/update/complete) for state bookkeeping.
         trackNativeTaskToolCall(toolNameRaw, firstRecord(toolInput), asRecord(event));
