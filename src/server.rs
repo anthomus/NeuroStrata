@@ -4437,11 +4437,18 @@ async fn handle_get_snapshot(
                         == Some("in_progress")
             })
             .map(|m| (m.id.as_str(), &m.payload));
+        let fresh_task = match active_task {
+            Some((id, payload)) => Some((
+                id.to_string(),
+                crate::task::task_payload_with_fresh_context(&store, namespace, id, payload).await,
+            )),
+            None => None,
+        };
         crate::task::persist_active_session_file(
             std::path::Path::new(root_str),
             namespace,
             &golden_rules,
-            active_task,
+            fresh_task.as_ref().map(|(id, payload)| (id.as_str(), payload)),
         );
     }
     // F10: detect conflicts AFTER active-row filtering (valid_to, archived,
@@ -12707,6 +12714,107 @@ mod tests {
             .unwrap()
             .expect("still there");
         assert_eq!(kept.content, "Path: src/a.rs", "and unchanged");
+    }
+
+    async fn cached_retirement_snapshot_case(retirement: &str) {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let (_, mut live) = store.get("probe", &old_id).await.unwrap().unwrap();
+        live.metadata["pinned"] = json!(true);
+        store.upsert("probe", &old_id, vec![0.1; 4], live.clone()).await.unwrap();
+        let mut unaffected = live.clone();
+        unaffected.content = "Keep the unaffected deployment backup.".to_string();
+        store.upsert("probe", "unaffected", vec![0.1; 4], unaffected).await.unwrap();
+        let mut task = payload("Fix deployment");
+        task.memory_type = "task".to_string();
+        task.metadata = json!({"task": {"status": "in_progress", "session_id": "session-cache"}});
+        let (_, cached) = crate::task::build_task_graph_context(
+            &store, "probe", "cache-task", &[0.1; 4], &task,
+        ).await;
+        assert!(cached.contains(&old_id), "claim-time precondition: {cached}");
+        task.metadata["task"]["subagent_prompt_injection"] = json!(cached);
+        store.upsert("probe", "cache-task", vec![0.1; 4], task).await.unwrap();
+        match retirement {
+            "archive" => {
+                crate::handlers::archive_memory::handle_archive_memory(
+                    json!({"namespace": "probe", "id": old_id}), store.clone(), quiet_bus(),
+                ).await;
+            }
+            "supersede" => {
+                let reply = handle_supersede_memory(
+                    json!({"namespace": "probe", "id": old_id, "content": "Use the current deployment script."}),
+                    emb, store.clone(), quiet_bus(),
+                ).await;
+                assert!(reply.starts_with("Superseded"), "{reply}");
+            }
+            _ => {
+                live.metadata["valid_to"] = json!(chrono::Utc::now().timestamp() - 1);
+                store.upsert("probe", &old_id, vec![0.1; 4], live).await.unwrap();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".NeuroStrata")).unwrap();
+        std::fs::write(root.path().join(".NeuroStrata/active_session.json"), json!({
+            "host_context": "keep unrelated host state",
+            "conceptual_bridges": [{"target_id": old_id, "target_summary": "retired bridge prose"}]
+        }).to_string()).unwrap();
+        let request: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "neurostrata_get_snapshot",
+                "arguments": {"namespace": "probe", "project_root": root.path()}
+            }
+        })).unwrap();
+        let response = process_mcp_request(
+            request, Arc::new(StubEmbedder), store.clone(),
+            Arc::new(crate::ingest_jobs::IngestJobs::new()), None, quiet_bus(),
+        ).await;
+        assert!(response.get("error").is_none(), "snapshot RPC failed: {response}");
+        let session: Value = serde_json::from_str(&std::fs::read_to_string(
+            root.path().join(".NeuroStrata/active_session.json")
+        ).unwrap()).unwrap();
+        let block = session["subagent_prompt_injection"].as_str().unwrap();
+        assert!(!block.contains(&old_id), "{retirement}: cached retired row injected: {block}");
+        assert!(block.contains("unaffected"), "unaffected live context lost: {block}");
+        if retirement == "supersede" {
+            assert!(block.contains("Use the current deployment script."), "live successor lost: {block}");
+        }
+        assert!(!session.to_string().contains("retired bridge prose"));
+        assert_eq!(session["host_context"], "keep unrelated host state");
+        assert!(store.get("probe", &old_id).await.unwrap().is_some(), "history remains readable");
+    }
+
+    #[tokio::test]
+    async fn correction_cache_snapshot_revalidates_archived_rules() {
+        cached_retirement_snapshot_case("archive").await;
+    }
+
+    #[tokio::test]
+    async fn correction_cache_snapshot_revalidates_superseded_rules() {
+        cached_retirement_snapshot_case("supersede").await;
+    }
+
+    #[tokio::test]
+    async fn correction_cache_snapshot_revalidates_expired_rules() {
+        cached_retirement_snapshot_case("expire").await;
+    }
+
+    #[tokio::test]
+    async fn correction_cache_snapshot_clears_finished_task() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let root = tempfile::tempdir().unwrap();
+        let mut task = payload("Finished deployment");
+        task.memory_type = "task".to_string();
+        task.metadata = json!({"task": {"status": "in_progress", "session_id": "old-session", "subagent_prompt_injection": "OLD CACHED CONTEXT"}});
+        crate::task::persist_active_session_file(root.path(), "probe", &[], Some(("finished", &task)));
+        handle_get_snapshot(json!({"namespace": "probe", "project_root": root.path()}), store).await.unwrap();
+        let session: Value = serde_json::from_str(&std::fs::read_to_string(
+            root.path().join(".NeuroStrata/active_session.json")
+        ).unwrap()).unwrap();
+        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+            assert!(session.get(key).is_none(), "stale {key}: {session}");
+        }
+        assert_eq!(session["namespace"], "probe");
+        assert!(session["golden_rules"].is_array());
     }
 
     fn new_id_from(message: &str) -> String {

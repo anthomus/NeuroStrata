@@ -333,10 +333,9 @@ export declare function sessionSeenFiles(sessionId: string | null | undefined): 
 export declare function resetSessionEpoch(sessionId: string | null | undefined): void;
 export declare function resetAllSessionEpochs(): void;
 /**
- * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
- * from the project root; when an active task exists and its baseline has not
- * been injected this epoch, injects `[NeuroStrata Active Context] ...` once.
- * Same-epoch repeat calls leave the event untouched.
+ * Refresh the snapshot before injecting its session baseline once per epoch.
+ * Unavailable refresh or unchanged persistence leaves host context untouched;
+ * cached prose is not proof that its memories remain current.
  */
 export declare function sessionContextHandler(event: any, config: ResolvedConfig): Promise<void>;
 /**

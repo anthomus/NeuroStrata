@@ -498,7 +498,7 @@ test("opencode default export handleHookEvent and handleClaudeHookEvent are alia
   assert.ok(target2.prompt.includes("### NeuroStrata Task & Graph Context"));
 });
 
-test("OpenCode V2 execute.after mutates event.result.content and registers session.hook context/compaction", async () => {
+test("OpenCode V2 hooks register and omit an unvalidated offline baseline", async () => {
   const tmpDir = mkdtempSync(join(tmpdir(), "ns-oc2-v226-"));
   const nsDir = join(tmpDir, ".NeuroStrata");
   mkdirSync(nsDir, { recursive: true });
@@ -524,6 +524,7 @@ test("OpenCode V2 execute.after mutates event.result.content and registers sessi
   const sessionHooks = new Map();
   const toolHooks = new Map();
   const ctx = {
+    config: { namespace: "probe", endpoint: "http://127.0.0.1:1/mcp" },
     location: {
       directory: tmpDir,
       project: { root: tmpDir, canonical: tmpDir },
@@ -561,8 +562,7 @@ test("OpenCode V2 execute.after mutates event.result.content and registers sessi
 
   const ctxEvent1 = { sessionID: "ses_v226", messages: [] };
   await sessionHooks.get("context")(ctxEvent1);
-  assert.equal(typeof ctxEvent1.additionalContext, "string");
-  assert.match(ctxEvent1.additionalContext, /neurostrata-a1si/);
+  assert.equal(ctxEvent1.additionalContext, undefined);
 
   const ctxEvent2 = { sessionID: "ses_v226", messages: [] };
   await sessionHooks.get("context")(ctxEvent2);
@@ -571,7 +571,7 @@ test("OpenCode V2 execute.after mutates event.result.content and registers sessi
   await sessionHooks.get("compaction")({ sessionID: "ses_v226" });
   const ctxEvent3 = { sessionID: "ses_v226", messages: [] };
   await sessionHooks.get("context")(ctxEvent3);
-  assert.match(ctxEvent3.additionalContext, /neurostrata-a1si/);
+  assert.equal(ctxEvent3.additionalContext, undefined);
 });
 
 test("OpenCode V2 execute.after preserves array content[0].text and appends TASK INTENT DETECTED", async () => {
@@ -591,6 +591,7 @@ test("OpenCode V2 execute.after preserves array content[0].text and appends TASK
 
   const toolHooks = new Map();
   const ctx = {
+    config: { namespace: "probe", endpoint: "http://127.0.0.1:1/mcp" },
     location: {
       directory: tmpDir,
       project: { root: tmpDir, canonical: tmpDir },

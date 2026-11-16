@@ -730,7 +730,7 @@ function extractBalancedCallArgs(code, startAfterOpenParen) {
  */
 export function inspectCodeModeExecution(code) {
     const result = { queriedFiles: [] };
-    const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|archive_memory|add_memory|supersede_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
+    const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|locate|archive_memory|add_memory|supersede_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
     let match;
     while ((match = callRe.exec(code)) !== null) {
         const tool = match[1];
@@ -741,7 +741,7 @@ export function inspectCodeModeExecution(code) {
         const idMatch = argSlice.match(/(?:^|[^\w$])["']?id["']?\s*:\s*["']([^"']+)["']/);
         const sessionMatch = argSlice.match(/(?:^|[^\w$])["']?session_id["']?\s*:\s*["']([^"']+)["']/);
         const noteMatch = argSlice.match(/(?:^|[^\w$])["']?note["']?\s*:\s*["']([^"']*)["']/);
-        const pathMatch = argSlice.match(/(?:^|[^\w$])["']?path["']?\s*:\s*["']([^"']+)["']/);
+        const pathMatch = argSlice.match(/(?:^|[^\w$])["']?(?:path|path_prefix|query)["']?\s*:\s*["']([^"']+)["']/);
         if (tool === "neurostrata_task_claim") {
             if (idMatch && sessionMatch) {
                 result.id = idMatch[1];
@@ -762,7 +762,7 @@ export function inspectCodeModeExecution(code) {
         else if (tool === "neurostrata_task_complete") {
             result.taskCompleted = true;
         }
-        else if (tool === "neurostrata_memories_for_file") {
+        else if (tool === "neurostrata_memories_for_file" || tool === "neurostrata_locate") {
             if (pathMatch)
                 result.queriedFiles.push(pathMatch[1]);
         }
@@ -1460,17 +1460,43 @@ export function resetAllSessionEpochs() {
     sessionEpochs.clear();
 }
 /**
- * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
- * from the project root; when an active task exists and its baseline has not
- * been injected this epoch, injects `[NeuroStrata Active Context] ...` once.
- * Same-epoch repeat calls leave the event untouched.
+ * Refresh the snapshot before injecting its session baseline once per epoch.
+ * Unavailable refresh or unchanged persistence leaves host context untouched;
+ * cached prose is not proof that its memories remain current.
  */
 export async function sessionContextHandler(event, config) {
     const sessionId = asString(event?.sessionID ?? event?.session_id);
     const st = sessionEpochState(sessionId);
     const projectRoot = effectiveProjectRoot(config);
+    if (st.baselineInjectedEpoch === st.epoch)
+        return;
+    // Long-lived adapters must not reintroduce old recall through a later
+    // subagent dispatch, even if this epoch's refresh fails.
+    cachedTaskInjection.clear();
+    subagentFileRecallCache.clear();
     let active = null;
     const sessionPath = join(projectRoot, ".NeuroStrata", "active_session.json");
+    let previousRevision;
+    try {
+        previousRevision = JSON.parse(readFileSync(sessionPath, "utf8")).context_revision;
+    }
+    catch { /* No previous baseline. */ }
+    // Cached prose cannot establish whether its memories are still current.
+    // A failed refresh must not replay it, including after compaction.
+    try {
+        const client = new NeuroStrataMCPClient({
+            endpoint: config.endpoint ?? DEFAULT_ENDPOINT,
+            token: config.bearerToken ?? loadDaemonToken(config.tokenFile),
+            timeoutMs: config.requestTimeoutMs ?? DEFAULT_CONFIG.requestTimeoutMs,
+        });
+        await client.callTool("neurostrata_get_snapshot", {
+            namespace: config.namespace,
+            project_root: projectRoot,
+        });
+    }
+    catch {
+        return;
+    }
     if (existsSync(sessionPath)) {
         try {
             active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
@@ -1479,6 +1505,9 @@ export async function sessionContextHandler(event, config) {
             active = null;
         }
     }
+    if (!active || asString(active.namespace)?.toLowerCase() !== config.namespace.toLowerCase() ||
+        !asString(active.context_revision) || active.context_revision === previousRevision)
+        return;
     const taskId = asString(active?.task_id);
     const goldenRules = Array.isArray(active?.golden_rules)
         ? active.golden_rules.filter((g) => typeof g === "string" && g.trim() !== "")
@@ -1671,6 +1700,7 @@ const NEUROSTRATA_NATIVE_TOOLS = new Set([
     "neurostrata_update_memory",
     "neurostrata_guard_validate",
     "neurostrata_memories_for_file",
+    "neurostrata_locate",
 ]);
 /**
  * Read the active task_id from `.NeuroStrata/active_session.json` so the

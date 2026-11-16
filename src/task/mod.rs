@@ -635,6 +635,25 @@ pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
     out
 }
 
+/// Rebuild recall rather than replaying the claim-time copy after retirement.
+pub(crate) async fn task_payload_with_fresh_context(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+    payload: &MemoryPayload,
+) -> MemoryPayload {
+    let vector = load_task(store, namespace, task_id)
+        .await
+        .map(|(_task, vector)| vector)
+        .unwrap_or_default();
+    let (hits, prompt) = build_task_graph_context(store, namespace, task_id, &vector, payload).await;
+    let mut fresh = payload.clone();
+    let task = task_obj_mut(&mut fresh);
+    task.insert("auto_retrieved_context".to_string(), hits);
+    task.insert("subagent_prompt_injection".to_string(), json!(prompt));
+    fresh
+}
+
 /// Best-effort persistence of `.NeuroStrata/active_session.json` so harness
 /// plugins can inject Golden Rules and active task context on session startup
 /// (`sessionContextHandler`) even before the first tool call.
@@ -666,6 +685,13 @@ pub fn persist_active_session_file(
         })
         .collect();
     active.insert("golden_rules".to_string(), json!(golden_strings));
+    // Missing fields must clear previous recall, not inherit a finished task or
+    // bridges accumulated by file recall before a memory was retired.
+    for key in ["task_id", "status", "session_id", "subagent_prompt_injection", "conceptual_bridges"] {
+        active.remove(key);
+    }
+    // Lets a client distinguish a successful refresh from failed persistence.
+    active.insert("context_revision".to_string(), json!(uuid::Uuid::new_v4().to_string()));
 
     if let Some((tid, payload)) = active_task {
         active.insert("task_id".to_string(), json!(tid));
@@ -686,6 +712,13 @@ pub fn persist_active_session_file(
             .and_then(|v| v.as_str())
         {
             active.insert("subagent_prompt_injection".to_string(), json!(inj));
+        }
+        if let Some(bridges) = task_obj
+            .and_then(|t| t.get("auto_retrieved_context"))
+            .and_then(|ctx| ctx.get("conceptual_bridges"))
+            .filter(|v| v.is_array())
+        {
+            active.insert("conceptual_bridges".to_string(), bridges.clone());
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
     }

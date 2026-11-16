@@ -145,7 +145,7 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
   });
 }
 
-function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
+function createMockDaemonServer({ returnTask = null, guardReject = false, snapshot = null, snapshotWrites = true } = {}) {
   const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
@@ -182,6 +182,17 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
                 { name: "neurostrata_memories_for_file" },
               ],
             });
+            return;
+          }
+          if (name === "neurostrata_get_snapshot") {
+            if (snapshot) snapshot(params.arguments);
+            const path = join(params.arguments.project_root, ".NeuroStrata", "active_session.json");
+            if (snapshotWrites && existsSync(path)) {
+              const active = JSON.parse(readFileSync(path, "utf8"));
+              active.context_revision = `${Date.now()}-${Math.random()}`;
+              writeFileSync(path, JSON.stringify(active));
+            }
+            respond({ content: [{ type: "text", text: "Current snapshot" }] });
             return;
           }
           if (name === "neurostrata_memories_for_file") {
@@ -2279,7 +2290,82 @@ describe("Task 1.1: extractToolName", () => {
   });
 });
 
+describe("correction cache: session baseline revalidation", () => {
+  it("does not trust an unchanged cache after a successful RPC", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ns-cache-unchanged-"));
+    mkdirSync(join(root, ".NeuroStrata"));
+    writeFileSync(join(root, ".NeuroStrata", "active_session.json"), JSON.stringify({
+      namespace: "probe", golden_rules: ["RETIRED RULE"], context_revision: "old-revision",
+    }));
+    const { server, url } = await createMockDaemonServer({ snapshotWrites: false });
+    try {
+      const event = { sessionID: "cache-unchanged" };
+      await sessionContextHandler(event, { ...resolveConfig({ namespace: "probe", endpoint: url }), projectRoot: root });
+      assert.equal(event.additionalContext, undefined, "a failed persistence must not replay old prose");
+    } finally { await new Promise((done) => server.close(done)); rmSync(root, { recursive: true, force: true }); resetClientForTesting(); }
+  });
+
+  it("does not replay cached retired text when the daemon is unavailable", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ns-cache-offline-"));
+    mkdirSync(join(root, ".NeuroStrata"));
+    writeFileSync(join(root, ".NeuroStrata", "active_session.json"), JSON.stringify({
+      namespace: "probe", task_id: "old-task", status: "in_progress",
+      golden_rules: ["RETIRED GOLDEN"], subagent_prompt_injection: "RETIRED TASK RULE",
+      conceptual_bridges: ["RETIRED BRIDGE"],
+    }));
+    const { server, url } = await createMockDaemonServer();
+    await new Promise((done) => server.close(done));
+    try {
+      cachedTaskInjection.set("old-task", "RETIRED TASK RULE");
+      const event = { sessionID: "cache-offline", additionalContext: "Unrelated host context" };
+      await sessionContextHandler(event, { ...resolveConfig({ namespace: "probe", endpoint: url, requestTimeoutMs: 100 }), projectRoot: root });
+      assert.equal(event.additionalContext, "Unrelated host context");
+      assert.equal(cachedTaskInjection.size, 0, "subagent dispatch must not replay the same stale cache");
+    } finally { rmSync(root, { recursive: true, force: true }); resetClientForTesting(); }
+  });
+
+  it("refreshes stale task, golden and bridge caches before injection", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ns-cache-live-"));
+    mkdirSync(join(root, ".NeuroStrata"));
+    const path = join(root, ".NeuroStrata", "active_session.json");
+    writeFileSync(path, JSON.stringify({ namespace: "probe", task_id: "task", status: "in_progress", subagent_prompt_injection: "RETIRED RULE" }));
+    let calls = 0;
+    const { server, url } = await createMockDaemonServer({ snapshot: (args) => {
+      calls++;
+      assert.equal(args.project_root, root);
+      assert.equal(args.namespace, "PROBE");
+      writeFileSync(path, JSON.stringify({ namespace: "probe", task_id: "task", status: "in_progress",
+        session_id: "cache-live",
+        subagent_prompt_injection: calls === 1 ? "CURRENT RULE; UNAFFECTED CLAUSE" : "SUCCESSOR RULE; UNAFFECTED CLAUSE",
+        golden_rules: calls === 1 ? ["LIVE GOLDEN"] : ["LIVE SUCCESSOR"] }));
+    }});
+    try {
+      const config = { ...resolveConfig({ namespace: "PROBE", endpoint: url }), projectRoot: root };
+      cachedTaskInjection.set("task", "RETIRED TASK RULE");
+      const event = { sessionID: "cache-live" };
+      await sessionContextHandler(event, config);
+      assert.ok(event.additionalContext.includes("CURRENT RULE; UNAFFECTED CLAUSE"));
+      assert.ok(event.additionalContext.includes("LIVE GOLDEN"));
+      assert.ok(!event.additionalContext.includes("RETIRED"));
+      assert.equal(cachedTaskInjection.size, 0);
+      await sessionContextHandler({ sessionID: "cache-live" }, config);
+      assert.equal(calls, 1, "refresh once per baseline epoch");
+      await sessionCompactionHandler({ sessionID: "cache-live" }, config);
+      const compacted = { sessionID: "cache-live" };
+      await sessionContextHandler(compacted, config);
+      assert.equal(calls, 2, "compaction revalidates again");
+      assert.ok(compacted.additionalContext.includes("UNAFFECTED CLAUSE"));
+      assert.ok(compacted.additionalContext.includes("SUCCESSOR RULE"));
+      assert.ok(!compacted.additionalContext.includes("CURRENT RULE"));
+      assert.ok(!compacted.additionalContext.includes("LIVE GOLDEN"));
+    } finally { await new Promise((done) => server.close(done)); rmSync(root, { recursive: true, force: true }); resetClientForTesting(); }
+  });
+});
+
 describe("Task 1.1: sessionContextHandler / sessionCompactionHandler epoch behavior", () => {
+  let daemon;
+  beforeEach(async () => { daemon = await createMockDaemonServer(); });
+  afterEach(async () => { await new Promise((done) => daemon.server.close(done)); });
   it("injects active-task baseline once per epoch; compaction re-injects", async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-ctx-"));
     const nsDir = join(tmpDir, ".NeuroStrata");
@@ -2297,6 +2383,7 @@ describe("Task 1.1: sessionContextHandler / sessionCompactionHandler epoch behav
     try {
       const config = {
         projectRoot: tmpDir,
+        endpoint: daemon.url,
         namespace: "NeuroStrata",
         intentDetection: { enabled: true, injectReminder: true },
       };
@@ -2328,6 +2415,9 @@ describe("Task 1.1: sessionContextHandler / sessionCompactionHandler epoch behav
 });
 
 describe("sessionContextHandler bridge formatting (no [object Object])", () => {
+  let daemon;
+  beforeEach(async () => { daemon = await createMockDaemonServer(); });
+  afterEach(async () => { await new Promise((done) => daemon.server.close(done)); });
   it("formats each bridge object cleanly instead of String(b)", async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-bridge-fmt-"));
     const nsDir = join(tmpDir, ".NeuroStrata");
@@ -2354,6 +2444,7 @@ describe("sessionContextHandler bridge formatting (no [object Object])", () => {
     try {
       const config = {
         projectRoot: tmpDir,
+        endpoint: daemon.url,
         namespace: "NeuroStrata",
         intentDetection: { enabled: false, injectReminder: false },
       };
@@ -2382,6 +2473,7 @@ describe("sessionContextHandler bridge formatting (no [object Object])", () => {
     try {
       const config = {
         projectRoot: tmpDir,
+        endpoint: daemon.url,
         namespace: "NeuroStrata",
         intentDetection: { enabled: false, injectReminder: false },
       };
@@ -2411,6 +2503,7 @@ describe("sessionContextHandler bridge formatting (no [object Object])", () => {
     try {
       const config = {
         projectRoot: tmpDir,
+        endpoint: daemon.url,
         namespace: "NeuroStrata",
         intentDetection: { enabled: false, injectReminder: false },
       };
