@@ -20,7 +20,7 @@
 // ──────────────────────────────────────────────────────────────────────
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
 // ──────────────────────────────────────────────────────────────────────
@@ -218,6 +218,56 @@ function pathRelativeToProjectRoot(filePath, config) {
         // fall through to the raw path
     }
     return filePath;
+}
+/**
+ * The directory the agent resolves its own relative file paths against: the
+ * one it was started in. Not the project root, which the host may place higher
+ * up (at the repository) than where the agent runs.
+ */
+function agentWorkingDirectory() {
+    const c = pluginCtx ?? {};
+    return (asString(c?.location?.directory) ??
+        asString(c?.directory) ??
+        asString(c?.cwd) ??
+        process.cwd());
+}
+/** The `resolved_from` a `memories_for_file` reply carries, if any. */
+function fileRecallResolvedFrom(text) {
+    try {
+        const body = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
+        return asString(body?.resolved_from);
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * Ask the daemon for the memories governing `filePath`. A relative path is
+ * sent joined onto the agent's working directory, so it names the file the
+ * agent meant wherever the agent was started; the daemon alone turns it into
+ * the project-relative path it stores. When the daemon places that absolute
+ * path under no project root (`resolved_from: "outside"`), or is too old to
+ * resolve absolute paths (no `resolved_from`), the path is asked as given,
+ * exactly as before.
+ */
+// A Windows path reaching a POSIX host (or the reverse) is still absolute: the
+// daemon reads both forms, so it must not be joined onto the working directory.
+function isAbsoluteOnAnyPlatform(path) {
+    return posix.isAbsolute(path) || win32.isAbsolute(path);
+}
+async function askMemoriesForFile(client, namespace, filePath) {
+    const ask = (path) => client.callTool("neurostrata_memories_for_file", { namespace, path, limit: 5 });
+    if (isAbsoluteOnAnyPlatform(filePath))
+        return ask(filePath);
+    let text;
+    try {
+        text = await ask(resolve(agentWorkingDirectory(), filePath));
+    }
+    catch {
+        return ask(filePath);
+    }
+    const from = fileRecallResolvedFrom(text);
+    return from === undefined || from === "outside" ? ask(filePath) : text;
 }
 // ──────────────────────────────────────────────────────────────────────
 // Credential
@@ -730,7 +780,7 @@ function extractBalancedCallArgs(code, startAfterOpenParen) {
  */
 export function inspectCodeModeExecution(code) {
     const result = { queriedFiles: [] };
-    const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|archive_memory|add_memory|supersede_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
+    const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|locate|archive_memory|add_memory|supersede_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
     let match;
     while ((match = callRe.exec(code)) !== null) {
         const tool = match[1];
@@ -741,7 +791,7 @@ export function inspectCodeModeExecution(code) {
         const idMatch = argSlice.match(/(?:^|[^\w$])["']?id["']?\s*:\s*["']([^"']+)["']/);
         const sessionMatch = argSlice.match(/(?:^|[^\w$])["']?session_id["']?\s*:\s*["']([^"']+)["']/);
         const noteMatch = argSlice.match(/(?:^|[^\w$])["']?note["']?\s*:\s*["']([^"']*)["']/);
-        const pathMatch = argSlice.match(/(?:^|[^\w$])["']?path["']?\s*:\s*["']([^"']+)["']/);
+        const pathMatch = argSlice.match(/(?:^|[^\w$])["']?(?:path|path_prefix|query)["']?\s*:\s*["']([^"']+)["']/);
         if (tool === "neurostrata_task_claim") {
             if (idMatch && sessionMatch) {
                 result.id = idMatch[1];
@@ -762,7 +812,7 @@ export function inspectCodeModeExecution(code) {
         else if (tool === "neurostrata_task_complete") {
             result.taskCompleted = true;
         }
-        else if (tool === "neurostrata_memories_for_file") {
+        else if (tool === "neurostrata_memories_for_file" || tool === "neurostrata_locate") {
             if (pathMatch)
                 result.queriedFiles.push(pathMatch[1]);
         }
@@ -987,11 +1037,7 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
     if (!mcpClient)
         return [];
     try {
-        const text = await mcpClient.callTool("neurostrata_memories_for_file", {
-            namespace,
-            path: normalized,
-            limit: 5,
-        });
+        const text = await askMemoriesForFile(mcpClient, namespace, normalized);
         recordPrefetchedPath(key);
         // Persist conceptual bridges from the hits into active_session.json so
         // sessionContextHandler can inject them as [NeuroStrata Conceptual Bridges].
@@ -1087,11 +1133,7 @@ async function recallMemoriesForSubagentFile(namespace, filePath, seenInPrompt) 
         if (!mcpClient)
             return [];
         try {
-            const text = await mcpClient.callTool("neurostrata_memories_for_file", {
-                namespace,
-                path: normalized,
-                limit: 5,
-            });
+            const text = await askMemoriesForFile(mcpClient, namespace, normalized);
             try {
                 recordLocalSessionQuery(namespace, "neurostrata_memories_for_file", normalized);
             }
@@ -1671,6 +1713,7 @@ const NEUROSTRATA_NATIVE_TOOLS = new Set([
     "neurostrata_update_memory",
     "neurostrata_guard_validate",
     "neurostrata_memories_for_file",
+    "neurostrata_locate",
 ]);
 /**
  * Read the active task_id from `.NeuroStrata/active_session.json` so the

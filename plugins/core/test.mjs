@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { join, isAbsolute } from "node:path";
+import { join, isAbsolute, posix as posixPath, win32 as win32Path, resolve as resolvePath } from "node:path";
 import { execFileSync as execFileSyncTop } from "node:child_process";
 
 // Windows cannot execute a .sh file directly (EFTYPE). Production hook
@@ -145,7 +145,7 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
   });
 }
 
-function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
+function createMockDaemonServer({ returnTask = null, guardReject = false, legacyDaemon = false, outsidePaths = null } = {}) {
   const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
@@ -188,23 +188,23 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
             counters.memoriesForFile++;
             const args = params.arguments ?? {};
             if (typeof args.path === "string") counters.memoriesForFilePaths.push(args.path);
-            respond({
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify({
-                    hits: [
-                      {
-                        id: "mem-rule-1",
-                        valid_from: "2026-01-01T00:00:00Z",
-                        memory_type: "rule",
-                        content: "Always claim a task before editing files.",
-                      },
-                    ],
-                  }),
-                },
-              ],
-            });
+            // Like the current daemon by default: an absolute path is resolved
+            // and the reply says from where. `legacyDaemon` answers like one
+            // that cannot resolve absolute paths (no hits, no resolved_from);
+            // `outsidePaths` lists absolute paths under no project root.
+            const absolute = typeof args.path === "string"
+              && (posixPath.isAbsolute(args.path) || win32Path.isAbsolute(args.path));
+            const hit = {
+              id: "mem-rule-1",
+              valid_from: "2026-01-01T00:00:00Z",
+              memory_type: "rule",
+              content: "Always claim a task before editing files.",
+            };
+            let reply = { hits: [hit] };
+            if (absolute && legacyDaemon) reply = { hits: [] };
+            else if (absolute && outsidePaths?.includes(args.path)) reply = { hits: [], resolved_from: "outside" };
+            else if (absolute) reply = { hits: [hit], resolved_from: "marker" };
+            respond({ content: [{ type: "text", text: JSON.stringify(reply) }] });
             return;
           }
           if (name === "neurostrata_task_list") {
@@ -788,6 +788,81 @@ describe("prefetchMemoriesForFile LRU + dedup", () => {
     resetClientForTesting();
     const out = await prefetchMemoriesForFile("ns", "src/foo.ts");
     assert.deepEqual(out, []);
+  });
+});
+
+describe("file recall sends the path the agent meant", () => {
+  const root = mkdtempSync(join(tmpdir(), "ns-abs-path-"));
+  const start = async (mock, ctxExtra) => {
+    const daemon = await createMockDaemonServer(mock);
+    await initialize({
+      config: { namespace: "abs-ns", endpoint: daemon.url, bearerToken: null, strictMode: false, requestTimeoutMs: 500 },
+      tool: { hook: async () => {} },
+      hooks: {},
+      ...ctxExtra,
+    });
+    return daemon;
+  };
+  const run = async (mock, ctxExtra, fn) => {
+    const daemon = await start(mock, ctxExtra);
+    try {
+      return await fn(daemon.counters);
+    } finally {
+      daemon.server.close();
+      resetModuleState();
+    }
+  };
+
+  it("joins a relative path onto the agent's working directory and asks once", async () => {
+    await run({}, { directory: root }, async (counters) => {
+      const out = await prefetchMemoriesForFile("abs-ns", "src/foo.ts");
+      assert.deepEqual(counters.memoriesForFilePaths, [resolvePath(root, "src/foo.ts")]);
+      assert.equal(out.length, 1);
+    });
+  });
+
+  it("uses the directory the agent started in, not the project root above it", async () => {
+    const sub = join(root, "src");
+    const ctx = { location: { directory: sub, project: { root } } };
+    await run({}, ctx, async (counters) => {
+      await prefetchMemoriesForFile("abs-ns", "lib.rs");
+      assert.deepEqual(counters.memoriesForFilePaths, [resolvePath(sub, "lib.rs")]);
+    });
+  });
+
+  it("sends an absolute path unchanged", async () => {
+    const abs = resolvePath(root, "src", "abs.ts");
+    await run({}, { directory: root }, async (counters) => {
+      await prefetchMemoriesForFile("abs-ns", abs);
+      assert.deepEqual(counters.memoriesForFilePaths, [abs]);
+    });
+  });
+
+  it("sends an absolute path of the other platform unchanged", async () => {
+    // Node's own isAbsolute only knows the host's form; both must pass through.
+    for (const abs of ["C:\\repo\\src\\foo.ts", "/repo/src/foo.ts"]) {
+      await run({}, { directory: root }, async (counters) => {
+        await prefetchMemoriesForFile("abs-ns", abs);
+        assert.deepEqual(counters.memoriesForFilePaths, [abs]);
+      });
+    }
+  });
+
+  it("asks the path as given when the daemon places it under no project root", async () => {
+    const abs = resolvePath(root, "x.ts");
+    await run({ outsidePaths: [abs] }, { directory: root }, async (counters) => {
+      const out = await prefetchMemoriesForFile("abs-ns", "x.ts");
+      assert.deepEqual(counters.memoriesForFilePaths, [abs, "x.ts"]);
+      assert.equal(out.length, 1, "the relative lookup still answers, as before");
+    });
+  });
+
+  it("asks the path as given when the daemon cannot resolve absolute paths", async () => {
+    await run({ legacyDaemon: true }, { directory: root }, async (counters) => {
+      const out = await prefetchMemoriesForFile("abs-ns", "src/foo.ts");
+      assert.deepEqual(counters.memoriesForFilePaths, [resolvePath(root, "src/foo.ts"), "src/foo.ts"]);
+      assert.equal(out.length, 1, "same memories as a relative lookup gave before");
+    });
   });
 });
 
@@ -1992,8 +2067,8 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       const result = await beforeExecFn({ tool: "apply_patch", input: patch });
       assert.ok(counters.memoriesForFile >= 1, "memories_for_file must run for the patched file");
       assert.ok(
-        counters.memoriesForFilePaths.includes("src/codex.rs"),
-        `patched path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`,
+        counters.memoriesForFilePaths.some((p) => p.replace(/\\/g, "/").endsWith("/src/codex.rs")),
+        `patched path must be queried (joined onto the working directory), got ${JSON.stringify(counters.memoriesForFilePaths)}`,
       );
       const blob = JSON.stringify(result ?? {});
       assert.ok(blob.includes("src/codex.rs"), "recall block must mention the patched file");
@@ -2018,8 +2093,8 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       });
       assert.ok(counters.memoriesForFile >= 1, "memories_for_file must run for the added file");
       assert.ok(
-        counters.memoriesForFilePaths.includes("src/new.rs"),
-        `added path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`,
+        counters.memoriesForFilePaths.some((p) => p.replace(/\\/g, "/").endsWith("/src/new.rs")),
+        `added path must be queried (joined onto the working directory), got ${JSON.stringify(counters.memoriesForFilePaths)}`,
       );
       const blob = JSON.stringify(result ?? {});
       assert.ok(blob.includes("src/new.rs"), "hook recall must mention the added file");
