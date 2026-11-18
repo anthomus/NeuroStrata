@@ -955,6 +955,9 @@ mod tests {
         assert_eq!(resolve_project_namespace(&main.join("src")), "example-project");
 
         // A linked worktree beside it, with no settings of its own, inherits it.
+        // Its gitdir names the shared `.git` in `commondir`, as git writes it.
+        let wt_gitdir = main.join(".git").join("worktrees").join("wt");
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
         let wt = base.join("platform-wt");
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(
