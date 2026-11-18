@@ -237,53 +237,92 @@ fn has_any_env(keys: &[&str]) -> bool {
 
 /// The namespace the harness installer recorded for the project at `root`:
 /// `NEUROSTRATA_NAMESPACE` in `.claude/settings.local.json` (its `env` block,
-/// else the first hook command carrying `NEUROSTRATA_NAMESPACE=<ns>`), else
-/// `neurostrata.namespace` in `.opencode/neurostrata-plugin.json`. These are
-/// the files [`auto_install_detected_plugins`] writes; this reads them back.
-/// `None` when neither names a non-empty namespace.
+/// else a hook command that starts with `NEUROSTRATA_NAMESPACE=<ns>`, the form
+/// the installer writes), else `namespace` in the opencode, hermes, codex,
+/// openclaw or GitHub CLI plugin config. These are the files
+/// [`auto_install_detected_plugins`] writes; this reads them back. `None` when
+/// none names a usable namespace.
 pub fn configured_namespace(root: &Path) -> Option<String> {
     let read = |rel: &str| -> Option<Value> {
         serde_json::from_str(&std::fs::read_to_string(root.join(rel)).ok()?).ok()
-    };
-    let non_empty = |s: &str| {
-        let s = s.trim().trim_matches(|c| c == '"' || c == '\'');
-        (!s.is_empty()).then(|| s.to_string())
     };
     if let Some(settings) = read(".claude/settings.local.json") {
         if let Some(ns) = settings
             .pointer("/env/NEUROSTRATA_NAMESPACE")
             .and_then(Value::as_str)
-            .and_then(non_empty)
+            .and_then(usable_namespace)
         {
             return Some(ns);
         }
-        let mut commands: Vec<&str> = Vec::new();
         if let Some(hooks) = settings.get("hooks").and_then(Value::as_object) {
             for entries in hooks.values().filter_map(Value::as_array) {
                 for entry in entries {
                     for hook in entry.get("hooks").and_then(Value::as_array).into_iter().flatten() {
-                        if let Some(command) = hook.get("command").and_then(Value::as_str) {
-                            commands.push(command);
+                        if let Some(ns) = hook
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .and_then(namespace_assigned_in_command)
+                        {
+                            return Some(ns);
                         }
                     }
                 }
             }
         }
-        for command in commands {
-            if let Some(rest) = command.split("NEUROSTRATA_NAMESPACE=").nth(1) {
-                // The value ends at the first whitespace; `NEUROSTRATA_NAMESPACE= node`
-                // (what the daemon's startup install writes) is an empty value,
-                // not the namespace `node`.
-                if let Some(ns) = rest.split(char::is_whitespace).next().and_then(non_empty) {
-                    return Some(ns);
-                }
-            }
+    }
+    for (rel, pointer) in [
+        (".opencode/neurostrata-plugin.json", "/neurostrata/namespace"),
+        (".hermes/plugins/neurostrata.json", "/namespace"),
+        (".codex/plugins/neurostrata.json", "/namespace"),
+        (".openclaw/plugins/neurostrata.json", "/namespace"),
+        (".NeuroStrata/plugins/github-cli/copilot-extension.json", "/namespace"),
+    ] {
+        if let Some(ns) = read(rel)
+            .as_ref()
+            .and_then(|v| v.pointer(pointer))
+            .and_then(Value::as_str)
+            .and_then(usable_namespace)
+        {
+            return Some(ns);
         }
     }
-    read(".opencode/neurostrata-plugin.json")?
-        .pointer("/neurostrata/namespace")
-        .and_then(Value::as_str)
-        .and_then(non_empty)
+    None
+}
+
+/// A namespace value as written, or `None` when it is empty or still an
+/// unexpanded shell or cmd variable (`$NS`, `%NS%`).
+fn usable_namespace(raw: &str) -> Option<String> {
+    let ns = raw.trim().trim_matches(|c| c == '"' || c == '\'');
+    (!ns.is_empty() && !ns.starts_with('$') && !ns.starts_with('%')).then(|| ns.to_string())
+}
+
+/// The value of a `NEUROSTRATA_NAMESPACE=<ns>` assignment that is a word of
+/// its own in a hook command (at the start, or after whitespace, as the
+/// installer writes it), not text inside another word such as
+/// `MY_NEUROSTRATA_NAMESPACE=`. A quoted value may hold spaces; an unquoted one
+/// ends at whitespace or a shell separator (`&`, `;`, `|`). The daemon's startup
+/// install writes `NEUROSTRATA_NAMESPACE= node ...`: an empty value, not `node`.
+fn namespace_assigned_in_command(command: &str) -> Option<String> {
+    const KEY: &str = "NEUROSTRATA_NAMESPACE=";
+    let mut from = 0;
+    while let Some(found) = command[from..].find(KEY) {
+        let at = from + found;
+        from = at + KEY.len();
+        let starts_word = command[..at].chars().next_back().map_or(true, char::is_whitespace);
+        if !starts_word {
+            continue;
+        }
+        let rest = &command[from..];
+        let value = match rest.chars().next() {
+            Some(q @ ('"' | '\'')) => rest[1..].split(q).next().unwrap_or(""),
+            _ => rest
+                .split(|c: char| c.is_whitespace() || matches!(c, '&' | ';' | '|'))
+                .next()
+                .unwrap_or(""),
+        };
+        return usable_namespace(value);
+    }
+    None
 }
 
 /// The namespace a project's git hooks and installers use for `dir`, resolved
@@ -291,9 +330,21 @@ pub fn configured_namespace(root: &Path) -> Option<String> {
 /// 1. the namespace configured in `dir`'s checkout ([`configured_namespace`]);
 /// 2. the one configured in the main checkout, for a linked worktree (harness
 ///    settings are untracked, so a worktree usually has none of its own);
-/// 3. the main checkout's folder name, the last resort;
-/// 4. `dir`'s own folder name outside git.
+/// 3. the `namespace` field of the main checkout's graph-lookup ledger
+///    (`.NeuroStrata/session_queries.json`), then of `dir`'s own;
+/// 4. the main checkout's folder name, the last resort;
+/// 5. `dir`'s own folder name outside git.
+///
+/// A relative `dir` is taken against the current directory. A linked worktree
+/// whose main checkout keeps its git data outside a `.git` folder
+/// (`--separate-git-dir`) is treated as its own checkout.
 pub fn resolve_project_namespace(dir: &Path) -> String {
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir().map(|cwd| cwd.join(dir)).unwrap_or_else(|_| dir.to_path_buf())
+    };
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
     let dir_s = dir.to_string_lossy().to_string();
     let own_root = crate::paths::git_root_of_dir(&dir_s).map(PathBuf::from);
     let main_root = crate::paths::main_checkout_root(&dir_s);
@@ -302,9 +353,22 @@ pub fn resolve_project_namespace(dir: &Path) -> String {
             return ns;
         }
     }
+    for root in main_root.iter().chain(own_root.iter()) {
+        let ledger = root.join(".NeuroStrata").join("session_queries.json");
+        if let Some(ns) = std::fs::read_to_string(ledger)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .as_ref()
+            .and_then(|v| v.get("namespace"))
+            .and_then(Value::as_str)
+            .and_then(usable_namespace)
+        {
+            return ns;
+        }
+    }
     main_root
         .as_deref()
-        .or(Some(dir))
+        .or(Some(dir.as_path()))
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .filter(|n| !n.is_empty())
@@ -924,6 +988,53 @@ mod tests {
         .unwrap();
         assert_eq!(configured_namespace(&main), None);
         assert_eq!(resolve_project_namespace(&wt), "platform");
+
+        // With no harness setting, the main checkout's ledger names it before
+        // the folder name does.
+        std::fs::create_dir_all(main.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            main.join(".NeuroStrata").join("session_queries.json"),
+            r#"{"namespace": "from-ledger", "queries": []}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_project_namespace(&wt), "from-ledger");
+        assert_eq!(resolve_project_namespace(&main), "from-ledger");
+
+        // Another harness's plugin config counts as configuration.
+        std::fs::create_dir_all(main.join(".codex").join("plugins")).unwrap();
+        std::fs::write(
+            main.join(".codex").join("plugins").join("neurostrata.json"),
+            r#"{"namespace": "from-codex"}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_project_namespace(&wt), "from-codex");
+    }
+
+    /// Only an assignment that is a word of its own counts, the way the
+    /// installer writes it; quoted values keep their spaces, unquoted ones end
+    /// at a shell separator, and unexpanded variables are no answer.
+    #[test]
+    fn a_hook_command_names_the_namespace_only_in_its_own_assignment() {
+        let ns = namespace_assigned_in_command;
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=example-project node \"C:/x/run.js\"").as_deref(), Some("example-project"));
+        assert_eq!(ns("set NEUROSTRATA_NAMESPACE=example-project&& node x").as_deref(), Some("example-project"));
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=\"my ns\" node x").as_deref(), Some("my ns"));
+        assert_eq!(ns("MY_NEUROSTRATA_NAMESPACE=other node x"), None);
+        assert_eq!(ns("echo xNEUROSTRATA_NAMESPACE=other"), None);
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=$NS node x"), None);
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=%NS% node x"), None);
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE= node x"), None);
+        assert_eq!(ns("node x"), None);
+    }
+
+    /// `namespace resolve some/dir` takes a relative directory against the
+    /// current one, as a shell user expects.
+    #[test]
+    fn a_relative_directory_resolves_against_the_current_one() {
+        let here = std::env::current_dir().unwrap();
+        let expected = resolve_project_namespace(&here);
+        assert_eq!(resolve_project_namespace(Path::new(".")), expected);
+        assert_eq!(resolve_project_namespace(Path::new("src")), expected);
     }
 
     #[test]
