@@ -293,23 +293,32 @@ pub fn configured_namespace(root: &Path) -> Option<String> {
 /// unexpanded shell or cmd variable (`$NS`, `%NS%`).
 fn usable_namespace(raw: &str) -> Option<String> {
     let ns = raw.trim().trim_matches(|c| c == '"' || c == '\'');
-    (!ns.is_empty() && !ns.starts_with('$') && !ns.starts_with('%')).then(|| ns.to_string())
+    // The value ends up in hook commands and in `task gate <ns>`: only plain
+    // namespace characters are taken, so it can never carry shell syntax.
+    let plain = ns
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    (!ns.is_empty() && plain).then(|| ns.to_string())
 }
 
-/// The value of a `NEUROSTRATA_NAMESPACE=<ns>` assignment that is a word of
-/// its own in a hook command (at the start, or after whitespace, as the
-/// installer writes it), not text inside another word such as
-/// `MY_NEUROSTRATA_NAMESPACE=`. A quoted value may hold spaces; an unquoted one
-/// ends at whitespace or a shell separator (`&`, `;`, `|`). The daemon's startup
-/// install writes `NEUROSTRATA_NAMESPACE= node ...`: an empty value, not `node`.
+/// The value of a `NEUROSTRATA_NAMESPACE=<ns>` assignment at the start of a
+/// hook command (or after a leading `set ` or `env `), where the installer
+/// writes it; not an argument further along, and not text inside another word
+/// such as `MY_NEUROSTRATA_NAMESPACE=`. An unquoted value ends at whitespace or
+/// a shell separator (`&`, `;`, `|`); only plain namespace characters are
+/// accepted. The daemon's startup install writes `NEUROSTRATA_NAMESPACE= node`:
+/// an empty value, not `node`.
 fn namespace_assigned_in_command(command: &str) -> Option<String> {
     const KEY: &str = "NEUROSTRATA_NAMESPACE=";
     let mut from = 0;
     while let Some(found) = command[from..].find(KEY) {
         let at = from + found;
         from = at + KEY.len();
-        let starts_word = command[..at].chars().next_back().map_or(true, char::is_whitespace);
-        if !starts_word {
+        // Only where the installer puts it: the first word of the command, or
+        // right after a leading `set ` or `env `. An argument further along is
+        // text for some program, not an assignment.
+        let before = command[..at].trim();
+        if !(before.is_empty() || before == "set" || before == "env") {
             continue;
         }
         let rest = &command[from..];
@@ -1010,17 +1019,20 @@ mod tests {
         assert_eq!(resolve_project_namespace(&wt), "from-codex");
     }
 
-    /// Only an assignment that is a word of its own counts, the way the
-    /// installer writes it; quoted values keep their spaces, unquoted ones end
-    /// at a shell separator, and unexpanded variables are no answer.
+    /// Only an assignment at the start of the command counts, the way the
+    /// installer writes it; unquoted values end at a shell separator, and
+    /// unexpanded variables or values with shell characters are no answer.
     #[test]
     fn a_hook_command_names_the_namespace_only_in_its_own_assignment() {
         let ns = namespace_assigned_in_command;
         assert_eq!(ns("NEUROSTRATA_NAMESPACE=example-project node \"C:/x/run.js\"").as_deref(), Some("example-project"));
         assert_eq!(ns("set NEUROSTRATA_NAMESPACE=example-project&& node x").as_deref(), Some("example-project"));
-        assert_eq!(ns("NEUROSTRATA_NAMESPACE=\"my ns\" node x").as_deref(), Some("my ns"));
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=\"my-ns\" node x").as_deref(), Some("my-ns"));
         assert_eq!(ns("MY_NEUROSTRATA_NAMESPACE=other node x"), None);
         assert_eq!(ns("echo xNEUROSTRATA_NAMESPACE=other"), None);
+        assert_eq!(ns("node run.js NEUROSTRATA_NAMESPACE=other"), None);
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=a;rm node x"), Some("a".to_string()));
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=\"a b\" node x"), None);
         assert_eq!(ns("NEUROSTRATA_NAMESPACE=$NS node x"), None);
         assert_eq!(ns("NEUROSTRATA_NAMESPACE=%NS% node x"), None);
         assert_eq!(ns("NEUROSTRATA_NAMESPACE= node x"), None);
