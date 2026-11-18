@@ -895,9 +895,10 @@ pub(crate) enum TaskCommands {
 pub(crate) enum NamespaceCommands {
     /// Print the namespace configured for a project: NEUROSTRATA_NAMESPACE
     /// when set, else the harness settings the installer wrote
-    /// (.claude/settings.local.json, .opencode/neurostrata-plugin.json) in the
-    /// checkout or its main checkout, else the main checkout's folder name.
-    /// The git hooks call this.
+    /// (.claude/settings.local.json, the opencode, hermes, codex, openclaw or
+    /// GitHub CLI plugin config) in the checkout or its main checkout, else
+    /// the namespace in .NeuroStrata/session_queries.json, else the main
+    /// checkout's folder name. The git hooks call this.
     Resolve {
         /// Directory inside the project (default: the current directory)
         dir: Option<std::path::PathBuf>,
@@ -6170,21 +6171,11 @@ async fn run() -> anyhow::Result<()> {
     if let Some(Commands::Namespace { action }) = cli.command.as_ref() {
         match action {
             NamespaceCommands::Resolve { dir } => {
-                let from_env = std::env::var("NEUROSTRATA_NAMESPACE")
-                    .ok()
-                    .map(|ns| ns.trim().to_string())
-                    .filter(|ns| !ns.is_empty());
-                let namespace = match from_env {
-                    Some(ns) => ns,
-                    None => {
-                        let dir = match dir {
-                            Some(d) => d.clone(),
-                            None => std::env::current_dir()?,
-                        };
-                        crate::task::harness_plugins::resolve_project_namespace(&dir)
-                    }
+                let dir = match dir {
+                    Some(d) => d.clone(),
+                    None => std::env::current_dir()?,
                 };
-                println!("{namespace}");
+                println!("{}", crate::task::harness_plugins::resolve_cli_namespace(&dir));
             }
         }
         return Ok(());
@@ -7383,7 +7374,7 @@ async fn run() -> anyhow::Result<()> {
                         Ok(target) => {
                             let _ = install_pre_commit_hook(&root);
                             let repo_ns =
-                                crate::task::harness_plugins::resolve_project_namespace(&root);
+                                crate::task::harness_plugins::resolve_cli_namespace(&root);
                             let _ = crate::task::harness_plugins::auto_install_detected_plugins(
                                 &root, &repo_ns, None,
                             );

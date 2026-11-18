@@ -291,14 +291,17 @@ pub fn configured_namespace(root: &Path) -> Option<String> {
 
 /// A namespace value as written, or `None` when it is empty or still an
 /// unexpanded shell or cmd variable (`$NS`, `%NS%`).
-fn usable_namespace(raw: &str) -> Option<String> {
+pub(crate) fn usable_namespace(raw: &str) -> Option<String> {
     let ns = raw.trim().trim_matches(|c| c == '"' || c == '\'');
     // The value ends up in hook commands and in `task gate <ns>`: only plain
-    // namespace characters are taken, so it can never carry shell syntax.
+    // namespace characters are taken, so it can never carry shell syntax. It
+    // starts with a letter or digit, so it is never read as an option
+    // (`--help`) or as a path step (`.`, `..`).
     let plain = ns
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    (!ns.is_empty() && plain).then(|| ns.to_string())
+    let leads = ns.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    (plain && leads).then(|| ns.to_string())
 }
 
 /// The value of a `NEUROSTRATA_NAMESPACE=<ns>` assignment at the start of a
@@ -342,11 +345,22 @@ fn namespace_assigned_in_command(command: &str) -> Option<String> {
 /// 3. the `namespace` field of the main checkout's graph-lookup ledger
 ///    (`.NeuroStrata/session_queries.json`), then of `dir`'s own;
 /// 4. the main checkout's folder name, the last resort;
-/// 5. `dir`'s own folder name outside git.
+/// 5. outside git, the same files in `dir` itself, then its folder name.
 ///
 /// A relative `dir` is taken against the current directory. A linked worktree
 /// whose main checkout keeps its git data outside a `.git` folder
 /// (`--separate-git-dir`) is treated as its own checkout.
+/// What the command line uses (`namespace resolve`, `hooks install`): a
+/// usable `NEUROSTRATA_NAMESPACE` from the environment first, then
+/// [`resolve_project_namespace`]. The daemon's hook refresh does not read its
+/// own environment: one daemon serves every project.
+pub fn resolve_cli_namespace(dir: &Path) -> String {
+    std::env::var("NEUROSTRATA_NAMESPACE")
+        .ok()
+        .and_then(|ns| usable_namespace(&ns))
+        .unwrap_or_else(|| resolve_project_namespace(dir))
+}
+
 pub fn resolve_project_namespace(dir: &Path) -> String {
     let dir = if dir.is_absolute() {
         dir.to_path_buf()
@@ -357,12 +371,14 @@ pub fn resolve_project_namespace(dir: &Path) -> String {
     let dir_s = dir.to_string_lossy().to_string();
     let own_root = crate::paths::git_root_of_dir(&dir_s).map(PathBuf::from);
     let main_root = crate::paths::main_checkout_root(&dir_s);
-    for root in own_root.iter().chain(main_root.iter()) {
+    // Outside git, `dir` itself is the only place to look.
+    let outside_git = (own_root.is_none() && main_root.is_none()).then(|| dir.clone());
+    for root in own_root.iter().chain(main_root.iter()).chain(outside_git.iter()) {
         if let Some(ns) = configured_namespace(root) {
             return ns;
         }
     }
-    for root in main_root.iter().chain(own_root.iter()) {
+    for root in main_root.iter().chain(own_root.iter()).chain(outside_git.iter()) {
         let ledger = root.join(".NeuroStrata").join("session_queries.json");
         if let Some(ns) = std::fs::read_to_string(ledger)
             .ok()
@@ -1045,8 +1061,40 @@ mod tests {
     /// `namespace resolve some/dir` takes a relative directory against the
     /// current one, as a shell user expects.
     #[test]
+    fn a_namespace_starts_with_a_letter_or_digit() {
+        assert_eq!(usable_namespace("example-project").as_deref(), Some("example-project"));
+        assert_eq!(usable_namespace("v1.2_x").as_deref(), Some("v1.2_x"));
+        for bad in ["", ".", "..", "--help", "-x", "_x", ".hidden", "a b", "$NS"] {
+            assert_eq!(usable_namespace(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn outside_git_the_directory_itself_is_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap().join("loose-folder");
+        std::fs::create_dir_all(dir.join(".opencode")).unwrap();
+        if crate::paths::git_root_of_dir(&dir.to_string_lossy()).is_some() {
+            eprintln!("skipped: the temp dir is inside a git checkout");
+            return;
+        }
+        assert_eq!(resolve_project_namespace(&dir), "loose-folder");
+        std::fs::write(
+            dir.join(".opencode").join("neurostrata-plugin.json"),
+            r#"{"neurostrata": {"namespace": "from-opencode"}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_project_namespace(&dir), "from-opencode");
+    }
+
+    #[test]
     fn a_relative_directory_resolves_against_the_current_one() {
         let here = std::env::current_dir().unwrap();
+        // Outside a git checkout (a source tarball) `src` is its own folder.
+        if crate::paths::git_root_of_dir(&here.to_string_lossy()).is_none() {
+            eprintln!("skipped: the crate is not inside a git checkout");
+            return;
+        }
         let expected = resolve_project_namespace(&here);
         assert_eq!(resolve_project_namespace(Path::new(".")), expected);
         assert_eq!(resolve_project_namespace(Path::new("src")), expected);
