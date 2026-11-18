@@ -3156,7 +3156,10 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 # A ledger the worktree already has (a lookup sent with the worktree as its
 # project root) is read too.
 MAIN_ROOT="$ROOT"
-COMMON=$(git rev-parse --git-common-dir 2>/dev/null)
+# git 2.31+ prints it absolute and normalized. Older git echoes the unknown
+# option on a line of its own and prints the dir as before (often relative),
+# hence the last line.
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | tail -n 1)
 case "$COMMON" in
     /*|[A-Za-z]:*) ;;
     "") ;;
@@ -3418,9 +3421,11 @@ mkdir -p "$(dirname "$LEDGER")"
 # add and write it, and one would lose the other's entries. An atomic `mkdir`
 # of a lock directory next to the ledger serializes the read-modify-write for
 # every writer below (node, python, awk), on Windows and POSIX alike. A lock
-# older than 30 s is left over from a killed hook and is taken over. After
-# about 5 s of waiting the hook writes anyway, with a warning: it only warns,
-# so it must never block a commit.
+# whose stamp is older than 30 s (or, with no stamp, whose directory is older
+# than a minute) is left over from a killed hook and is taken over. After
+# about 5 s of waiting the hook records nothing this time, with a warning: it
+# only warns, so it must never block a commit, and writing without the lock
+# could drop another commit's entries.
 LEDGER_LOCK="$LEDGER.lock"
 LEDGER_LOCKED=0
 release_ledger_lock() {
@@ -3429,22 +3434,31 @@ release_ledger_lock() {
         LEDGER_LOCKED=0
     fi
 }
+# Whether the lock directory "$1" was left behind by a killed hook.
+lock_is_stale() {
+    local since
+    since=$(cat "$1/since" 2>/dev/null)
+    case "$since" in
+        ''|*[!0-9]*) [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ] ;;
+        *) [ $(( $(date +%s) - since )) -gt 30 ] ;;
+    esac
+}
 acquire_ledger_lock() {
-    local tries=0 since
+    local tries=0 aside="$LEDGER_LOCK.stale.$$"
     while ! mkdir "$LEDGER_LOCK" 2>/dev/null; do
-        since=$(cat "$LEDGER_LOCK/since" 2>/dev/null)
-        case "$since" in
-            ''|*[!0-9]*) ;;
-            *)
-                if [ $(( $(date +%s) - since )) -gt 30 ]; then
-                    rm -rf "$LEDGER_LOCK" 2>/dev/null
-                    continue
-                fi
-                ;;
-        esac
+        # Rename a stale lock aside before removing it, and check it again
+        # there: if another hook took the lock over in the meantime, the
+        # fresh lock goes back instead of being removed.
+        if lock_is_stale "$LEDGER_LOCK" && mv "$LEDGER_LOCK" "$aside" 2>/dev/null; then
+            if lock_is_stale "$aside"; then
+                rm -rf "$aside" 2>/dev/null
+            else
+                mv "$aside" "$LEDGER_LOCK" 2>/dev/null
+            fi
+        fi
         tries=$((tries + 1))
         if [ "$tries" -ge 50 ]; then
-            echo "warning: NeuroStrata ledger lock $LEDGER_LOCK is held; writing the ledger without it" >&2
+            echo "warning: NeuroStrata ledger lock $LEDGER_LOCK is held; this commit's files are not recorded" >&2
             return 1
         fi
         sleep 0.1
@@ -3453,7 +3467,9 @@ acquire_ledger_lock() {
     LEDGER_LOCKED=1
     trap release_ledger_lock EXIT
 }
-acquire_ledger_lock
+if ! acquire_ledger_lock; then
+    exit 0
+fi
 
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
@@ -5302,9 +5318,23 @@ mod tests {
         std::fs::write(wt_a.join("after-stale.rs"), "y").unwrap();
         git_stdout_in(&wt_a, &["add", "after-stale.rs"]);
         let stderr = run_pre_commit(&bash, &hook, &wt_a);
-        assert!(!stderr.contains("writing the ledger without it"), "{stderr}");
+        assert!(!stderr.contains("ledger lock"), "{stderr}");
         assert!(!lock.exists(), "the hook removes the lock it took over");
         assert!(std::fs::read_to_string(&ledger).unwrap().contains("\"after-stale.rs\""));
+
+        // A lock another hook holds right now (fresh, still unstamped): the
+        // hook gives up after a few seconds, warns, records nothing, and does
+        // not remove that lock.
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(wt_a.join("while-held.rs"), "y").unwrap();
+        git_stdout_in(&wt_a, &["add", "while-held.rs"]);
+        let started = std::time::Instant::now();
+        let stderr = run_pre_commit(&bash, &hook, &wt_a);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "bounded wait");
+        assert!(stderr.contains("this commit's files are not recorded"), "{stderr}");
+        assert!(lock.exists(), "a held lock is not taken over");
+        assert!(!std::fs::read_to_string(&ledger).unwrap().contains("\"while-held.rs\""));
+        std::fs::remove_dir_all(&lock).unwrap();
 
         // Two worktrees committing at once: every entry of both survives.
         let wt_b = base.join("wt-b");
