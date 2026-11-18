@@ -22,7 +22,7 @@
 
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
@@ -251,6 +251,58 @@ function pathRelativeToProjectRoot(filePath: string, config: ResolvedConfig): st
     // fall through to the raw path
   }
   return filePath;
+}
+
+/**
+ * The directory the agent resolves its own relative file paths against: the
+ * one it was started in. Not the project root, which the host may place higher
+ * up (at the repository) than where the agent runs.
+ */
+function agentWorkingDirectory(): string {
+  const c = pluginCtx ?? {};
+  return (
+    asString(c?.location?.directory) ??
+    asString(c?.directory) ??
+    asString(c?.cwd) ??
+    process.cwd()
+  );
+}
+
+/** The `resolved_from` a `memories_for_file` reply carries, if any. */
+function fileRecallResolvedFrom(text: string): string | undefined {
+  try {
+    const body = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
+    return asString(body?.resolved_from);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Ask the daemon for the memories governing `filePath`. A relative path is
+ * sent joined onto the agent's working directory, so it names the file the
+ * agent meant wherever the agent was started; the daemon alone turns it into
+ * the project-relative path it stores. When the daemon places that absolute
+ * path under no project root (`resolved_from: "outside"`), or is too old to
+ * resolve absolute paths (no `resolved_from`), the path is asked as given,
+ * exactly as before.
+ */
+async function askMemoriesForFile(
+  client: NeuroStrataMCPClient,
+  namespace: string,
+  filePath: string,
+): Promise<string> {
+  const ask = (path: string) =>
+    client.callTool("neurostrata_memories_for_file", { namespace, path, limit: 5 });
+  if (isAbsolute(filePath)) return ask(filePath);
+  let text: string;
+  try {
+    text = await ask(resolve(agentWorkingDirectory(), filePath));
+  } catch {
+    return ask(filePath);
+  }
+  const from = fileRecallResolvedFrom(text);
+  return from === undefined || from === "outside" ? ask(filePath) : text;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1163,11 +1215,7 @@ export async function prefetchMemoriesForFile(
   }
   if (!mcpClient) return [];
   try {
-    const text = await mcpClient.callTool("neurostrata_memories_for_file", {
-      namespace,
-      path: normalized,
-      limit: 5,
-    });
+    const text = await askMemoriesForFile(mcpClient, namespace, normalized);
     recordPrefetchedPath(key);
     // Persist conceptual bridges from the hits into active_session.json so
     // sessionContextHandler can inject them as [NeuroStrata Conceptual Bridges].
@@ -1259,11 +1307,7 @@ async function recallMemoriesForSubagentFile(
   if (!entries) {
     if (!mcpClient) return [];
     try {
-      const text = await mcpClient.callTool("neurostrata_memories_for_file", {
-        namespace,
-        path: normalized,
-        limit: 5,
-      });
+      const text = await askMemoriesForFile(mcpClient, namespace, normalized);
       try {
         recordLocalSessionQuery(namespace, "neurostrata_memories_for_file", normalized);
       } catch {
