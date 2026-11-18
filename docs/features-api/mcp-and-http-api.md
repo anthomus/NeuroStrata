@@ -32,6 +32,8 @@
 - `neurostrata_procedure_perform` — fire a recurring procedure.
 - `neurostrata_guard_validate` — validate PreToolUse actions against behavioral rules and Zero-Action Start (`git push`/`pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` without file-output or exec-override flags like `--output`/`-c`, plus `neurostrata-mcp task` commands, are exempt from requiring an `in_progress` task so post-completion pushes pass without skipping the gate).
 
+When no task is in progress, `neurostrata_get_snapshot` removes `task_id`, `status`, `session_id` and `subagent_prompt_injection` from `.NeuroStrata/active_session.json`, so session start stops announcing a task once it is completed or released. Other keys (namespace, golden rules) stay.
+
 ## Code Intelligence & SCIP Call-Graph Tools
 
 - `neurostrata_Export_scip` — export SCIP code graph data.
