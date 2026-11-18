@@ -145,6 +145,13 @@ Installs `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (g
 ```bash
 neurostrata-mcp hooks install [--force]
 ```
+The hooks gate and record against the project's configured namespace, not the folder name (see `namespace resolve`).
+
+### `namespace resolve`
+Prints the namespace configured for a project. Order: `NEUROSTRATA_NAMESPACE` in the environment; `NEUROSTRATA_NAMESPACE` in `.claude/settings.local.json` (its `env` block, else a hook command); `neurostrata.namespace` in `.opencode/neurostrata-plugin.json`; the same files in the main checkout of a linked worktree; the main checkout's folder name last. It opens no database and starts no daemon. The `pre-push` and `pre-commit` hooks, `hooks install` and `get_snapshot`'s hook refresh all use it.
+```bash
+neurostrata-mcp namespace resolve [dir]
+```
 
 ---
 
