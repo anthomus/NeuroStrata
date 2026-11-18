@@ -22,7 +22,7 @@
 
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
@@ -287,6 +287,12 @@ function fileRecallResolvedFrom(text: string): string | undefined {
  * resolve absolute paths (no `resolved_from`), the path is asked as given,
  * exactly as before.
  */
+// A Windows path reaching a POSIX host (or the reverse) is still absolute: the
+// daemon reads both forms, so it must not be joined onto the working directory.
+function isAbsoluteOnAnyPlatform(path: string): boolean {
+  return posix.isAbsolute(path) || win32.isAbsolute(path);
+}
+
 async function askMemoriesForFile(
   client: NeuroStrataMCPClient,
   namespace: string,
@@ -294,7 +300,7 @@ async function askMemoriesForFile(
 ): Promise<string> {
   const ask = (path: string) =>
     client.callTool("neurostrata_memories_for_file", { namespace, path, limit: 5 });
-  if (isAbsolute(filePath)) return ask(filePath);
+  if (isAbsoluteOnAnyPlatform(filePath)) return ask(filePath);
   let text: string;
   try {
     text = await ask(resolve(agentWorkingDirectory(), filePath));

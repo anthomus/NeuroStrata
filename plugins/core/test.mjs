@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { join, isAbsolute, resolve as resolvePath } from "node:path";
+import { join, isAbsolute, posix as posixPath, win32 as win32Path, resolve as resolvePath } from "node:path";
 import { execFileSync as execFileSyncTop } from "node:child_process";
 
 // Windows cannot execute a .sh file directly (EFTYPE). Production hook
@@ -192,7 +192,8 @@ function createMockDaemonServer({ returnTask = null, guardReject = false, legacy
             // and the reply says from where. `legacyDaemon` answers like one
             // that cannot resolve absolute paths (no hits, no resolved_from);
             // `outsidePaths` lists absolute paths under no project root.
-            const absolute = typeof args.path === "string" && isAbsolute(args.path);
+            const absolute = typeof args.path === "string"
+              && (posixPath.isAbsolute(args.path) || win32Path.isAbsolute(args.path));
             const hit = {
               id: "mem-rule-1",
               valid_from: "2026-01-01T00:00:00Z",
@@ -835,6 +836,16 @@ describe("file recall sends the path the agent meant", () => {
       await prefetchMemoriesForFile("abs-ns", abs);
       assert.deepEqual(counters.memoriesForFilePaths, [abs]);
     });
+  });
+
+  it("sends an absolute path of the other platform unchanged", async () => {
+    // Node's own isAbsolute only knows the host's form; both must pass through.
+    for (const abs of ["C:\\repo\\src\\foo.ts", "/repo/src/foo.ts"]) {
+      await run({}, { directory: root }, async (counters) => {
+        await prefetchMemoriesForFile("abs-ns", abs);
+        assert.deepEqual(counters.memoriesForFilePaths, [abs]);
+      });
+    }
   });
 
   it("asks the path as given when the daemon places it under no project root", async () => {
