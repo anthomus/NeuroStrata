@@ -1036,7 +1036,7 @@ pub(crate) fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f6
 /// crate::paths. Do not normalize, join or compare paths by hand.
 fn ledger_path_for(tool_name: &str, query_hint: &str, ledger_root: &str) -> Option<(String, String)> {
     use crate::parser::ingest::normalize_node_path;
-    use crate::paths::{to_project_relative, validate_root, RootSource};
+    use crate::paths::{to_project_relative, RootSource};
     if tool_name != "neurostrata_memories_for_file" && !crate::paths::is_absolute_any(query_hint) {
         return None;
     }
@@ -1047,10 +1047,11 @@ fn ledger_path_for(tool_name: &str, query_hint: &str, ledger_root: &str) -> Opti
         _ => (resolved.path, resolved.root.unwrap_or_else(|| ledger_root.to_string())),
     };
     let path = normalize_node_path(&path);
-    if path.is_empty() {
+    // A relative hint that climbs out (`../x.rs`) names no file under the root.
+    if path.is_empty() || path.split('/').any(|part| part == "..") {
         return None;
     }
-    let root = validate_root(&root)
+    let root = dunce::canonicalize(&root)
         .map(|r| r.to_string_lossy().to_string())
         .unwrap_or(root);
     Some((path, root))
@@ -1173,10 +1174,46 @@ pub async fn record_graph_query(
             path: path.as_deref(),
             root: path_root.as_deref(),
         };
-        let existing = std::fs::read_to_string(&ledger_path).ok();
-        if let Some(text) = append_ledger_entry(existing.as_deref(), &ns, &entry) {
-            let _ = std::fs::write(&ledger_path, text);
+        // An empty file (a writer cut short) is a missing ledger. Text that is
+        // not JSON at all is moved aside, kept, and a new ledger started, so one
+        // torn write does not stop every later lookup from being recorded. JSON
+        // without a `queries` array is someone else's file: left alone.
+        let mut existing = std::fs::read_to_string(&ledger_path)
+            .ok()
+            .filter(|text| !text.trim().is_empty());
+        if let Some(text) = existing.as_deref() {
+            if serde_json::from_str::<Value>(text).is_err() {
+                let aside = ledger_path.with_file_name(format!("session_queries.json.unreadable-{now}"));
+                tracing::warn!(
+                    "{} is not JSON; moved to {} and started a new ledger",
+                    ledger_path.display(),
+                    aside.display()
+                );
+                if std::fs::rename(&ledger_path, &aside).is_err() {
+                    return;
+                }
+                existing = None;
+            }
         }
+        match append_ledger_entry(existing.as_deref(), &ns, &entry) {
+            Some(text) => write_ledger_atomically(&ledger_path, &text),
+            None => tracing::warn!(
+                "{} has no top-level `queries` array; lookup not recorded",
+                ledger_path.display()
+            ),
+        }
+    }
+}
+
+/// Write the ledger through a temporary file and a rename, so a reader (the
+/// plugins, the pre-commit hook) never sees a half-written file from the daemon.
+fn write_ledger_atomically(ledger_path: &std::path::Path, text: &str) {
+    let tmp = ledger_path.with_file_name(format!(
+        "session_queries.json.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, ledger_path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -5257,6 +5294,9 @@ mod tests {
             Some("src/lib.rs".to_string())
         );
         assert_eq!(ledger_path_for("neurostrata_search_memory", "auth flow", &root_s), None);
+        // A relative hint that climbs out of the root names no file under it.
+        assert_eq!(ledger_path_for(mff, "../other/x.rs", &root_s), None);
+        assert_eq!(ledger_path_for(mff, "src/../../x.rs", &root_s), None);
         // Outside every root this project knows: no `path`.
         let other = dunce::canonicalize(tmp.path()).unwrap().join("other").join("x.rs");
         assert_eq!(ledger_path_for(mff, &other.to_string_lossy(), &root_s), None);
@@ -5327,6 +5367,34 @@ mod tests {
         assert_eq!(entry["path"], json!("src/lib.rs"));
         assert_eq!(entry["root"], json!(root.to_string_lossy()));
         assert_eq!(entry["governed_prefixes"], json!([raw]), "unchanged for older hooks");
+
+        // A torn write (empty file) is a missing ledger; text that is not JSON
+        // is kept aside and a new ledger started; JSON without `queries` is
+        // left alone. Every case leaves no temporary file behind.
+        let ledger_path = root.join(".NeuroStrata").join("session_queries.json");
+        let record = || record_graph_query(&store, "ledger-path-probe", "neurostrata_memories_for_file", &raw);
+        std::fs::write(&ledger_path, "").unwrap();
+        record().await;
+        let fresh: Value = serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        assert_eq!(fresh["queries"].as_array().unwrap().len(), 1, "{fresh}");
+
+        std::fs::write(&ledger_path, "{\"queries\": [ {\"ts\": 1").unwrap();
+        record().await;
+        let fresh: Value = serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        assert_eq!(fresh["queries"].as_array().unwrap().len(), 1, "{fresh}");
+        let kept: Vec<String> = std::fs::read_dir(root.join(".NeuroStrata"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            kept.iter().any(|name| name.starts_with("session_queries.json.unreadable-")),
+            "{kept:?}"
+        );
+        assert!(!kept.iter().any(|name| name.ends_with(".tmp")), "{kept:?}");
+
+        std::fs::write(&ledger_path, "{\"other\": true}").unwrap();
+        record().await;
+        assert_eq!(std::fs::read_to_string(&ledger_path).unwrap(), "{\"other\": true}");
     }
 
     /// A store whose `namespace` already holds one rule, so the namespace
