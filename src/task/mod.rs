@@ -646,10 +646,11 @@ pub(crate) async fn task_payload_with_fresh_context(
     task_id: &str,
     payload: &MemoryPayload,
 ) -> MemoryPayload {
-    let vector = load_task(store, namespace, task_id)
-        .await
-        .map(|(_task, vec)| vec)
-        .unwrap_or_default();
+    // Without the task's vector the rebuilt block would lose its related
+    // memories; keep the cached block then.
+    let Ok((_task, vector)) = load_task(store, namespace, task_id).await else {
+        return payload.clone();
+    };
     let (_hits, prompt) = build_task_graph_context(store, namespace, task_id, &vector, payload).await;
     let mut fresh = payload.clone();
     task_obj_mut(&mut fresh).insert("subagent_prompt_injection".to_string(), json!(prompt));
