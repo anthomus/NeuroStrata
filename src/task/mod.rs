@@ -1183,7 +1183,10 @@ pub async fn record_graph_query(
             .filter(|text| !text.trim().is_empty());
         if let Some(text) = existing.as_deref() {
             if serde_json::from_str::<Value>(text).is_err() {
-                let aside = ledger_path.with_file_name(format!("session_queries.json.unreadable-{now}"));
+                let aside = ledger_path.with_file_name(format!(
+                    "session_queries.json.unreadable-{now}-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
                 tracing::warn!(
                     "{} is not JSON; moved to {} and started a new ledger",
                     ledger_path.display(),
@@ -1212,8 +1215,10 @@ fn write_ledger_atomically(ledger_path: &std::path::Path, text: &str) {
         "session_queries.json.{}.tmp",
         uuid::Uuid::new_v4()
     ));
-    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, ledger_path).is_err() {
+    let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, ledger_path));
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("{}: lookup not recorded: {e}", ledger_path.display());
     }
 }
 
