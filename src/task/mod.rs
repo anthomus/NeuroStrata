@@ -3148,10 +3148,13 @@ pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # Install with:  neurostrata-mcp hooks install
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-# Linked worktrees (`git worktree add`, `.claude/worktrees/...`) share ONE
-# ledger: the main checkout's. The common git dir of a linked worktree is the
-# main checkout's `.git`; for the main checkout itself git prints `.git`,
-# relative to the top level, where hooks run.
+# Linked worktrees (`git worktree add`, `.claude/worktrees/...`) record into
+# ONE ledger: the main checkout's. The common git dir of a linked worktree is
+# the main checkout's `.git`; for the main checkout itself git prints `.git`,
+# relative to the top level, where hooks run. A common dir not named `.git`
+# (`--separate-git-dir`, a bare repository) keeps the worktree's own ledger.
+# A ledger the worktree already has (a lookup sent with the worktree as its
+# project root) is read too.
 MAIN_ROOT="$ROOT"
 COMMON=$(git rev-parse --git-common-dir 2>/dev/null)
 case "$COMMON" in
@@ -3163,6 +3166,10 @@ case "$COMMON" in
     */.git) MAIN_ROOT="${COMMON%/.git}" ;;
 esac
 LEDGER="$MAIN_ROOT/.NeuroStrata/session_queries.json"
+OWN_LEDGER=""
+if [ "$MAIN_ROOT" != "$ROOT" ] && [ -f "$ROOT/.NeuroStrata/session_queries.json" ]; then
+    OWN_LEDGER="$ROOT/.NeuroStrata/session_queries.json"
+fi
 NAMESPACE=""
 if [ -f "$LEDGER" ]; then
     NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
@@ -3220,12 +3227,16 @@ normalize_rel_path() {
     printf '%s' "$p"
 }
 
-# Dump decoded, normalized ledger paths (one per line) using node or python3.
-# Empty if ledger missing or neither runtime is available.
+# Dump decoded, normalized paths (one per line) of the ledger file "$1" using
+# node or python3. Empty if that ledger is missing or neither runtime is
+# available.
 dump_ledger_paths() {
-    if [ ! -f "$LEDGER" ]; then
+    if [ ! -f "$1" ]; then
         return 0
     fi
+    ( LEDGER="$1"; dump_ledger_file )
+}
+dump_ledger_file() {
     export LEDGER ROOT MAIN_ROOT FOLD
     if command -v node >/dev/null 2>&1; then
         node -e '
@@ -3326,7 +3337,21 @@ for p in out:
     fi
 }
 
-LEDGER_PATHS=$(dump_ledger_paths)
+LEDGER_PATHS=$(dump_ledger_paths "$LEDGER"; [ -n "$OWN_LEDGER" ] && dump_ledger_paths "$OWN_LEDGER")
+
+# The ledgers this hook reads: the shared one, and the worktree's own if any.
+any_ledger() {
+    [ -f "$LEDGER" ] || [ -n "$OWN_LEDGER" ]
+}
+
+# Raw-text fallback when neither node nor python3 is available.
+ledger_grep() {
+    local needle="$1" f
+    for f in "$LEDGER" "$OWN_LEDGER"; do
+        [ -n "$f" ] && [ -f "$f" ] && grep -qF "$needle" "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
 
 ledger_has_file() {
     local rel="$1"
@@ -3334,10 +3359,11 @@ ledger_has_file() {
         printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel")"
         return $?
     fi
-    [ -f "$LEDGER" ] || return 1
-    grep -qF "\"$rel\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"./$rel\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"$ROOT/$rel\"" "$LEDGER" 2>/dev/null
+    any_ledger || return 1
+    ledger_grep "\"$rel\"" \
+        || ledger_grep "\"./$rel\"" \
+        || ledger_grep "\"$ROOT/$rel\"" \
+        || ledger_grep "\"$MAIN_ROOT/$rel\""
 }
 
 ledger_has_dir() {
@@ -3346,11 +3372,12 @@ ledger_has_dir() {
         printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel_dir")"
         return $?
     fi
-    [ -f "$LEDGER" ] || return 1
-    grep -qF "\"$rel_dir/\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"./$rel_dir/\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"$ROOT/$rel_dir/\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"$rel_dir\"" "$LEDGER" 2>/dev/null
+    any_ledger || return 1
+    ledger_grep "\"$rel_dir/\"" \
+        || ledger_grep "\"./$rel_dir/\"" \
+        || ledger_grep "\"$ROOT/$rel_dir/\"" \
+        || ledger_grep "\"$MAIN_ROOT/$rel_dir/\"" \
+        || ledger_grep "\"$rel_dir\""
 }
 
 # ── Check each staged file / ancestor dir-prefix against session_queries.json ──
@@ -3358,7 +3385,7 @@ for raw_file in "${StagedFiles[@]}"; do
     file=$(normalize_rel_path "$raw_file")
     [ -z "$file" ] && continue
     matched=0
-    if [ -f "$LEDGER" ]; then
+    if any_ledger; then
         if ledger_has_file "$file"; then
             matched=1
         else
@@ -5141,6 +5168,30 @@ mod tests {
         assert!(!wt.join(".NeuroStrata").exists(), "the worktree has no ledger of its own");
         let main_ledger = std::fs::read_to_string(&ledger).unwrap();
         assert!(main_ledger.contains("\"fresh.rs\""), "recorded in the main checkout's ledger");
+
+        // A ledger the worktree already has (a lookup sent with the worktree
+        // as its project root) still counts, and the hook records into the
+        // main checkout's ledger, not that one.
+        std::fs::create_dir_all(wt.join(".NeuroStrata")).unwrap();
+        let wt_ledger = wt.join(".NeuroStrata").join("session_queries.json");
+        let wt_entry = wt.join("wt-only.rs").to_string_lossy().to_string();
+        std::fs::write(
+            &wt_ledger,
+            serde_json::to_string_pretty(&json!({"namespace": "example-project", "queries": [
+                {"ts": 1, "tool": "neurostrata_memories_for_file", "query": wt_entry, "governed_prefixes": [wt_entry]}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let wt_ledger_before = std::fs::read_to_string(&wt_ledger).unwrap();
+        std::fs::write(wt.join("wt-only.rs"), "y").unwrap();
+        std::fs::write(wt.join("fresh2.rs"), "y").unwrap();
+        git_stdout_in(&wt, &["add", "wt-only.rs", "fresh2.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &wt);
+        assert!(!stderr.contains("wt-only.rs' has no recorded"), "{stderr}");
+        assert!(stderr.contains("file 'fresh2.rs' has no recorded"), "{stderr}");
+        assert_eq!(std::fs::read_to_string(&wt_ledger).unwrap(), wt_ledger_before);
+        assert!(std::fs::read_to_string(&ledger).unwrap().contains("\"fresh2.rs\""));
     }
 
     /// A store whose `namespace` already holds one rule, so the namespace
