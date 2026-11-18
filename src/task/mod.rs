@@ -688,12 +688,144 @@ pub fn persist_active_session_file(
             active.insert("subagent_prompt_injection".to_string(), json!(inj));
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
+    } else {
+        // No task is in progress: drop the fields a finished (completed or
+        // released) task left behind, or the session-start hook keeps
+        // announcing it as the active task.
+        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+            active.remove(key);
+        }
+        active.insert("updated_at".to_string(), json!(machine::timestamp()));
     }
 
     if std::fs::create_dir_all(&ns_dir).is_ok() {
         if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
             let _ = std::fs::write(&session_path, serialized);
         }
+    }
+}
+
+/// Serializes every read-modify-write of `.NeuroStrata/active_session.json`
+/// (claim, snapshot, and the cleanup after a task ends), so a cleanup cannot
+/// clear the fields a concurrent claim has just written. One daemon process
+/// runs all of them (see [`claim_lock`]), so a process lock covers it.
+static SESSION_FILE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// The task id the session file at `project_root` currently names, if any.
+fn session_file_task_id(project_root: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(project_root.join(".NeuroStrata").join("active_session.json")).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    value.get("task_id").and_then(|v| v.as_str()).map(String::from)
+}
+
+/// The row of task `id` read fresh: `Ok(Some)` when it is in progress and a
+/// snapshot would show it (not archived, expired or mesh-conflicting),
+/// `Ok(None)` when it is not, `Err` when the store could not be read. A read
+/// error is never taken as "finished".
+async fn in_progress_task(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    id: &str,
+) -> Result<Option<Task>, ()> {
+    let payload = match store.get(namespace, id).await {
+        Ok(Some((_, payload))) => payload,
+        Ok(None) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let expired = payload
+        .metadata
+        .get("valid_to")
+        .is_some_and(|v| !v.is_null() && v.as_i64().unwrap_or(0) <= now);
+    let task = Task { id: id.to_string(), payload };
+    let shown = task.payload.memory_type == "task"
+        && task.status() == Status::InProgress
+        && !expired
+        && !crate::handlers::archive_memory::is_archived(&task.payload)
+        && !crate::synaptic_mesh::conflict::is_conflicting(&task.payload);
+    Ok(shown.then_some(task))
+}
+
+/// [`persist_active_session_file`] under [`SESSION_FILE_LOCK`]. `claimed` is
+/// the row a claim has just saved, written as is. Otherwise a task is named
+/// only when its row is in progress at write time: `candidate` (the task the
+/// snapshot found), else the task the file already names (a claim that landed
+/// after the snapshot listed the tasks), else none. If a row cannot be read,
+/// the file is left as it is.
+pub(crate) async fn refresh_active_session_file(
+    store: &Arc<dyn VectorStore>,
+    project_root: &std::path::Path,
+    namespace: &str,
+    golden_rules: &[SearchResult],
+    claimed: Option<(&str, &MemoryPayload)>,
+    candidate: Option<&str>,
+) {
+    let _session_guard = SESSION_FILE_LOCK.lock().await;
+    if let Some(claimed) = claimed {
+        persist_active_session_file(project_root, namespace, golden_rules, Some(claimed));
+        return;
+    }
+    let mut active: Option<Task> = None;
+    let named = session_file_task_id(project_root);
+    for id in candidate.map(String::from).into_iter().chain(named) {
+        match in_progress_task(store, namespace, &id).await {
+            Ok(Some(task)) => {
+                active = Some(task);
+                break;
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
+    }
+    persist_active_session_file(
+        project_root,
+        namespace,
+        golden_rules,
+        active.as_ref().map(|task| (task.id.as_str(), &task.payload)),
+    );
+}
+
+/// When task `task_id` stops being in progress (completed, released, blocked),
+/// remove its fields from the session file at the namespace's registered
+/// project root, the file `task_claim` wrote, so the next session start does
+/// not announce a finished task. Only a file that still names this task is
+/// touched: another task claimed since keeps its fields, and so does this
+/// task when another session has claimed it again meanwhile (its row is
+/// read again under the session file lock). Best effort.
+pub(crate) async fn clear_finished_task_from_session_file(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+) {
+    let rid = crate::registry::registry_row_id(namespace);
+    let Ok(Some((_, registry))) = store.get(namespace, &rid).await else {
+        return;
+    };
+    let Some(root) = registry.metadata.get("project_root").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let _session_guard = SESSION_FILE_LOCK.lock().await;
+    let session_path = std::path::Path::new(root).join(".NeuroStrata").join("active_session.json");
+    let Some(mut active) = std::fs::read_to_string(&session_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+    else {
+        return;
+    };
+    if active.get("task_id").and_then(|v| v.as_str()) != Some(task_id) {
+        return;
+    }
+    if !matches!(in_progress_task(store, namespace, task_id).await, Ok(None)) {
+        return;
+    }
+    for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+        active.remove(key);
+    }
+    active.insert("updated_at".to_string(), json!(machine::timestamp()));
+    if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
+        let _ = std::fs::write(&session_path, serialized);
     }
 }
 
@@ -1599,12 +1731,15 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     if let Ok(Some((_, reg_p))) = store.get(&namespace, &rid).await {
         if let Some(pr) = reg_p.metadata.get("project_root").and_then(|v| v.as_str()) {
             let golden = collect_golden_rules(&store, &namespace, None).await;
-            persist_active_session_file(
+            refresh_active_session_file(
+                &store,
                 std::path::Path::new(pr),
                 &namespace,
                 &golden,
                 Some((&id, &task.payload)),
-            );
+                None,
+            )
+            .await;
         }
     }
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
@@ -1879,6 +2014,9 @@ pub async fn handle_task_update(
 
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
+    }
+    if from == Status::InProgress && task.status() != Status::InProgress {
+        clear_finished_task_from_session_file(&store, &namespace, &id).await;
     }
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("update-{}", id)).to_string();
     let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
@@ -2557,6 +2695,7 @@ pub async fn handle_task_complete(
         }
     }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
+    clear_finished_task_from_session_file(&store, &namespace, &id).await;
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("complete-{}", id)).to_string();
     let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
         task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
