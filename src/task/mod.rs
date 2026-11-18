@@ -1029,6 +1029,34 @@ pub(crate) fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f6
     }
 }
 
+/// The project-relative path (with `/`) a ledger entry names, and the root it
+/// is relative to, for a lookup that names a file: a `memories_for_file` hint,
+/// or any absolute hint. `None` for free-text queries and for an absolute path
+/// under no root the ledger's project knows. All path handling goes through
+/// crate::paths. Do not normalize, join or compare paths by hand.
+fn ledger_path_for(tool_name: &str, query_hint: &str, ledger_root: &str) -> Option<(String, String)> {
+    use crate::parser::ingest::normalize_node_path;
+    use crate::paths::{to_project_relative, RootSource};
+    if tool_name != "neurostrata_memories_for_file" && !crate::paths::is_absolute_any(query_hint) {
+        return None;
+    }
+    let resolved = to_project_relative(query_hint, None, Some(ledger_root));
+    let (path, root) = match resolved.source {
+        RootSource::Outside => return None,
+        RootSource::Relative => (query_hint.to_string(), ledger_root.to_string()),
+        _ => (resolved.path, resolved.root.unwrap_or_else(|| ledger_root.to_string())),
+    };
+    let path = normalize_node_path(&path);
+    // A relative hint that climbs out (`../x.rs`) names no file under the root.
+    if path.is_empty() || path.split('/').any(|part| part == "..") {
+        return None;
+    }
+    let root = dunce::canonicalize(&root)
+        .map(|r| r.to_string_lossy().to_string())
+        .unwrap_or(root);
+    Some((path, root))
+}
+
 /// Record a graph or memory lookup against any active `in_progress` task in
 /// `namespace` and append to `.NeuroStrata/session_queries.json` if a project
 /// root is known.
@@ -1131,22 +1159,155 @@ pub async fn record_graph_query(
         if let Some(parent) = ledger_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut doc: Value = std::fs::read_to_string(&ledger_path)
+        // Additive: `query` stays the raw hint (history, and what older hooks
+        // read); `path` is the same file project-relative with `/`, and `root`
+        // the directory it is relative to.
+        let (path, path_root) = match ledger_path_for(tool_name, query_hint, &root) {
+            Some((path, path_root)) => (Some(path), Some(path_root)),
+            None => (None, None),
+        };
+        let entry = LedgerEntry {
+            ts: now,
+            tool: tool_name,
+            query: query_hint,
+            governed_prefixes: [governed_prefix.as_str()],
+            path: path.as_deref(),
+            root: path_root.as_deref(),
+        };
+        // An empty file (a writer cut short) is a missing ledger. Text that is
+        // not JSON at all is moved aside, kept, and a new ledger started, so one
+        // torn write does not stop every later lookup from being recorded. JSON
+        // without a `queries` array is someone else's file: left alone.
+        let mut existing = std::fs::read_to_string(&ledger_path)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| json!({ "namespace": ns, "queries": [] }));
-        if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
-            arr.push(json!({
-                "ts": now,
-                "tool": tool_name,
-                "query": query_hint,
-                "governed_prefixes": [governed_prefix],
-            }));
-            if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
-                let _ = std::fs::write(&ledger_path, serialized);
+            .filter(|text| !text.trim().is_empty());
+        if let Some(text) = existing.as_deref() {
+            if serde_json::from_str::<Value>(text).is_err() {
+                let aside = ledger_path.with_file_name(format!(
+                    "session_queries.json.unreadable-{now}-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                tracing::warn!(
+                    "{} is not JSON; moved to {} and started a new ledger",
+                    ledger_path.display(),
+                    aside.display()
+                );
+                if std::fs::rename(&ledger_path, &aside).is_err() {
+                    return;
+                }
+                existing = None;
             }
         }
+        match append_ledger_entry(existing.as_deref(), &ns, &entry) {
+            Some(text) => write_ledger_atomically(&ledger_path, &text),
+            None => tracing::warn!(
+                "{} has no top-level `queries` array; lookup not recorded",
+                ledger_path.display()
+            ),
+        }
     }
+}
+
+/// Write the ledger through a temporary file and a rename, so a reader (the
+/// plugins, the pre-commit hook) never sees a half-written file from the daemon.
+fn write_ledger_atomically(ledger_path: &std::path::Path, text: &str) {
+    let tmp = ledger_path.with_file_name(format!(
+        "session_queries.json.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, ledger_path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("{}: lookup not recorded: {e}", ledger_path.display());
+    }
+}
+
+/// One `.NeuroStrata/session_queries.json` entry, fields in the order the
+/// plugins and the pre-commit hook write them (ts, tool, query,
+/// governed_prefixes), then the optional resolved `path` and `root`.
+#[derive(serde::Serialize)]
+struct LedgerEntry<'a> {
+    ts: i64,
+    tool: &'a str,
+    query: &'a str,
+    governed_prefixes: [&'a str; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<&'a str>,
+}
+
+/// The ledger text with `entry` appended to its `queries` array, leaving every
+/// byte of the existing entries as it was. The daemon used to parse the whole
+/// file and write it back with `serde_json`, which sorts object keys: every
+/// lookup re-ordered all of the plugins' entries (thousands of them), so each
+/// one showed up as a diff of the whole file. `None` when the file exists but
+/// is not a ledger this can append to (unparseable, or no `queries` array):
+/// it is left alone rather than replaced. A missing file starts a new ledger.
+fn append_ledger_entry(existing: Option<&str>, namespace: &str, entry: &LedgerEntry<'_>) -> Option<String> {
+    let entry_text = serde_json::to_string_pretty(entry).ok()?;
+    // Indented for an element of a top-level array member, as
+    // `JSON.stringify(doc, null, 2)` lays it out.
+    let entry_text = entry_text.replace('\n', "\n    ");
+    let Some(text) = existing else {
+        let namespace = serde_json::to_string(namespace).ok()?;
+        return Some(format!(
+            "{{\n  \"namespace\": {namespace},\n  \"queries\": [\n    {entry_text}\n  ]\n}}"
+        ));
+    };
+    serde_json::from_str::<Value>(text).ok()?.get("queries")?.as_array()?;
+    let (open, close) = top_level_array_span(text, "queries")?;
+    let inner = &text[open + 1..close];
+    if inner.trim().is_empty() {
+        return Some(format!("{}\n    {entry_text}\n  {}", &text[..=open], &text[close..]));
+    }
+    // After the last element, before the whitespace that precedes `]`.
+    let last = open + 1 + inner.trim_end().len();
+    Some(format!("{},\n    {entry_text}{}", &text[..last], &text[last..]))
+}
+
+/// Byte offsets of the `[` and `]` of the array held by top-level key `key` in
+/// a JSON object text. Strings (and their escapes) are skipped, so a bracket
+/// inside a query never counts.
+fn top_level_array_span(text: &str, key: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut i) = (0usize, 0usize);
+    let mut last_string: Option<(usize, usize)> = None;
+    let mut key_matches = false;
+    let mut open: Option<usize> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i + 1;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                last_string = Some((start, i));
+            }
+            b':' if depth == 1 && open.is_none() => {
+                key_matches = last_string.is_some_and(|(s, e)| text.get(s..e) == Some(key));
+            }
+            b',' if depth == 1 && open.is_none() => key_matches = false,
+            b'[' | b'{' => {
+                if depth == 1 && open.is_none() && key_matches && bytes[i] == b'[' {
+                    open = Some(i);
+                }
+                depth += 1;
+            }
+            b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 1 && bytes[i] == b']' {
+                    if let Some(open) = open {
+                        return Some((open, i));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 // ── tool: neurostrata_task_create ──────────────────────────────────────────
@@ -5105,6 +5266,140 @@ mod tests {
         for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
             assert!(!stderr.contains(&format!("src/a/{f}.rs' has no recorded")), "{f}: {stderr}");
         }
+    }
+
+    /// Ledger entries name a file the way the hooks compare it: relative to
+    /// the project, with `/`, whatever spelling the lookup arrived in.
+    #[test]
+    fn ledger_entries_resolve_the_looked_up_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("lib.rs"), b"x").unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        let file = root.join("src").join("lib.rs").to_string_lossy().to_string();
+        let mff = "neurostrata_memories_for_file";
+        for hint in [
+            file.clone(),
+            file.replace('\\', "/"),
+            "src/lib.rs".into(),
+            r"src\lib.rs".into(),
+            "./src/lib.rs".into(),
+        ] {
+            assert_eq!(
+                ledger_path_for(mff, &hint, &root_s),
+                Some(("src/lib.rs".to_string(), root_s.clone())),
+                "{hint}"
+            );
+        }
+        // An absolute hint from another tool is a file too; free text is not.
+        assert_eq!(
+            ledger_path_for("neurostrata_context_plan", &file, &root_s).map(|(p, _)| p),
+            Some("src/lib.rs".to_string())
+        );
+        assert_eq!(ledger_path_for("neurostrata_search_memory", "auth flow", &root_s), None);
+        // A relative hint that climbs out of the root names no file under it.
+        assert_eq!(ledger_path_for(mff, "../other/x.rs", &root_s), None);
+        assert_eq!(ledger_path_for(mff, "src/../../x.rs", &root_s), None);
+        // Outside every root this project knows: no `path`.
+        let other = dunce::canonicalize(tmp.path()).unwrap().join("other").join("x.rs");
+        assert_eq!(ledger_path_for(mff, &other.to_string_lossy(), &root_s), None);
+    }
+
+    /// A lookup appends its entry without touching the bytes of the entries
+    /// already there: the plugins' key order (ts, tool, query,
+    /// governed_prefixes), their spacing, unusual characters, and whatever
+    /// follows the array survive, so the file's diff is the new entry only.
+    #[test]
+    fn a_ledger_append_leaves_the_existing_bytes_unchanged() {
+        let entry = LedgerEntry {
+            ts: 7,
+            tool: "neurostrata_memories_for_file",
+            query: r"C:\dev\example-project\src\lib.rs",
+            governed_prefixes: [r"C:\dev\example-project\src\lib.rs"],
+            path: Some("src/lib.rs"),
+            root: Some(r"C:\dev\example-project"),
+        };
+        let before = "{\n  \"namespace\": \"example-project\",\n  \"queries\": [\n    {\n      \"ts\": 1,\n      \"tool\": \"neurostrata_related\",\n      \"query\": \"a ] b [ \\\" } \u{e9}\",\n      \"governed_prefixes\": [\n        \"a/\"\n      ]\n    },\n    {\"ts\": 2, \"query\": \"x\", \"tool\": \"pre-commit\"}\n  ],\n  \"extra\": [1, 2]\n}";
+        let after = append_ledger_entry(Some(before), "example-project", &entry).expect("appends");
+        let cut = before.find("\n  ],").unwrap();
+        assert_eq!(&after[..cut], &before[..cut], "every earlier byte is unchanged");
+        assert!(after.ends_with(&before[cut..]), "and so is everything after the array");
+        let parsed: Value = serde_json::from_str(&after).expect("still JSON");
+        let queries = parsed["queries"].as_array().unwrap();
+        assert_eq!(queries.len(), 3);
+        assert_eq!(queries[2]["path"], json!("src/lib.rs"));
+        assert_eq!(parsed["extra"], json!([1, 2]));
+        let added = &after[cut..];
+        let order: Vec<usize> = ["\"ts\"", "\"tool\"", "\"query\"", "\"governed_prefixes\"", "\"path\"", "\"root\""]
+            .iter()
+            .map(|k| added.find(k).unwrap())
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "the plugins' key order: {added}");
+
+        // An empty array, a missing file, and a file that is not a ledger.
+        let empty = "{\"namespace\": \"n\", \"queries\": []}";
+        let grown = append_ledger_entry(Some(empty), "n", &entry).unwrap();
+        assert!(grown.starts_with("{\"namespace\": \"n\", \"queries\": ["));
+        assert_eq!(serde_json::from_str::<Value>(&grown).unwrap()["queries"].as_array().unwrap().len(), 1);
+        let fresh = append_ledger_entry(None, "n", &entry).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&fresh).unwrap()["namespace"], json!("n"));
+        assert_eq!(append_ledger_entry(Some("not json"), "n", &entry), None, "left alone");
+        assert_eq!(append_ledger_entry(Some("[1]"), "n", &entry), None, "left alone");
+    }
+
+    /// The daemon's ledger entry keeps the raw `query` and adds `path` and
+    /// `root` (additive: older hooks read `query` and `governed_prefixes`).
+    #[tokio::test]
+    async fn the_ledger_entry_carries_the_resolved_path_and_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let store = store_with_namespace("ledger-path-probe").await;
+        crate::registry::cache_project_root(&store, Some(&emb()), "ledger-path-probe", &root.to_string_lossy())
+            .await;
+        let raw = root.join("src").join("lib.rs").to_string_lossy().to_string();
+        record_graph_query(&store, "ledger-path-probe", "neurostrata_memories_for_file", &raw).await;
+
+        let ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json")).unwrap(),
+        )
+        .unwrap();
+        let entry = ledger["queries"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(entry["query"], json!(raw), "the raw hint is kept");
+        assert_eq!(entry["path"], json!("src/lib.rs"));
+        assert_eq!(entry["root"], json!(root.to_string_lossy()));
+        assert_eq!(entry["governed_prefixes"], json!([raw]), "unchanged for older hooks");
+
+        // A torn write (empty file) is a missing ledger; text that is not JSON
+        // is kept aside and a new ledger started; JSON without `queries` is
+        // left alone. Every case leaves no temporary file behind.
+        let ledger_path = root.join(".NeuroStrata").join("session_queries.json");
+        let record = || record_graph_query(&store, "ledger-path-probe", "neurostrata_memories_for_file", &raw);
+        std::fs::write(&ledger_path, "").unwrap();
+        record().await;
+        let fresh: Value = serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        assert_eq!(fresh["queries"].as_array().unwrap().len(), 1, "{fresh}");
+
+        std::fs::write(&ledger_path, "{\"queries\": [ {\"ts\": 1").unwrap();
+        record().await;
+        let fresh: Value = serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        assert_eq!(fresh["queries"].as_array().unwrap().len(), 1, "{fresh}");
+        let kept: Vec<String> = std::fs::read_dir(root.join(".NeuroStrata"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            kept.iter().any(|name| name.starts_with("session_queries.json.unreadable-")),
+            "{kept:?}"
+        );
+        assert!(!kept.iter().any(|name| name.ends_with(".tmp")), "{kept:?}");
+
+        std::fs::write(&ledger_path, "{\"other\": true}").unwrap();
+        record().await;
+        assert_eq!(std::fs::read_to_string(&ledger_path).unwrap(), "{\"other\": true}");
     }
 
     /// A store whose `namespace` already holds one rule, so the namespace
