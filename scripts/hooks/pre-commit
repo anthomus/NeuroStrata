@@ -30,10 +30,14 @@ OWN_LEDGER=""
 if [ "$MAIN_ROOT" != "$ROOT" ] && [ -f "$ROOT/.NeuroStrata/session_queries.json" ]; then
     OWN_LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 fi
+# The namespace a ledger names: the shared one first, else the worktree's own
+# (only the worktree has looked anything up yet), else the folder name.
 NAMESPACE=""
-if [ -f "$LEDGER" ]; then
-    NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-fi
+for NS_LEDGER in "$LEDGER" "$OWN_LEDGER"; do
+    if [ -z "$NAMESPACE" ] && [ -n "$NS_LEDGER" ] && [ -f "$NS_LEDGER" ]; then
+        NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$NS_LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    fi
+done
 if [ -z "$NAMESPACE" ]; then
     NAMESPACE=$(basename "$MAIN_ROOT")
 fi
@@ -269,6 +273,48 @@ done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 mkdir -p "$(dirname "$LEDGER")"
+
+# Linked worktrees share this ledger, so two commits at once would both read,
+# add and write it, and one would lose the other's entries. An atomic `mkdir`
+# of a lock directory next to the ledger serializes the read-modify-write for
+# every writer below (node, python, awk), on Windows and POSIX alike. A lock
+# older than 30 s is left over from a killed hook and is taken over. After
+# about 5 s of waiting the hook writes anyway, with a warning: it only warns,
+# so it must never block a commit.
+LEDGER_LOCK="$LEDGER.lock"
+LEDGER_LOCKED=0
+release_ledger_lock() {
+    if [ "$LEDGER_LOCKED" = "1" ]; then
+        rm -rf "$LEDGER_LOCK" 2>/dev/null
+        LEDGER_LOCKED=0
+    fi
+}
+acquire_ledger_lock() {
+    local tries=0 since
+    while ! mkdir "$LEDGER_LOCK" 2>/dev/null; do
+        since=$(cat "$LEDGER_LOCK/since" 2>/dev/null)
+        case "$since" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ $(( $(date +%s) - since )) -gt 30 ]; then
+                    rm -rf "$LEDGER_LOCK" 2>/dev/null
+                    continue
+                fi
+                ;;
+        esac
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            echo "warning: NeuroStrata ledger lock $LEDGER_LOCK is held; writing the ledger without it" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    date +%s > "$LEDGER_LOCK/since" 2>/dev/null
+    LEDGER_LOCKED=1
+    trap release_ledger_lock EXIT
+}
+acquire_ledger_lock
+
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi

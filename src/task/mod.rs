@@ -3170,10 +3170,14 @@ OWN_LEDGER=""
 if [ "$MAIN_ROOT" != "$ROOT" ] && [ -f "$ROOT/.NeuroStrata/session_queries.json" ]; then
     OWN_LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 fi
+# The namespace a ledger names: the shared one first, else the worktree's own
+# (only the worktree has looked anything up yet), else the folder name.
 NAMESPACE=""
-if [ -f "$LEDGER" ]; then
-    NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-fi
+for NS_LEDGER in "$LEDGER" "$OWN_LEDGER"; do
+    if [ -z "$NAMESPACE" ] && [ -n "$NS_LEDGER" ] && [ -f "$NS_LEDGER" ]; then
+        NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$NS_LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    fi
+done
 if [ -z "$NAMESPACE" ]; then
     NAMESPACE=$(basename "$MAIN_ROOT")
 fi
@@ -3409,6 +3413,48 @@ done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 mkdir -p "$(dirname "$LEDGER")"
+
+# Linked worktrees share this ledger, so two commits at once would both read,
+# add and write it, and one would lose the other's entries. An atomic `mkdir`
+# of a lock directory next to the ledger serializes the read-modify-write for
+# every writer below (node, python, awk), on Windows and POSIX alike. A lock
+# older than 30 s is left over from a killed hook and is taken over. After
+# about 5 s of waiting the hook writes anyway, with a warning: it only warns,
+# so it must never block a commit.
+LEDGER_LOCK="$LEDGER.lock"
+LEDGER_LOCKED=0
+release_ledger_lock() {
+    if [ "$LEDGER_LOCKED" = "1" ]; then
+        rm -rf "$LEDGER_LOCK" 2>/dev/null
+        LEDGER_LOCKED=0
+    fi
+}
+acquire_ledger_lock() {
+    local tries=0 since
+    while ! mkdir "$LEDGER_LOCK" 2>/dev/null; do
+        since=$(cat "$LEDGER_LOCK/since" 2>/dev/null)
+        case "$since" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ $(( $(date +%s) - since )) -gt 30 ]; then
+                    rm -rf "$LEDGER_LOCK" 2>/dev/null
+                    continue
+                fi
+                ;;
+        esac
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            echo "warning: NeuroStrata ledger lock $LEDGER_LOCK is held; writing the ledger without it" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    date +%s > "$LEDGER_LOCK/since" 2>/dev/null
+    LEDGER_LOCKED=1
+    trap release_ledger_lock EXIT
+}
+acquire_ledger_lock
+
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi
@@ -5192,6 +5238,115 @@ mod tests {
         assert!(stderr.contains("file 'fresh2.rs' has no recorded"), "{stderr}");
         assert_eq!(std::fs::read_to_string(&wt_ledger).unwrap(), wt_ledger_before);
         assert!(std::fs::read_to_string(&ledger).unwrap().contains("\"fresh2.rs\""));
+    }
+
+    /// Linked worktrees share the main checkout's ledger: two commits at once
+    /// must both keep their entries, a lock left by a killed hook must not
+    /// stop the next one, and a worktree that alone has a ledger names the
+    /// namespace when the shared ledger is first written.
+    #[test]
+    fn the_pre_commit_hook_shares_the_main_ledger_safely_between_worktrees() {
+        let Some(bash) = hook_bash() else {
+            eprintln!("skipped: no bash to run the hook with");
+            return;
+        };
+        let has = |tool: &str| {
+            std::process::Command::new(&bash)
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !has("node") && !has("python3") {
+            eprintln!("skipped: the hook needs node or python3 to read the ledger");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("main-folder");
+        let hooks_off = base.join("no-hooks");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&hooks_off).unwrap();
+        git_stdout_in(&repo, &["init", "-q"]);
+        git_stdout_in(&repo, &["config", "user.email", "t@example.invalid"]);
+        git_stdout_in(&repo, &["config", "user.name", "t"]);
+        git_stdout_in(&repo, &["config", "core.hooksPath", &hooks_off.to_string_lossy()]);
+        std::fs::write(repo.join("seed.rs"), "x").unwrap();
+        git_stdout_in(&repo, &["add", "seed.rs"]);
+        git_stdout_in(&repo, &["commit", "-q", "-m", "seed"]);
+        let hook = base.join("pre-commit");
+        std::fs::write(&hook, SCAFFOLDED_PRE_COMMIT_HOOK).unwrap();
+        let ledger = repo.join(".NeuroStrata").join("session_queries.json");
+
+        // Only the worktree has a ledger: its namespace, not the main
+        // checkout's folder name, goes into the shared ledger.
+        let wt_a = base.join("wt-a");
+        git_stdout_in(&repo, &["worktree", "add", "-q", &wt_a.to_string_lossy()]);
+        std::fs::create_dir_all(wt_a.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            wt_a.join(".NeuroStrata").join("session_queries.json"),
+            r#"{"namespace": "example-project", "queries": []}"#,
+        )
+        .unwrap();
+        std::fs::write(wt_a.join("first.rs"), "y").unwrap();
+        git_stdout_in(&wt_a, &["add", "first.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &wt_a);
+        assert!(stderr.contains("--namespace example-project "), "{stderr}");
+        let shared: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        assert_eq!(shared["namespace"], json!("example-project"), "{shared}");
+
+        // A lock left behind by a killed hook (stamped long ago) is taken over.
+        let lock = repo.join(".NeuroStrata").join("session_queries.json.lock");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join("since"), "1\n").unwrap();
+        std::fs::write(wt_a.join("after-stale.rs"), "y").unwrap();
+        git_stdout_in(&wt_a, &["add", "after-stale.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &wt_a);
+        assert!(!stderr.contains("writing the ledger without it"), "{stderr}");
+        assert!(!lock.exists(), "the hook removes the lock it took over");
+        assert!(std::fs::read_to_string(&ledger).unwrap().contains("\"after-stale.rs\""));
+
+        // Two worktrees committing at once: every entry of both survives.
+        let wt_b = base.join("wt-b");
+        git_stdout_in(&repo, &["worktree", "add", "-q", &wt_b.to_string_lossy()]);
+        let mut expected = Vec::new();
+        for round in 0..4 {
+            for (wt, tag) in [(&wt_a, "a"), (&wt_b, "b")] {
+                let mut names = Vec::new();
+                for i in 0..3 {
+                    let name = format!("r{round}-{tag}{i}.rs");
+                    std::fs::write(wt.join(&name), "z").unwrap();
+                    names.push(name);
+                }
+                let mut add = vec!["add"];
+                add.extend(names.iter().map(String::as_str));
+                git_stdout_in(wt, &add);
+                expected.extend(names);
+            }
+            let spawn = |dir: &std::path::Path| {
+                let mut cmd = std::process::Command::new(&bash);
+                cmd.arg(&hook).current_dir(dir);
+                if cfg!(windows) {
+                    if let Some(bin) = bash.parent() {
+                        let mut paths = vec![bin.to_path_buf()];
+                        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+                        cmd.env("PATH", std::env::join_paths(paths).expect("join PATH"));
+                    }
+                }
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("the hook runs")
+            };
+            let (mut a, mut b) = (spawn(&wt_a), spawn(&wt_b));
+            a.wait().unwrap();
+            b.wait().unwrap();
+            let text = std::fs::read_to_string(&ledger).unwrap();
+            for name in &expected {
+                assert!(text.contains(&format!("\"{name}\"")), "round {round} lost {name}: {text}");
+            }
+            assert!(!lock.exists(), "round {round} left the lock behind");
+        }
     }
 
     /// A store whose `namespace` already holds one rule, so the namespace
