@@ -3148,13 +3148,41 @@ pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # Install with:  neurostrata-mcp hooks install
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-LEDGER="$ROOT/.NeuroStrata/session_queries.json"
-NAMESPACE=""
-if [ -f "$LEDGER" ]; then
-    NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+# Linked worktrees (`git worktree add`, `.claude/worktrees/...`) record into
+# ONE ledger: the main checkout's. The common git dir of a linked worktree is
+# the main checkout's `.git`; for the main checkout itself git prints `.git`,
+# relative to the top level, where hooks run. A common dir not named `.git`
+# (`--separate-git-dir`, a bare repository) keeps the worktree's own ledger.
+# A ledger the worktree already has (a lookup sent with the worktree as its
+# project root) is read too.
+MAIN_ROOT="$ROOT"
+# git 2.31+ prints it absolute and normalized. Older git echoes the unknown
+# option on a line of its own and prints the dir as before (often relative),
+# hence the last line.
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | tail -n 1)
+case "$COMMON" in
+    /*|[A-Za-z]:*) ;;
+    "") ;;
+    *) COMMON="$ROOT/$COMMON" ;;
+esac
+case "$COMMON" in
+    */.git) MAIN_ROOT="${COMMON%/.git}" ;;
+esac
+LEDGER="$MAIN_ROOT/.NeuroStrata/session_queries.json"
+OWN_LEDGER=""
+if [ "$MAIN_ROOT" != "$ROOT" ] && [ -f "$ROOT/.NeuroStrata/session_queries.json" ]; then
+    OWN_LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 fi
+# The namespace a ledger names: the shared one first, else the worktree's own
+# (only the worktree has looked anything up yet), else the folder name.
+NAMESPACE=""
+for NS_LEDGER in "$LEDGER" "$OWN_LEDGER"; do
+    if [ -z "$NAMESPACE" ] && [ -n "$NS_LEDGER" ] && [ -f "$NS_LEDGER" ]; then
+        NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$NS_LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    fi
+done
 if [ -z "$NAMESPACE" ]; then
-    NAMESPACE=$(basename "$ROOT")
+    NAMESPACE=$(basename "$MAIN_ROOT")
 fi
 
 # Windows roots (`C:/...`) compare case-insensitively, like the file system.
@@ -3192,8 +3220,8 @@ fi
 # ── Path normalization for ledger matching ─────────────────────────────────
 # $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`). A ledger
 # entry may carry `path` (already project-relative, written by newer daemons;
-# preferred), or only the raw `query`: `"$ROOT/$file"` as an absolute path,
-# with `/` or `\`, `\\?\` or Git Bash `/c/` prefixes and any
+# preferred), or only the raw `query`: `"$ROOT/$file"` or the main checkout's
+# absolute path, with `/` or `\`, `\\?\` or Git Bash `/c/` prefixes and any
 # drive-letter case on Windows, `"./$file"`, or the bare `"$file"`. All of them
 # are reduced to the repo-relative form below.
 normalize_rel_path() {
@@ -3206,13 +3234,17 @@ normalize_rel_path() {
     printf '%s' "$p"
 }
 
-# Dump decoded, normalized ledger paths (one per line) using node or python3.
-# Empty if ledger missing or neither runtime is available.
+# Dump decoded, normalized paths (one per line) of the ledger file "$1" using
+# node or python3. Empty if that ledger is missing or neither runtime is
+# available.
 dump_ledger_paths() {
-    if [ ! -f "$LEDGER" ]; then
+    if [ ! -f "$1" ]; then
         return 0
     fi
-    export LEDGER ROOT FOLD
+    ( LEDGER="$1"; dump_ledger_file )
+}
+dump_ledger_file() {
+    export LEDGER ROOT MAIN_ROOT FOLD
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -3226,7 +3258,7 @@ dump_ledger_paths() {
             if (m) p = m[1] + ":" + (m[2] || "/");
             return p.length > 1 ? p.replace(/\/+$/, "") : p;
           };
-          const roots = [process.env.ROOT].filter(Boolean).map(normAbs);
+          const roots = [process.env.ROOT, process.env.MAIN_ROOT].filter(Boolean).map(normAbs);
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
           const queries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.queries) ? parsed.queries : []);
@@ -3268,7 +3300,7 @@ def norm_abs(p):
     if m:
         p = m.group(1) + ":" + (m.group(2) or "/")
     return p.rstrip("/") if len(p) > 1 else p
-roots = [norm_abs(r) for r in (os.environ.get("ROOT"),) if r]
+roots = [norm_abs(r) for r in (os.environ.get("ROOT"), os.environ.get("MAIN_ROOT")) if r]
 try:
     with open(ledger, encoding="utf-8") as f:
         parsed = json.load(f)
@@ -3312,7 +3344,21 @@ for p in out:
     fi
 }
 
-LEDGER_PATHS=$(dump_ledger_paths)
+LEDGER_PATHS=$(dump_ledger_paths "$LEDGER"; [ -n "$OWN_LEDGER" ] && dump_ledger_paths "$OWN_LEDGER")
+
+# The ledgers this hook reads: the shared one, and the worktree's own if any.
+any_ledger() {
+    [ -f "$LEDGER" ] || [ -n "$OWN_LEDGER" ]
+}
+
+# Raw-text fallback when neither node nor python3 is available.
+ledger_grep() {
+    local needle="$1" f
+    for f in "$LEDGER" "$OWN_LEDGER"; do
+        [ -n "$f" ] && [ -f "$f" ] && grep -qF "$needle" "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
 
 ledger_has_file() {
     local rel="$1"
@@ -3320,10 +3366,11 @@ ledger_has_file() {
         printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel")"
         return $?
     fi
-    [ -f "$LEDGER" ] || return 1
-    grep -qF "\"$rel\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"./$rel\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"$ROOT/$rel\"" "$LEDGER" 2>/dev/null
+    any_ledger || return 1
+    ledger_grep "\"$rel\"" \
+        || ledger_grep "\"./$rel\"" \
+        || ledger_grep "\"$ROOT/$rel\"" \
+        || ledger_grep "\"$MAIN_ROOT/$rel\""
 }
 
 ledger_has_dir() {
@@ -3332,11 +3379,12 @@ ledger_has_dir() {
         printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$(fold_case "$rel_dir")"
         return $?
     fi
-    [ -f "$LEDGER" ] || return 1
-    grep -qF "\"$rel_dir/\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"./$rel_dir/\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"$ROOT/$rel_dir/\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"$rel_dir\"" "$LEDGER" 2>/dev/null
+    any_ledger || return 1
+    ledger_grep "\"$rel_dir/\"" \
+        || ledger_grep "\"./$rel_dir/\"" \
+        || ledger_grep "\"$ROOT/$rel_dir/\"" \
+        || ledger_grep "\"$MAIN_ROOT/$rel_dir/\"" \
+        || ledger_grep "\"$rel_dir\""
 }
 
 # ── Check each staged file / ancestor dir-prefix against session_queries.json ──
@@ -3344,7 +3392,7 @@ for raw_file in "${StagedFiles[@]}"; do
     file=$(normalize_rel_path "$raw_file")
     [ -z "$file" ] && continue
     matched=0
-    if [ -f "$LEDGER" ]; then
+    if any_ledger; then
         if ledger_has_file "$file"; then
             matched=1
         else
@@ -3368,6 +3416,61 @@ done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 mkdir -p "$(dirname "$LEDGER")"
+
+# Linked worktrees share this ledger, so two commits at once would both read,
+# add and write it, and one would lose the other's entries. An atomic `mkdir`
+# of a lock directory next to the ledger serializes the read-modify-write for
+# every writer below (node, python, awk), on Windows and POSIX alike. A lock
+# whose stamp is older than 30 s (or, with no stamp, whose directory is older
+# than a minute) is left over from a killed hook and is taken over. After
+# about 5 s of waiting the hook records nothing this time, with a warning: it
+# only warns, so it must never block a commit, and writing without the lock
+# could drop another commit's entries.
+LEDGER_LOCK="$LEDGER.lock"
+LEDGER_LOCKED=0
+release_ledger_lock() {
+    if [ "$LEDGER_LOCKED" = "1" ]; then
+        rm -rf "$LEDGER_LOCK" 2>/dev/null
+        LEDGER_LOCKED=0
+    fi
+}
+# Whether the lock directory "$1" was left behind by a killed hook.
+lock_is_stale() {
+    local since
+    since=$(cat "$1/since" 2>/dev/null)
+    case "$since" in
+        ''|*[!0-9]*) [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ] ;;
+        *) [ $(( $(date +%s) - since )) -gt 30 ] ;;
+    esac
+}
+acquire_ledger_lock() {
+    local tries=0 aside="$LEDGER_LOCK.stale.$$"
+    while ! mkdir "$LEDGER_LOCK" 2>/dev/null; do
+        # Rename a stale lock aside before removing it, and check it again
+        # there: if another hook took the lock over in the meantime, the
+        # fresh lock goes back instead of being removed.
+        if lock_is_stale "$LEDGER_LOCK" && mv "$LEDGER_LOCK" "$aside" 2>/dev/null; then
+            if lock_is_stale "$aside"; then
+                rm -rf "$aside" 2>/dev/null
+            else
+                mv "$aside" "$LEDGER_LOCK" 2>/dev/null
+            fi
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            echo "warning: NeuroStrata ledger lock $LEDGER_LOCK is held; this commit's files are not recorded" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    date +%s > "$LEDGER_LOCK/since" 2>/dev/null
+    LEDGER_LOCKED=1
+    trap release_ledger_lock EXIT
+}
+if ! acquire_ledger_lock; then
+    exit 0
+fi
+
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi
@@ -5111,6 +5214,168 @@ mod tests {
         assert!(stderr.contains("file 'none.rs' has no recorded"), "{stderr}");
         for f in ["a1", "a2", "a3", "a4", "a5", "a6", "Ä7"] {
             assert!(!stderr.contains(&format!("src/a/{f}.rs' has no recorded")), "{f}: {stderr}");
+        }
+
+        // A linked worktree: the main checkout's ledger answers, and the
+        // worktree gets no ledger of its own.
+        git_stdout_in(&repo, &["commit", "-q", "-m", "seed"]);
+        let wt = base.join("example-project-wt");
+        git_stdout_in(&repo, &["worktree", "add", "-q", &wt.to_string_lossy()]);
+        std::fs::write(wt.join("src").join("a").join("a1.rs"), "y").unwrap();
+        std::fs::write(wt.join("fresh.rs"), "y").unwrap();
+        git_stdout_in(&wt, &["add", "src", "fresh.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &wt);
+        assert!(stderr.contains("file 'fresh.rs' has no recorded"), "{stderr}");
+        assert!(!stderr.contains("a1.rs' has no recorded"), "{stderr}");
+        assert!(!wt.join(".NeuroStrata").exists(), "the worktree has no ledger of its own");
+        let main_ledger = std::fs::read_to_string(&ledger).unwrap();
+        assert!(main_ledger.contains("\"fresh.rs\""), "recorded in the main checkout's ledger");
+
+        // A ledger the worktree already has (a lookup sent with the worktree
+        // as its project root) still counts, and the hook records into the
+        // main checkout's ledger, not that one.
+        std::fs::create_dir_all(wt.join(".NeuroStrata")).unwrap();
+        let wt_ledger = wt.join(".NeuroStrata").join("session_queries.json");
+        let wt_entry = wt.join("wt-only.rs").to_string_lossy().to_string();
+        std::fs::write(
+            &wt_ledger,
+            serde_json::to_string_pretty(&json!({"namespace": "example-project", "queries": [
+                {"ts": 1, "tool": "neurostrata_memories_for_file", "query": wt_entry, "governed_prefixes": [wt_entry]}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let wt_ledger_before = std::fs::read_to_string(&wt_ledger).unwrap();
+        std::fs::write(wt.join("wt-only.rs"), "y").unwrap();
+        std::fs::write(wt.join("fresh2.rs"), "y").unwrap();
+        git_stdout_in(&wt, &["add", "wt-only.rs", "fresh2.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &wt);
+        assert!(!stderr.contains("wt-only.rs' has no recorded"), "{stderr}");
+        assert!(stderr.contains("file 'fresh2.rs' has no recorded"), "{stderr}");
+        assert_eq!(std::fs::read_to_string(&wt_ledger).unwrap(), wt_ledger_before);
+        assert!(std::fs::read_to_string(&ledger).unwrap().contains("\"fresh2.rs\""));
+    }
+
+    /// Linked worktrees share the main checkout's ledger: two commits at once
+    /// must both keep their entries, a lock left by a killed hook must not
+    /// stop the next one, and a worktree that alone has a ledger names the
+    /// namespace when the shared ledger is first written.
+    #[test]
+    fn the_pre_commit_hook_shares_the_main_ledger_safely_between_worktrees() {
+        let Some(bash) = hook_bash() else {
+            eprintln!("skipped: no bash to run the hook with");
+            return;
+        };
+        let has = |tool: &str| {
+            std::process::Command::new(&bash)
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !has("node") && !has("python3") {
+            eprintln!("skipped: the hook needs node or python3 to read the ledger");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("main-folder");
+        let hooks_off = base.join("no-hooks");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&hooks_off).unwrap();
+        git_stdout_in(&repo, &["init", "-q"]);
+        git_stdout_in(&repo, &["config", "user.email", "t@example.invalid"]);
+        git_stdout_in(&repo, &["config", "user.name", "t"]);
+        git_stdout_in(&repo, &["config", "core.hooksPath", &hooks_off.to_string_lossy()]);
+        std::fs::write(repo.join("seed.rs"), "x").unwrap();
+        git_stdout_in(&repo, &["add", "seed.rs"]);
+        git_stdout_in(&repo, &["commit", "-q", "-m", "seed"]);
+        let hook = base.join("pre-commit");
+        std::fs::write(&hook, SCAFFOLDED_PRE_COMMIT_HOOK).unwrap();
+        let ledger = repo.join(".NeuroStrata").join("session_queries.json");
+
+        // Only the worktree has a ledger: its namespace, not the main
+        // checkout's folder name, goes into the shared ledger.
+        let wt_a = base.join("wt-a");
+        git_stdout_in(&repo, &["worktree", "add", "-q", &wt_a.to_string_lossy()]);
+        std::fs::create_dir_all(wt_a.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            wt_a.join(".NeuroStrata").join("session_queries.json"),
+            r#"{"namespace": "example-project", "queries": []}"#,
+        )
+        .unwrap();
+        std::fs::write(wt_a.join("first.rs"), "y").unwrap();
+        git_stdout_in(&wt_a, &["add", "first.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &wt_a);
+        assert!(stderr.contains("--namespace example-project "), "{stderr}");
+        let shared: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        assert_eq!(shared["namespace"], json!("example-project"), "{shared}");
+
+        // A lock left behind by a killed hook (stamped long ago) is taken over.
+        let lock = repo.join(".NeuroStrata").join("session_queries.json.lock");
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(lock.join("since"), "1\n").unwrap();
+        std::fs::write(wt_a.join("after-stale.rs"), "y").unwrap();
+        git_stdout_in(&wt_a, &["add", "after-stale.rs"]);
+        let stderr = run_pre_commit(&bash, &hook, &wt_a);
+        assert!(!stderr.contains("ledger lock"), "{stderr}");
+        assert!(!lock.exists(), "the hook removes the lock it took over");
+        assert!(std::fs::read_to_string(&ledger).unwrap().contains("\"after-stale.rs\""));
+
+        // A lock another hook holds right now (fresh, still unstamped): the
+        // hook gives up after a few seconds, warns, records nothing, and does
+        // not remove that lock.
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(wt_a.join("while-held.rs"), "y").unwrap();
+        git_stdout_in(&wt_a, &["add", "while-held.rs"]);
+        let started = std::time::Instant::now();
+        let stderr = run_pre_commit(&bash, &hook, &wt_a);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "bounded wait");
+        assert!(stderr.contains("this commit's files are not recorded"), "{stderr}");
+        assert!(lock.exists(), "a held lock is not taken over");
+        assert!(!std::fs::read_to_string(&ledger).unwrap().contains("\"while-held.rs\""));
+        std::fs::remove_dir_all(&lock).unwrap();
+
+        // Two worktrees committing at once: every entry of both survives.
+        let wt_b = base.join("wt-b");
+        git_stdout_in(&repo, &["worktree", "add", "-q", &wt_b.to_string_lossy()]);
+        let mut expected = Vec::new();
+        for round in 0..4 {
+            for (wt, tag) in [(&wt_a, "a"), (&wt_b, "b")] {
+                let mut names = Vec::new();
+                for i in 0..3 {
+                    let name = format!("r{round}-{tag}{i}.rs");
+                    std::fs::write(wt.join(&name), "z").unwrap();
+                    names.push(name);
+                }
+                let mut add = vec!["add"];
+                add.extend(names.iter().map(String::as_str));
+                git_stdout_in(wt, &add);
+                expected.extend(names);
+            }
+            let spawn = |dir: &std::path::Path| {
+                let mut cmd = std::process::Command::new(&bash);
+                cmd.arg(&hook).current_dir(dir);
+                if cfg!(windows) {
+                    if let Some(bin) = bash.parent() {
+                        let mut paths = vec![bin.to_path_buf()];
+                        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+                        cmd.env("PATH", std::env::join_paths(paths).expect("join PATH"));
+                    }
+                }
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("the hook runs")
+            };
+            let (mut a, mut b) = (spawn(&wt_a), spawn(&wt_b));
+            a.wait().unwrap();
+            b.wait().unwrap();
+            let text = std::fs::read_to_string(&ledger).unwrap();
+            for name in &expected {
+                assert!(text.contains(&format!("\"{name}\"")), "round {round} lost {name}: {text}");
+            }
+            assert!(!lock.exists(), "round {round} left the lock behind");
         }
     }
 
