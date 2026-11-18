@@ -143,15 +143,32 @@ pub const SKIPPED_DIRS: [&str; 19] = [
 /// components rather than `"/name/"` substrings works with either separator
 /// (a Windows walk yields `\`), and leaving out the root's own ancestors
 /// keeps a project that lives under a directory named `build` or `out`
-/// from being skipped whole.
-pub fn is_in_skipped_dir(root: &Path, path: &Path) -> bool {
+/// from being skipped whole. The last component counts only when `is_dir`:
+/// a regular file named `build` or `.env` is kept.
+pub fn is_in_skipped_dir(root: &Path, path: &Path, is_dir: bool) -> bool {
     let below_root = path.strip_prefix(root).unwrap_or(path);
-    below_root.components().any(|component| match component {
+    let is_skipped = |component: std::path::Component| match component {
         std::path::Component::Normal(name) => {
             name.to_str().is_some_and(|name| SKIPPED_DIRS.contains(&name))
         }
         _ => false,
-    })
+    };
+    let mut components = below_root.components();
+    let last = components.next_back();
+    components.any(is_skipped) || (is_dir && last.is_some_and(is_skipped))
+}
+
+/// A walker over `root` with the ignore crate's defaults that does not descend
+/// into a [`SKIPPED_DIRS`] directory below `root`. Ingest and dry run share it,
+/// so both leave out the same entries.
+fn skip_list_walker(root: &Path) -> ignore::Walk {
+    let walk_root = root.to_path_buf();
+    WalkBuilder::new(root)
+        .filter_entry(move |entry| {
+            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+            !is_in_skipped_dir(&walk_root, entry.path(), is_dir)
+        })
+        .build()
 }
 
 /// The id a node gets, relative to the directory being ingested.
@@ -1304,7 +1321,7 @@ fn run_producer(
         std::collections::HashMap::new();
     let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    let walker = WalkBuilder::new(&dir_path).build();
+    let walker = skip_list_walker(Path::new(&dir_path));
 
     let mut unreadable = 0usize;
 
@@ -1329,9 +1346,6 @@ fn run_producer(
         };
 
         let path = entry.path();
-        if is_in_skipped_dir(&dir_path, path) {
-            continue;
-        }
         let path_str = path.to_string_lossy().to_string();
 
         let abs_path = if path.is_absolute() {
@@ -4401,29 +4415,36 @@ mod tests {
     #[test]
     fn skipped_dirs_match_components_below_the_walk_root() {
         let root = std::env::temp_dir().join("build").join("example-project");
-        for skipped in [
-            root.join("node_modules").join("pkg").join("index.js"),
-            root.join("src").join("build").join("gen.rs"),
-            root.join("target"),
+        for (skipped, is_dir) in [
+            (root.join("node_modules").join("pkg").join("index.js"), false),
+            (root.join("src").join("build").join("gen.rs"), false),
+            (root.join("target"), true),
         ] {
-            assert!(is_in_skipped_dir(&root, &skipped), "{}", skipped.display());
+            assert!(is_in_skipped_dir(&root, &skipped, is_dir), "{}", skipped.display());
         }
-        for kept in [root.clone(), root.join("src").join("lib.rs"), root.join("builds").join("x.rs")] {
-            assert!(!is_in_skipped_dir(&root, &kept), "{}", kept.display());
+        for (kept, is_dir) in [
+            (root.clone(), true),
+            (root.join("src").join("lib.rs"), false),
+            (root.join("builds").join("x.rs"), false),
+            // A regular file named like a listed directory is kept.
+            (root.join("scripts").join("build"), false),
+            (root.join(".env"), false),
+        ] {
+            assert!(!is_in_skipped_dir(&root, &kept, is_dir), "{}", kept.display());
         }
         // A relative walk, as the CLI runs it.
-        assert!(is_in_skipped_dir(Path::new("."), Path::new("./node_modules/x.js")));
-        assert!(!is_in_skipped_dir(Path::new("./src"), Path::new("./src/lib.rs")));
+        assert!(is_in_skipped_dir(Path::new("."), Path::new("./node_modules/x.js"), false));
+        assert!(!is_in_skipped_dir(Path::new("./src"), Path::new("./src/lib.rs"), false));
     }
 
     #[cfg(windows)]
     #[test]
     fn skipped_dirs_match_windows_walk_paths() {
         // What a daemon ingest walks on Windows: the std-canonical verbatim root.
-        let root = Path::new(r"\?\C:\dev\example-project");
-        assert!(is_in_skipped_dir(root, Path::new(r"\?\C:\dev\example-project\node_modules\x.js")));
-        assert!(is_in_skipped_dir(Path::new(r".\src"), Path::new(r".\src\dist\x.js")));
-        assert!(!is_in_skipped_dir(root, Path::new(r"\?\C:\dev\example-project\src\lib.rs")));
+        let root = Path::new(r"\\?\C:\dev\example-project");
+        assert!(is_in_skipped_dir(root, Path::new(r"\\?\C:\dev\example-project\node_modules\x.js"), false));
+        assert!(is_in_skipped_dir(Path::new(r".\src"), Path::new(r".\src\dist\x.js"), false));
+        assert!(!is_in_skipped_dir(root, Path::new(r"\\?\C:\dev\example-project\src\lib.rs"), false));
     }
 
     /// One fixture under an ancestor named `build`, holding a `node_modules`
@@ -4441,11 +4462,14 @@ mod tests {
         std::fs::create_dir_all(tmp.join("node_modules").join("pkg")).unwrap();
         std::fs::write(tmp.join("src").join("lib.rs"), "pub fn kept() {}").unwrap();
         std::fs::write(tmp.join("README.md"), "# kept\n").unwrap();
+        // A regular file named like a listed directory is kept.
+        std::fs::create_dir_all(tmp.join("scripts")).unwrap();
+        std::fs::write(tmp.join("scripts").join("build"), "#!/bin/sh\n").unwrap();
         std::fs::write(tmp.join("node_modules").join("pkg").join("index.js"), "module.exports = 1;").unwrap();
 
         let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema parses");
         let report = dry_run_directory(&tmp, &schema, "estimate").await.unwrap();
-        assert!(report.contains("Files: 2\n"), "{report}");
+        assert!(report.contains("Files: 3\n"), "{report}");
 
         let db = std::env::temp_dir().join(format!("ns-skip-db-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
@@ -5941,7 +5965,7 @@ pub async fn dry_run_directory(
     // Pattern: version suffixes in file stem; used after loop too.
     let v_pattern = regex::Regex::new(r"(_v[0-9]+|-v[0-9]+|\.bak$|\.old$|_old$|_copy$)").unwrap();
 
-    let walker = ignore::WalkBuilder::new(dir_path).build();
+    let walker = skip_list_walker(dir_path);
     for result in walker {
         let entry = match result {
             Ok(e) => e,
@@ -5951,9 +5975,6 @@ pub async fn dry_run_directory(
             }
         };
         let path = entry.path();
-        if is_in_skipped_dir(dir_path, path) {
-            continue;
-        }
         let path_str = path.to_string_lossy();
         let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
         if !is_file {
