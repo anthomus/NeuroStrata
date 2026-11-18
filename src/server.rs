@@ -4956,11 +4956,20 @@ async fn handle_get_snapshot(
                         == Some("in_progress")
             })
             .map(|m| (m.id.as_str(), &m.payload));
+        // Rebuild the task block instead of passing on the copy cached at claim
+        // time, which still lists rules retired since.
+        let fresh_task = match active_task {
+            Some((tid, payload)) => Some((
+                tid.to_string(),
+                crate::task::task_payload_with_fresh_context(&store, namespace, tid, payload).await,
+            )),
+            None => None,
+        };
         crate::task::persist_active_session_file(
             std::path::Path::new(root_str),
             namespace,
             &golden_rules,
-            active_task,
+            fresh_task.as_ref().map(|(tid, payload)| (tid.as_str(), payload)),
         );
     }
     // F10: detect conflicts AFTER active-row filtering (valid_to, archived,
@@ -20251,6 +20260,101 @@ mod context_plan_tests {
                 .iter()
                 .any(|g| g.as_str().unwrap_or("").contains("AGAINST using Python")),
             "active_session.json golden_rules must include global NO PYTHON rule: {golden_arr:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// The task block that get_snapshot writes to active_session.json (and that
+    /// session start quotes) must be built from the rules as they are now, not
+    /// copied from the block cached on the task row at claim time.
+    #[tokio::test]
+    async fn snapshot_writes_task_block_without_rules_archived_after_claim() {
+        use crate::traits::MemoryPayload;
+        let tmp_dir = std::env::temp_dir().join(format!("ns-fresh-task-snap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&tmp_dir.join("db"), 4).expect("open"),
+        );
+        store.init("global").await.unwrap();
+        store.init("probe").await.unwrap();
+
+        let payload = |content: &str, memory_type: &str, metadata: serde_json::Value| MemoryPayload {
+            content: content.to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: memory_type.to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        };
+        store
+            .upsert(
+                "probe",
+                "rule-old-deploy",
+                vec![0.1f32; 4],
+                payload("Deploy with the old script.", "rule", serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+
+        // An in-progress task whose cached block was built while the rule was live,
+        // the way task_claim stamps it.
+        let mut task = payload(
+            "Fix the deploy",
+            "task",
+            serde_json::json!({ "task": { "status": "in_progress", "session_id": "ses_snap" } }),
+        );
+        let (_hits, cached) = crate::task::build_task_graph_context(
+            &store, "probe", "probe-t1", &[0.1f32; 4], &task,
+        )
+        .await;
+        assert!(
+            cached.contains("rule-old-deploy"),
+            "precondition: the claim-time block quotes the live rule: {cached}"
+        );
+        task.metadata["task"]["subagent_prompt_injection"] = serde_json::json!(cached);
+        store.upsert("probe", "probe-t1", vec![0.1f32; 4], task).await.unwrap();
+
+        // The rule is retired after the claim.
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
+        let _ = crate::handlers::archive_memory::handle_archive_memory(
+            serde_json::json!({ "namespace": "probe", "id": "rule-old-deploy" }),
+            store.clone(),
+            bus,
+        )
+        .await;
+        let (_, rule_row) = store.get("probe", "rule-old-deploy").await.unwrap().unwrap();
+        assert!(
+            crate::handlers::archive_memory::is_archived(&rule_row),
+            "precondition: the rule is archived"
+        );
+
+        let proj_root = tmp_dir.join("repo");
+        std::fs::create_dir_all(&proj_root).unwrap();
+        handle_get_snapshot(
+            serde_json::json!({
+                "namespace": "probe",
+                "project_root": proj_root.to_string_lossy(),
+            }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+
+        let session_file = proj_root.join(".NeuroStrata").join("active_session.json");
+        let session_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&session_file).unwrap()).unwrap();
+        assert_eq!(session_json["task_id"], "probe-t1");
+        let block = session_json["subagent_prompt_injection"]
+            .as_str()
+            .expect("active_session.json carries the task block");
+        assert!(
+            block.contains("probe-t1") && block.contains("Fix the deploy"),
+            "the task block names the active task: {block}"
+        );
+        assert!(
+            !block.contains("rule-old-deploy") && !block.contains("Deploy with the old script."),
+            "the task block must not quote a rule archived after the claim: {block}"
         );
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
