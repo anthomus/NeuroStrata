@@ -4,7 +4,7 @@
 
 - `neurostrata_add_memory` — store an architectural rule, project pattern, or task insight.
 - `neurostrata_search_memory` — query memory contents via vector + graph RAG (accepts optional `project_root` alongside `path_prefix` for multi-form relative/absolute prefix resolution, including root-equal prefixes that match in-root relative and absolute paths).
-- `neurostrata_get_snapshot` — fetch current task state snapshot (<=800 chars).
+- `neurostrata_get_snapshot` — fetch current task state snapshot (<=800 chars). It reads the namespace's knowledge rows and leaves out the ingested `code_ast`, `symbol`, `file` and `doc_section` rows and `guard_event` rows, so those never take a top-5 slot; the migration notice for unqualified ingested ids comes from its own narrow read.
 - `neurostrata_supersede_memory` — replace active version with new one atomically.
 - `neurostrata_memories_for_file` — inspect governing memories for a given path/file.
 - `neurostrata_related` — find related entities (`CONTAINS`, `GOVERNS`; accepts optional `project_root`, resolves multi-form file seeds to one canonical in-namespace file node before single traversal, and returns additive `resolved_seed` metadata).

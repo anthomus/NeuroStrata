@@ -23,6 +23,8 @@ The `VectorStore` trait is the pluggable interface for vector persistence and si
 - `fn search(&self, query: &[f32], limit: usize) -> Result<Vec<(String, f32)>>` — nearest-neighbor search
 - `fn delete(&mut self, id: &str) -> Result<()>` — remove a vector
 
+Some `VectorStore` reads have a default built on `list` that filters in memory: `generation_summary`, `list_pinned`, `list_excluding_types` (every row except the given memory types; the snapshot uses it to skip the ingested code graph and event rows) and `list_unqualified_ingested` (ingested rows whose id does not carry the namespace). A backend that can filter in its query engine should override them; `LadybugStore` does.
+
 Both traits are generic over storage backend. The default implementation uses a local in-memory store; custom implementations can target GPU-accelerated indexes or distributed stores.
 
 ## Custom `JudgmentProvider` Adapters

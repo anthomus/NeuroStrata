@@ -5000,14 +5000,41 @@ async fn handle_add_memory(
     }
 }
 
+/// Memory types the snapshot's main read leaves in the store: the ingested
+/// code graph (`code_ast`, `symbol`, `file`), ingested doc sections, and guard
+/// audit events. On an ingested project they are most of the namespace and
+/// none of them is knowledge an agent starts a task from. `directory` stays
+/// in the read: hook hygiene infers the git root from it.
+const SNAPSHOT_SKIPPED_TYPES: &[&str] =
+    &["code_ast", "symbol", "file", "doc_section", "guard_event"];
+
+/// Whether a row belongs in the snapshot's view: not tombstoned (unless the
+/// caller asked for archived rows), not a conflicting mesh variant, and not
+/// the registry row.
+fn snapshot_row_visible(r: &SearchResult, include_archived: bool) -> bool {
+    (include_archived || !crate::handlers::archive_memory::is_archived(&r.payload))
+        && !crate::synaptic_mesh::conflict::is_conflicting(&r.payload)
+        && !crate::registry::is_registry_row(&r.payload.metadata)
+}
+
+/// Whether a row's `valid_to` has not passed yet (absent or null: open-ended).
+fn snapshot_row_unexpired(r: &SearchResult, now: i64) -> bool {
+    match r.payload.metadata.get("valid_to") {
+        None => true,
+        Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
+    }
+}
+
 /// What to tell an agent when this namespace still holds ids written before
 /// they carried a namespace, or None when there is nothing to say.
 ///
 /// It rides on get_snapshot because that is the one call an agent is required
-/// to make at the start of a task, and because the snapshot has already fetched
-/// the list this counts from. `doctor` reports the same condition, but doctor
-/// only runs with the daemon stopped, so an agent in a session would otherwise
-/// never learn of it -- and an agent is the only party present to raise it.
+/// to make at the start of a task. `memories` is the namespace's ingested rows;
+/// the snapshot reads them only after a narrow read found a stale id, so a
+/// migrated namespace never pays for the count. `doctor` reports the same
+/// condition, but doctor only runs with the daemon stopped, so an agent in a
+/// session would otherwise never learn of it -- and an agent is the only party
+/// present to raise it.
 ///
 /// The message deliberately hands the work to the user rather than describing
 /// something to attempt. Migrating means stopping the daemon, which is the
@@ -5499,10 +5526,12 @@ async fn handle_get_snapshot(
         crate::registry::cache_project_root(&store, None, namespace, pr).await;
     }
 
-    // Fetch all memories first so hook hygiene can infer a git root when none
-    // was explicitly provided or cached.
+    // Fetch the knowledge rows first so hook hygiene can infer a git root when
+    // none was explicitly provided or cached (directory rows are kept for
+    // that). The ingested code graph and event rows are left in the store:
+    // on an ingested project they are most of the namespace.
     let mut all_memories = store
-        .list(namespace, None, None)
+        .list_excluding_types(namespace, SNAPSHOT_SKIPPED_TYPES)
         .await
         .map_err(|_| "Failed to list memories or namespace does not exist.".to_string())?;
 
@@ -5552,9 +5581,33 @@ async fn handle_get_snapshot(
     // The registry row is metadata, not knowledge: never serve it.
     all_memories.retain(|r| !crate::registry::is_registry_row(&r.payload.metadata));
 
-    // Counted from the list the snapshot already had to fetch, so this
-    // costs nothing beyond the scan.
-    let migration = unmigrated_ids_notice(namespace, &all_memories);
+    // The knowledge read above skips ingested files and symbols, so the stale
+    // ids get their own narrow read, which is empty on a migrated namespace.
+    // Only when it finds one does the snapshot read every ingested row, to
+    // give the notice its total.
+    let migration = match store.list_unqualified_ingested(namespace).await {
+        Ok(stale)
+            if stale
+                .iter()
+                .any(|r| snapshot_row_visible(r, include_archived)) =>
+        {
+            match store.list(namespace, Some("auto-ingestor"), None).await {
+                Ok(mut ingested) => {
+                    ingested.retain(|r| snapshot_row_visible(r, include_archived));
+                    unmigrated_ids_notice(namespace, &ingested)
+                }
+                Err(e) => {
+                    tracing::warn!("ingested row list failed for '{namespace}': {e}");
+                    None
+                }
+            }
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("unqualified ingested id read failed for '{namespace}': {e}");
+            None
+        }
+    };
     // Computed before the top-5 cut below: tasks are never the highest-access
     // rows, and section 6.1 requires the Zero-Action Start header on every
     // snapshot regardless of what the body holds.
@@ -5582,10 +5635,7 @@ async fn handle_get_snapshot(
     } else {
         crate::tools::procedure::procedures_due_strap(&all_memories, now)
     };
-    all_memories.retain(|r| match r.payload.metadata.get("valid_to") {
-        None => true,
-        Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
-    });
+    all_memories.retain(|r| snapshot_row_unexpired(r, now));
     // Capability C: advisory freshness SLA scan over ALL active visible rows,
     // computed before the top-5 truncation. Never blocks anything.
     let stale_memory_rows = crate::task::gate::stale_memory_violations(&all_memories, now);
@@ -5898,13 +5948,32 @@ async fn handle_get_snapshot(
     let mut doctor_report: Option<String> = None;
     let mut hygiene_ok = true;
     if trigger {
-        let known =
-            crate::store::ladybug::KnownIds::new(all_memories.iter().map(|m| m.id.as_str()));
+        // The doctor resolves edges against every row and counts ingested
+        // symbols, so it also reads the types the knowledge read skipped,
+        // through the same visibility filters. It runs on a version change,
+        // every 20th session, or weekly, not on every snapshot.
+        let mut skipped_rows: Vec<SearchResult> = Vec::new();
+        for memory_type in SNAPSHOT_SKIPPED_TYPES.iter().copied() {
+            skipped_rows.extend(
+                store
+                    .list(namespace, None, Some(memory_type))
+                    .await
+                    .map_err(|_| {
+                        "Failed to list memories or namespace does not exist.".to_string()
+                    })?,
+            );
+        }
+        skipped_rows.retain(|r| {
+            snapshot_row_visible(r, include_archived) && snapshot_row_unexpired(r, now)
+        });
+        let doctor_rows: Vec<&SearchResult> =
+            all_memories.iter().chain(skipped_rows.iter()).collect();
+        let known = crate::store::ladybug::KnownIds::new(doctor_rows.iter().map(|m| m.id.as_str()));
         let mut unqualified_ingested = 0usize;
         let mut resolvable = 0usize;
         let mut missing = 0usize;
         let mut missing_samples: Vec<String> = Vec::new();
-        for m in &all_memories {
+        for m in &doctor_rows {
             if m.payload.user_id == "auto-ingestor"
                 && !crate::parser::ingest::is_qualified(namespace, &m.id)
             {
@@ -6020,11 +6089,11 @@ async fn handle_get_snapshot(
             }
         }
         // Check if ingested symbol nodes predate the AST call-graph schema.
-        let symbol_count = all_memories
+        let symbol_count = doctor_rows
             .iter()
             .filter(|m| m.payload.user_id == "auto-ingestor" && m.payload.memory_type == "symbol")
             .count();
-        let symbols_with_calls = all_memories
+        let symbols_with_calls = doctor_rows
             .iter()
             .filter(|m| {
                 m.payload.user_id == "auto-ingestor"
@@ -19746,6 +19815,56 @@ mod tests {
             text.contains("always use podman"),
             "the body still follows: {}",
             text
+        );
+    }
+
+    /// The snapshot reads the knowledge rows, not the ingested code graph or
+    /// event rows: a heavily read symbol or guard event no longer takes a top-5
+    /// slot from a rule. The migration notice, which counts ingested ids, still
+    /// sees an unqualified file id through its own narrow read.
+    #[tokio::test]
+    async fn the_snapshot_skips_structural_rows_but_still_reports_unqualified_ingested_ids() {
+        let (store, rule_id) = store_with_one_rule("probe").await;
+        let ingested = |memory_type: &str, user_id: &str| MemoryPayload {
+            content: format!("an ingested {memory_type} row"),
+            user_id: user_id.to_string(),
+            memory_type: memory_type.to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "access_count": 100 }),
+        };
+        for (id, memory_type, user_id) in [
+            ("probe::src/hot.rs::hot_symbol", "code_ast", "auto-ingestor"),
+            ("hot-guard-event", "guard_event", "guard"),
+            ("probe::src/hot.rs", "file", "auto-ingestor"),
+            ("src/legacy.rs", "file", "auto-ingestor"),
+        ] {
+            store
+                .upsert("probe", id, vec![0.1; 4], ingested(memory_type, user_id))
+                .await
+                .expect("seed a structural row");
+        }
+
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+        assert!(text.contains(&rule_id), "the rule is served: {text}");
+        assert!(
+            !text.contains("hot_symbol"),
+            "a code_ast row is not in the top 5: {text}"
+        );
+        assert!(
+            !text.contains("hot-guard-event"),
+            "a guard_event row is not in the top 5: {text}"
+        );
+        assert!(
+            text.contains("MIGRATION NEEDED"),
+            "the unqualified file id still raises the notice: {text}"
+        );
+        assert!(
+            text.contains("1 of 3 ingested ids"),
+            "the notice counts every ingested row: {text}"
         );
     }
 
