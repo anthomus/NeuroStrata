@@ -637,6 +637,36 @@ pub trait VectorStore: Send + Sync + AsAny {
         self.list(namespace, None, None).await
     }
 
+    /// `list` without the rows of the given memory types, for callers that
+    /// want the knowledge rows and not the ingested code graph or event rows,
+    /// which outnumber them many times over on an ingested project. Stores
+    /// that can narrow in the engine override this; the default lists the
+    /// whole namespace and filters here.
+    async fn list_excluding_types(
+        &self,
+        namespace: &str,
+        exclude: &[&str],
+    ) -> Result<Vec<SearchResult>> {
+        let rows = self.list(namespace, None, None).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| !exclude.contains(&r.payload.memory_type.as_str()))
+            .collect())
+    }
+
+    /// Ingested rows (`user_id` `auto-ingestor`) whose id does not name this
+    /// namespace: ids written before ids were namespace-qualified (see
+    /// `parser::ingest::is_qualified`). A migrated namespace has none, so a
+    /// store that can narrow in the engine answers without reading the
+    /// ingested graph. The default lists the ingested rows and filters here.
+    async fn list_unqualified_ingested(&self, namespace: &str) -> Result<Vec<SearchResult>> {
+        let rows = self.list(namespace, Some("auto-ingestor"), None).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| !crate::parser::ingest::is_qualified(namespace, &r.id))
+            .collect())
+    }
+
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
 
