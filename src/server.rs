@@ -5652,8 +5652,26 @@ async fn handle_get_snapshot(
     };
     // Computed off the pre-truncation list too: global and pinned Golden Rules
     // must surface regardless of whether they made the top-5 by access_count.
-    let golden_rules =
-        crate::task::collect_golden_rules(&store, namespace, Some(&all_memories)).await;
+    // Any pinned row qualifies whatever its type, so pinned rows of the types
+    // the main read skipped are added back from the narrow pinned read.
+    let skipped_pinned: Vec<SearchResult> = match store.list_pinned(namespace).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|r| SNAPSHOT_SKIPPED_TYPES.contains(&r.payload.memory_type.as_str()))
+            .filter(|r| snapshot_row_visible(r, include_archived) && snapshot_row_unexpired(r, now))
+            .collect(),
+        Err(e) => {
+            tracing::warn!("pinned row read failed for '{namespace}': {e}");
+            Vec::new()
+        }
+    };
+    let golden_rules = if skipped_pinned.is_empty() {
+        crate::task::collect_golden_rules(&store, namespace, Some(&all_memories)).await
+    } else {
+        let mut golden_input = all_memories.clone();
+        golden_input.extend(skipped_pinned);
+        crate::task::collect_golden_rules(&store, namespace, Some(&golden_input)).await
+    };
     let golden_section = crate::task::format_golden_rules_section(&golden_rules);
     if let Some(root_str) = &inferred_root {
         let is_active = |m: &SearchResult| {
@@ -19865,6 +19883,36 @@ mod tests {
         assert!(
             text.contains("1 of 3 ingested ids"),
             "the notice counts every ingested row: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_keeps_a_pinned_row_of_a_skipped_type_in_golden_rules() {
+        let (store, _rule_id) = store_with_one_rule("probe").await;
+        store
+            .upsert(
+                "probe",
+                "pinned-doc-section",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "a pinned doc section".to_string(),
+                    user_id: "auto-ingestor".to_string(),
+                    memory_type: "doc_section".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "pinned": true }),
+                },
+            )
+            .await
+            .expect("seed a pinned doc_section row");
+
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+        assert!(
+            text.contains("`pinned-doc-section`"),
+            "a pinned row of a skipped type is still a Golden Rule: {text}"
         );
     }
 
