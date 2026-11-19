@@ -235,6 +235,172 @@ fn has_any_env(keys: &[&str]) -> bool {
         .any(|k| std::env::var_os(k).map(|v| !v.is_empty()).unwrap_or(false))
 }
 
+/// The namespace the harness installer recorded for the project at `root`:
+/// `NEUROSTRATA_NAMESPACE` in `.claude/settings.local.json` (its `env` block,
+/// else a hook command that starts with `NEUROSTRATA_NAMESPACE=<ns>`, the form
+/// the installer writes), else `namespace` in the opencode, hermes, codex,
+/// openclaw or GitHub CLI plugin config. These are the files
+/// [`auto_install_detected_plugins`] writes; this reads them back. `None` when
+/// none names a usable namespace.
+pub fn configured_namespace(root: &Path) -> Option<String> {
+    let read = |rel: &str| -> Option<Value> {
+        serde_json::from_str(&std::fs::read_to_string(root.join(rel)).ok()?).ok()
+    };
+    if let Some(settings) = read(".claude/settings.local.json") {
+        if let Some(ns) = settings
+            .pointer("/env/NEUROSTRATA_NAMESPACE")
+            .and_then(Value::as_str)
+            .and_then(usable_namespace)
+        {
+            return Some(ns);
+        }
+        if let Some(hooks) = settings.get("hooks").and_then(Value::as_object) {
+            for entries in hooks.values().filter_map(Value::as_array) {
+                for entry in entries {
+                    for hook in entry.get("hooks").and_then(Value::as_array).into_iter().flatten() {
+                        if let Some(ns) = hook
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .and_then(namespace_assigned_in_command)
+                        {
+                            return Some(ns);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (rel, pointer) in [
+        (".opencode/neurostrata-plugin.json", "/neurostrata/namespace"),
+        (".hermes/plugins/neurostrata.json", "/namespace"),
+        (".codex/plugins/neurostrata.json", "/namespace"),
+        (".openclaw/plugins/neurostrata.json", "/namespace"),
+        (".NeuroStrata/plugins/github-cli/copilot-extension.json", "/namespace"),
+    ] {
+        if let Some(ns) = read(rel)
+            .as_ref()
+            .and_then(|v| v.pointer(pointer))
+            .and_then(Value::as_str)
+            .and_then(usable_namespace)
+        {
+            return Some(ns);
+        }
+    }
+    None
+}
+
+/// A namespace value as written, or `None` when it is empty or still an
+/// unexpanded shell or cmd variable (`$NS`, `%NS%`).
+pub(crate) fn usable_namespace(raw: &str) -> Option<String> {
+    let ns = raw.trim().trim_matches(|c| c == '"' || c == '\'');
+    // The value ends up in hook commands and in `task gate <ns>`: only plain
+    // namespace characters are taken, so it can never carry shell syntax. It
+    // starts with a letter or digit, so it is never read as an option
+    // (`--help`) or as a path step (`.`, `..`).
+    let plain = ns
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    let leads = ns.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    (plain && leads).then(|| ns.to_string())
+}
+
+/// The value of a `NEUROSTRATA_NAMESPACE=<ns>` assignment at the start of a
+/// hook command (or after a leading `set ` or `env `), where the installer
+/// writes it; not an argument further along, and not text inside another word
+/// such as `MY_NEUROSTRATA_NAMESPACE=`. An unquoted value ends at whitespace or
+/// a shell separator (`&`, `;`, `|`); only plain namespace characters are
+/// accepted. The daemon's startup install writes `NEUROSTRATA_NAMESPACE= node`:
+/// an empty value, not `node`.
+fn namespace_assigned_in_command(command: &str) -> Option<String> {
+    const KEY: &str = "NEUROSTRATA_NAMESPACE=";
+    let mut from = 0;
+    while let Some(found) = command[from..].find(KEY) {
+        let at = from + found;
+        from = at + KEY.len();
+        // Only where the installer puts it: the first word of the command, or
+        // right after a leading `set ` or `env `. An argument further along is
+        // text for some program, not an assignment.
+        let before = command[..at].trim();
+        if !(before.is_empty() || before == "set" || before == "env") {
+            continue;
+        }
+        let rest = &command[from..];
+        let value = match rest.chars().next() {
+            Some(q @ ('"' | '\'')) => rest[1..].split(q).next().unwrap_or(""),
+            _ => rest
+                .split(|c: char| c.is_whitespace() || matches!(c, '&' | ';' | '|'))
+                .next()
+                .unwrap_or(""),
+        };
+        return usable_namespace(value);
+    }
+    None
+}
+
+/// The namespace a project's git hooks and installers use for `dir`, resolved
+/// in one place (`neurostrata-mcp namespace resolve` prints it for the hooks):
+/// 1. the namespace configured in `dir`'s checkout ([`configured_namespace`]);
+/// 2. the one configured in the main checkout, for a linked worktree (harness
+///    settings are untracked, so a worktree usually has none of its own);
+/// 3. the `namespace` field of the main checkout's graph-lookup ledger
+///    (`.NeuroStrata/session_queries.json`), then of `dir`'s own;
+/// 4. the main checkout's folder name, the last resort;
+/// 5. outside git, the same files in `dir` itself, then its folder name.
+///
+/// A relative `dir` is taken against the current directory. A linked worktree
+/// whose main checkout keeps its git data outside a `.git` folder
+/// (`--separate-git-dir`) is treated as its own checkout.
+/// What the command line uses (`namespace resolve`, `hooks install`): a
+/// usable `NEUROSTRATA_NAMESPACE` from the environment first, then
+/// [`resolve_project_namespace`]. The daemon's hook refresh does not read its
+/// own environment: one daemon serves every project.
+pub fn resolve_cli_namespace(dir: &Path) -> String {
+    std::env::var("NEUROSTRATA_NAMESPACE")
+        .ok()
+        .and_then(|ns| usable_namespace(&ns))
+        .unwrap_or_else(|| resolve_project_namespace(dir))
+}
+
+pub fn resolve_project_namespace(dir: &Path) -> String {
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir().map(|cwd| cwd.join(dir)).unwrap_or_else(|_| dir.to_path_buf())
+    };
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+    let dir_s = dir.to_string_lossy().to_string();
+    let own_root = crate::paths::git_root_of_dir(&dir_s).map(PathBuf::from);
+    let main_root = crate::paths::main_checkout_root(&dir_s);
+    // Outside git, `dir` itself is the only place to look.
+    let outside_git = (own_root.is_none() && main_root.is_none()).then(|| dir.clone());
+    for root in own_root.iter().chain(main_root.iter()).chain(outside_git.iter()) {
+        if let Some(ns) = configured_namespace(root) {
+            return ns;
+        }
+    }
+    for root in main_root.iter().chain(own_root.iter()).chain(outside_git.iter()) {
+        let ledger = root.join(".NeuroStrata").join("session_queries.json");
+        if let Some(ns) = std::fs::read_to_string(ledger)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .as_ref()
+            .and_then(|v| v.get("namespace"))
+            .and_then(Value::as_str)
+            .and_then(usable_namespace)
+        {
+            return ns;
+        }
+    }
+    main_root
+        .as_deref()
+        .or(Some(dir.as_path()))
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -778,6 +944,161 @@ fn wire_harness_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hooks' namespace comes from the harness settings the installer
+    /// wrote, then the main checkout's, and the folder name only last.
+    #[test]
+    fn the_project_namespace_is_the_configured_one_and_the_folder_name_last() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let main = base.join("platform");
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        // No configuration yet: the folder name, from any directory inside.
+        assert_eq!(resolve_project_namespace(&main), "platform");
+        assert_eq!(resolve_project_namespace(&main.join("src")), "platform");
+
+        // Claude Code settings as the installer writes them.
+        std::fs::create_dir_all(main.join(".claude")).unwrap();
+        std::fs::write(
+            main.join(".claude").join("settings.local.json"),
+            serde_json::to_string(&json!({"hooks": {"PreToolUse": [{"matcher": "Read",
+                "hooks": [{"type": "command", "command": "NEUROSTRATA_NAMESPACE=example-project node \"C:/x/run.js\""}]}]}}))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(configured_namespace(&main).as_deref(), Some("example-project"));
+        assert_eq!(resolve_project_namespace(&main.join("src")), "example-project");
+
+        // A linked worktree beside it, with no settings of its own, inherits it.
+        // Its gitdir names the shared `.git` in `commondir`, as git writes it.
+        let wt_gitdir = main.join(".git").join("worktrees").join("wt");
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        let wt = base.join("platform-wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git").join("worktrees").join("wt").display()),
+        )
+        .unwrap();
+        assert_eq!(resolve_project_namespace(&wt), "example-project");
+
+        // An explicit env block wins over the hook commands; opencode's file
+        // is read when Claude's names nothing.
+        std::fs::write(
+            main.join(".claude").join("settings.local.json"),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "from-env"}}"#,
+        )
+        .unwrap();
+        assert_eq!(configured_namespace(&main).as_deref(), Some("from-env"));
+        std::fs::write(main.join(".claude").join("settings.local.json"), "{}").unwrap();
+        std::fs::create_dir_all(main.join(".opencode")).unwrap();
+        std::fs::write(
+            main.join(".opencode").join("neurostrata-plugin.json"),
+            r#"{"neurostrata": {"namespace": "from-opencode"}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_project_namespace(&wt), "from-opencode");
+        // An empty namespace (the daemon's startup install writes "") is no
+        // answer, in either file; the word after an empty `NEUROSTRATA_NAMESPACE=`
+        // is the command, not a namespace.
+        std::fs::write(
+            main.join(".opencode").join("neurostrata-plugin.json"),
+            r#"{"neurostrata": {"namespace": ""}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            main.join(".claude").join("settings.local.json"),
+            serde_json::to_string(&json!({"hooks": {"Stop": [{"hooks": [{"type": "command",
+                "command": "NEUROSTRATA_NAMESPACE= node \"C:/x/cli-hook.mjs\""}]}]}}))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(configured_namespace(&main), None);
+        assert_eq!(resolve_project_namespace(&wt), "platform");
+
+        // With no harness setting, the main checkout's ledger names it before
+        // the folder name does.
+        std::fs::create_dir_all(main.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            main.join(".NeuroStrata").join("session_queries.json"),
+            r#"{"namespace": "from-ledger", "queries": []}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_project_namespace(&wt), "from-ledger");
+        assert_eq!(resolve_project_namespace(&main), "from-ledger");
+
+        // Another harness's plugin config counts as configuration.
+        std::fs::create_dir_all(main.join(".codex").join("plugins")).unwrap();
+        std::fs::write(
+            main.join(".codex").join("plugins").join("neurostrata.json"),
+            r#"{"namespace": "from-codex"}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_project_namespace(&wt), "from-codex");
+    }
+
+    /// Only an assignment at the start of the command counts, the way the
+    /// installer writes it; unquoted values end at a shell separator, and
+    /// unexpanded variables or values with shell characters are no answer.
+    #[test]
+    fn a_hook_command_names_the_namespace_only_in_its_own_assignment() {
+        let ns = namespace_assigned_in_command;
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=example-project node \"C:/x/run.js\"").as_deref(), Some("example-project"));
+        assert_eq!(ns("set NEUROSTRATA_NAMESPACE=example-project&& node x").as_deref(), Some("example-project"));
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=\"my-ns\" node x").as_deref(), Some("my-ns"));
+        assert_eq!(ns("MY_NEUROSTRATA_NAMESPACE=other node x"), None);
+        assert_eq!(ns("echo xNEUROSTRATA_NAMESPACE=other"), None);
+        assert_eq!(ns("node run.js NEUROSTRATA_NAMESPACE=other"), None);
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=a;rm node x"), Some("a".to_string()));
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=\"a b\" node x"), None);
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=$NS node x"), None);
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE=%NS% node x"), None);
+        assert_eq!(ns("NEUROSTRATA_NAMESPACE= node x"), None);
+        assert_eq!(ns("node x"), None);
+    }
+
+    /// `namespace resolve some/dir` takes a relative directory against the
+    /// current one, as a shell user expects.
+    #[test]
+    fn a_namespace_starts_with_a_letter_or_digit() {
+        assert_eq!(usable_namespace("example-project").as_deref(), Some("example-project"));
+        assert_eq!(usable_namespace("v1.2_x").as_deref(), Some("v1.2_x"));
+        for bad in ["", ".", "..", "--help", "-x", "_x", ".hidden", "a b", "$NS"] {
+            assert_eq!(usable_namespace(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn outside_git_the_directory_itself_is_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap().join("loose-folder");
+        std::fs::create_dir_all(dir.join(".opencode")).unwrap();
+        if crate::paths::git_root_of_dir(&dir.to_string_lossy()).is_some() {
+            eprintln!("skipped: the temp dir is inside a git checkout");
+            return;
+        }
+        assert_eq!(resolve_project_namespace(&dir), "loose-folder");
+        std::fs::write(
+            dir.join(".opencode").join("neurostrata-plugin.json"),
+            r#"{"neurostrata": {"namespace": "from-opencode"}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_project_namespace(&dir), "from-opencode");
+    }
+
+    #[test]
+    fn a_relative_directory_resolves_against_the_current_one() {
+        let here = std::env::current_dir().unwrap();
+        // Outside a git checkout (a source tarball) `src` is its own folder.
+        if crate::paths::git_root_of_dir(&here.to_string_lossy()).is_none() {
+            eprintln!("skipped: the crate is not inside a git checkout");
+            return;
+        }
+        let expected = resolve_project_namespace(&here);
+        assert_eq!(resolve_project_namespace(Path::new(".")), expected);
+        assert_eq!(resolve_project_namespace(Path::new("src")), expected);
+    }
 
     #[test]
     fn auto_install_detected_plugins_writes_bundles_and_wires_explicit_harness() {
