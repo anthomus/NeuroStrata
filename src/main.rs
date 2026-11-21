@@ -899,7 +899,9 @@ pub(crate) enum NamespaceCommands {
     /// main checkout, else NEUROSTRATA_NAMESPACE, else the namespace in
     /// .NeuroStrata/session_queries.json, else the main checkout's folder
     /// name. Configs that disagree are reported on stderr; the first in that
-    /// order wins. The git hooks call this.
+    /// order wins. Exits non-zero, naming the cause, when the directory does
+    /// not exist, a harness config cannot be read, or no usable namespace is
+    /// found. The git hooks call this.
     Resolve {
         /// Directory inside the project (default: the current directory)
         dir: Option<std::path::PathBuf>,
@@ -6183,7 +6185,17 @@ async fn run() -> anyhow::Result<()> {
                     Some(d) => d.clone(),
                     None => std::env::current_dir()?,
                 };
-                let configs = crate::task::harness_plugins::harness_namespaces(&dir);
+                // Fail closed: a missing directory, a harness config that
+                // cannot be read, or no usable namespace exits non-zero, and
+                // the pre-push hook blocks the push.
+                let resolved = match crate::task::harness_plugins::resolve_namespace(&dir) {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        eprintln!("error: namespace resolve: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let configs = &resolved.configs;
                 if configs.iter().any(|(_, ns)| *ns != configs[0].1) {
                     let listed: Vec<String> =
                         configs.iter().map(|(harness, ns)| format!("{harness}={ns}")).collect();
@@ -6193,7 +6205,7 @@ async fn run() -> anyhow::Result<()> {
                         configs[0].1
                     );
                 }
-                println!("{}", crate::task::harness_plugins::resolve_project_namespace(&dir));
+                println!("{}", resolved.namespace);
             }
         }
         return Ok(());
@@ -6995,7 +7007,7 @@ async fn run() -> anyhow::Result<()> {
                                 } else if probe == DaemonProbe::Silent {
                                     Err("nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy in the database; not opening it".to_string())
                                 } else {
-                                    let line = crate::task::hook_hygiene(&cwd);
+                                    let line = crate::task::hook_hygiene_from_cli(&cwd);
                                     if !line.is_empty() {
                                         println!("{}", line);
                                     }
@@ -7386,10 +7398,26 @@ async fn run() -> anyhow::Result<()> {
                     match install_pre_push_hook(&root, force) {
                         Ok(target) => {
                             let _ = install_pre_commit_hook(&root);
-                            let repo_ns =
-                                crate::task::harness_plugins::resolve_project_namespace(&root);
+                            // Harness configs get a namespace only from an
+                            // explicit source (a harness config or
+                            // NEUROSTRATA_NAMESPACE), never the ledger or the
+                            // folder name; each config keeps its own.
+                            let explicit =
+                                match crate::task::harness_plugins::namespace_for_refresh(
+                                    &root, true,
+                                ) {
+                                    Ok(ns) => ns,
+                                    Err(e) => {
+                                        eprintln!("warning: harness configs left as they are: {e}");
+                                        None
+                                    }
+                                };
                             let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-                                &root, &repo_ns, None,
+                                &root,
+                                crate::task::harness_plugins::ConfigNamespace::Keep(
+                                    explicit.as_deref(),
+                                ),
+                                None,
                             );
                             println!(
                                 "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
@@ -8205,7 +8233,7 @@ async fn run() -> anyhow::Result<()> {
 
                 // CLI fallback: hook hygiene against the CWD git root (daemon down).
                 let cwd = std::env::current_dir().unwrap_or_default();
-                let line = crate::task::hook_hygiene(&cwd);
+                let line = crate::task::hook_hygiene_from_cli(&cwd);
                 if !line.is_empty() {
                     println!("{}", line);
                 }
