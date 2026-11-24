@@ -86,31 +86,42 @@ function existingRealPath(p) {
   }
 }
 
-function makeDependencies(text) {
-  const dependencies = []
+// Splits rustc dep-info (Make syntax) into rules. rustc escapes only spaces
+// ("\ "), so any other backslash is a Windows path separator, and the colon of
+// a drive letter (C:\...) is part of the path, not the rule separator.
+function parseDepInfoRules(text) {
+  const rules = []
   for (const logicalLine of text.replace(/\\\r?\n/g, ' ').split('\n')) {
-    const separator = logicalLine.search(/:\s?/)
-    if (separator < 0) continue
-    const input = logicalLine.slice(separator + 1)
+    if (logicalLine.startsWith('#')) continue
+    const targets = []
+    const dependencies = []
+    let current = targets
     let token = ''
-    let escaped = false
-    for (const char of input) {
-      if (escaped) {
-        token += char
-        escaped = false
-      } else if (char === '\\') {
-        escaped = true
+    const chars = [...logicalLine.replace(/\r$/, '')]
+    for (let i = 0; i < chars.length; i++) {
+      const char = chars[i]
+      if (char === '\\' && chars[i + 1] === ' ') {
+        token += ' '
+        i++
+      } else if (
+        char === ':' &&
+        current === targets &&
+        !(token.length === 1 && /[A-Za-z]/.test(token))
+      ) {
+        if (token) targets.push(token)
+        token = ''
+        current = dependencies
       } else if (/\s/.test(char)) {
-        if (token) dependencies.push(token)
+        if (token) current.push(token)
         token = ''
       } else {
         token += char
       }
     }
-    if (escaped) token += '\\'
-    if (token) dependencies.push(token)
+    if (token) current.push(token)
+    if (current === dependencies) rules.push({ targets, dependencies })
   }
-  return dependencies
+  return rules
 }
 
 /** Returns staged .rs paths absent from every Cargo dep-info dependency set. */
@@ -135,12 +146,14 @@ function findUnbuiltStagedRustFiles(depInfoTexts, root, stagedPaths) {
 
   const built = new Set()
   for (const text of depInfoTexts) {
-    for (const dependency of makeDependencies(text)) {
-      const absolute = path.isAbsolute(dependency)
-        ? dependency
-        : path.join(canonicalRoot, dependency)
-      const normalized = repoRelative(absolute)
-      if (normalized.endsWith('.rs')) built.add(normalized)
+    for (const { dependencies } of parseDepInfoRules(text)) {
+      for (const dependency of dependencies) {
+        const absolute = path.isAbsolute(dependency)
+          ? dependency
+          : path.join(canonicalRoot, dependency)
+        const normalized = repoRelative(absolute)
+        if (normalized.endsWith('.rs')) built.add(normalized)
+      }
     }
   }
   return stagedPaths
@@ -248,7 +261,11 @@ function main() {
 }
 
 // Export pure function for importing tests
-export { findStagedDiagnostics, findUnbuiltStagedRustFiles }
+export {
+  findStagedDiagnostics,
+  findUnbuiltStagedRustFiles,
+  parseDepInfoRules
+}
 
 // Run main() only when executed as CLI (not imported). Compare real paths so a
 // symlinked checkout (macOS /tmp, iCloud, symlinked worktrees) still runs main().

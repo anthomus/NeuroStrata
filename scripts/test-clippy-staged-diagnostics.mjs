@@ -427,6 +427,35 @@ test('CLI dep-info rejects unbuilt staged Rust and preserves diagnostics', () =>
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('dep-info from Windows rustc keeps backslash paths and drive colons', async () => {
+  const { parseDepInfoRules, findUnbuiltStagedRustFiles } = await import(
+    './clippy-staged-diagnostics.mjs'
+  )
+  const text = [
+    String.raw`C:\t\debug\deps\libm-1.rmeta: src\main.rs src\task\mod.rs src\a\ b.rs`,
+    '',
+    String.raw`src\main.rs:`,
+    '# env-dep:CARGO_PKG_NAME=m'
+  ].join('\r\n')
+  assert.deepEqual(parseDepInfoRules(text)[0], {
+    targets: [String.raw`C:\t\debug\deps\libm-1.rmeta`],
+    dependencies: [
+      String.raw`src\main.rs`,
+      String.raw`src\task\mod.rs`,
+      String.raw`src\a b.rs`
+    ]
+  })
+  assert.deepEqual(
+    findUnbuiltStagedRustFiles([text], '/repo', [
+      'src/main.rs',
+      'src/task/mod.rs',
+      'src/a b.rs',
+      'src/other.rs'
+    ]),
+    ['src/other.rs']
+  )
+})
+
 test('symlinked CLI path still runs main (exit 1)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-symlink-'))
   const link = path.join(dir, 'filter-link.mjs')
