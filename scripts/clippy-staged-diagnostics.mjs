@@ -87,8 +87,10 @@ function existingRealPath(p) {
 }
 
 // Splits rustc dep-info (Make syntax) into rules. rustc escapes only spaces
-// ("\ "), so any other backslash is a Windows path separator, and the colon of
-// a drive letter (C:\...) is part of the path, not the rule separator.
+// ("\ "), so any other backslash is a Windows path separator. rustc ends each
+// target with ": " or a colon at the end of the line, so a colon inside a path
+// (C:\..., /tmp/a:b/...) is not the rule separator. A line without that form
+// splits at its first colon that is not a drive letter's.
 function parseDepInfoRules(text) {
   const rules = []
   for (const logicalLine of text.replace(/\\\r?\n/g, ' ').split('\n')) {
@@ -98,6 +100,8 @@ function parseDepInfoRules(text) {
     let current = targets
     let token = ''
     const chars = [...logicalLine.replace(/\r$/, '')]
+    const endsTarget = (i) => i + 1 === chars.length || /\s/.test(chars[i + 1])
+    const spaced = chars.some((char, i) => char === ':' && endsTarget(i))
     for (let i = 0; i < chars.length; i++) {
       const char = chars[i]
       if (char === '\\' && chars[i + 1] === ' ') {
@@ -106,7 +110,9 @@ function parseDepInfoRules(text) {
       } else if (
         char === ':' &&
         current === targets &&
-        !(token.length === 1 && /[A-Za-z]/.test(token))
+        (spaced
+          ? endsTarget(i)
+          : !(token.length === 1 && /[A-Za-z]/.test(token)))
       ) {
         if (token) targets.push(token)
         token = ''
@@ -162,16 +168,79 @@ function findUnbuiltStagedRustFiles(depInfoTexts, root, stagedPaths) {
     .filter((p) => !built.has(p))
 }
 
-function readDepInfoTree(root) {
+function artifactKey(p) {
+  const key = path.resolve(p).replace(/\\/g, '/')
+  return process.platform === 'win32' ? key.toLowerCase() : key
+}
+
+// Cargo reports a build script by its hard link, build-script-build, while
+// rustc's .d rule names the hashed file beside it, build_script_build-<hash>.
+// The unhashed spelling can only equal an artifact name that has no hash.
+function unhashedSibling(key) {
+  const name = path.posix
+    .basename(key)
+    .replace(/-[0-9a-f]{16}(?=\.[^.]*$|$)/, '')
+    .replace(/_/g, '-')
+  return path.posix.join(path.posix.dirname(key), name)
+}
+
+/**
+ * Returns the dep-info texts written for artifacts this Cargo run reported.
+ * The target directory may be shared with other builds and keep .d files from
+ * earlier checkouts, which name repo-relative sources too; only a .d file whose
+ * rule names one of this run's artifacts describes the staged content.
+ */
+function readRunDepInfo(targetDir, messages) {
+  const targetKey = artifactKey(targetDir)
+  const artifacts = new Set()
+  for (const msg of messages) {
+    if (!msg || msg.reason !== 'compiler-artifact') continue
+    for (const file of Array.isArray(msg.filenames) ? msg.filenames : []) {
+      if (typeof file !== 'string') continue
+      const key = artifactKey(file)
+      if (key.startsWith(targetKey + '/')) artifacts.add(key)
+    }
+  }
+  const dirs = new Set([...artifacts].map((key) => path.posix.dirname(key)))
   const texts = []
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    const fullPath = path.join(root, entry.name)
-    if (entry.isDirectory()) texts.push(...readDepInfoTree(fullPath))
-    else if (entry.isFile() && entry.name.endsWith('.d')) {
-      texts.push(readFileSync(fullPath, 'utf8'))
+  for (const dir of dirs) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.d')) continue
+      const text = readFileSync(path.join(dir, entry.name), 'utf8')
+      const ours = parseDepInfoRules(text).some(({ targets }) =>
+        targets.some((target) => {
+          const key = artifactKey(target)
+          return artifacts.has(key) || artifacts.has(unhashedSibling(key))
+        })
+      )
+      if (ours) texts.push(text)
     }
   }
   return texts
+}
+
+/**
+ * Returns the targets of packages inside the staged snapshot that Cargo
+ * reported as fresh. The snapshot is a new checkout, so its crates are always
+ * checked again; a fresh one means Cargo replayed another checkout's build
+ * from a shared target directory, whose diagnostics and dep-info do not
+ * describe the staged files. Path dependencies outside the snapshot keep
+ * their files between runs and may be fresh.
+ */
+function findReusedWorkspaceArtifacts(messages, root) {
+  const rootKey = artifactKey(existingRealPath(root))
+  const reused = new Set()
+  for (const msg of messages) {
+    if (!msg || msg.reason !== 'compiler-artifact' || msg.fresh !== true) {
+      continue
+    }
+    if (typeof msg.manifest_path !== 'string') continue
+    const manifest = artifactKey(existingRealPath(msg.manifest_path))
+    if (manifest.startsWith(rootKey + '/')) {
+      reused.add(msg.target && msg.target.name ? msg.target.name : manifest)
+    }
+  }
+  return [...reused]
 }
 
 /**
@@ -233,10 +302,12 @@ function main() {
 
     const matched = findStagedDiagnostics(messages, root, staged)
     let unbuilt = []
+    let reused = []
     if (depInfoRoot) {
+      reused = findReusedWorkspaceArtifacts(messages, root)
       try {
         unbuilt = findUnbuiltStagedRustFiles(
-          readDepInfoTree(depInfoRoot),
+          readRunDepInfo(depInfoRoot, messages),
           root,
           staged
         )
@@ -255,16 +326,25 @@ function main() {
         `error: staged Rust file ${file} is not in the Cargo build dep-info; add it to a target/module graph or unstage it`
       )
     }
+    for (const name of reused) {
+      console.error(
+        `error: Cargo reused an earlier build of workspace target ${name} instead of checking the staged files; run the commit again`
+      )
+    }
 
-    process.exit(matched.length > 0 || unbuilt.length > 0 ? 1 : 0)
+    process.exit(
+      matched.length > 0 || unbuilt.length > 0 || reused.length > 0 ? 1 : 0
+    )
   })
 }
 
 // Export pure function for importing tests
 export {
   findStagedDiagnostics,
+  findReusedWorkspaceArtifacts,
   findUnbuiltStagedRustFiles,
-  parseDepInfoRules
+  parseDepInfoRules,
+  readRunDepInfo
 }
 
 // Run main() only when executed as CLI (not imported). Compare real paths so a

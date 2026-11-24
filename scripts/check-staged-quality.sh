@@ -167,7 +167,20 @@ if [ ${#ClippyStaged[@]} -gt 0 ]; then
 
     clippy_stderr="$tmpdir/clippy-stderr.log"
     filter_stderr="$tmpdir/filter-stderr.log"
-    clippy_target_dir="$tmpdir/clippy-target"
+    # A persistent target directory keeps dependencies compiled between
+    # commits; a fresh one rebuilt every crate, lbug's C++ engine included,
+    # on every commit. It is a staged-quality/ folder of its own inside the
+    # caller's target directory (CARGO_TARGET_DIR, else the checkout's
+    # target/): a snapshot build written into the caller's own directory
+    # would make their next clippy run of the worktree look up to date. The
+    # filter reads only the dep-info of this run's artifacts and rejects
+    # workspace crates Cargo did not check again.
+    clippy_target_dir="${CARGO_TARGET_DIR:-$ROOT/target}"
+    case "$clippy_target_dir" in
+        /*|[A-Za-z]:[\\/]*) ;;
+        *) clippy_target_dir="$ROOT/$clippy_target_dir" ;;
+    esac
+    clippy_target_dir="${clippy_target_dir%/}/staged-quality"
     mkdir -p "$clippy_target_dir"
 
     # node must be available for the filter step — this produces a setup

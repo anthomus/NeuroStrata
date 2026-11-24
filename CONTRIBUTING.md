@@ -85,7 +85,7 @@ Formatting is strictly manual. Neither the checked-in hook nor any `npm` script 
 
 ### Fail-closed, no auto-install
 
-Required tools must be installed before the hook runs. The runner does not install tools or restage files. Clippy may populate `target/` and the Cargo registry cache; a cold cache can fetch registry crates under `--locked`. Missing tools produce a clear diagnostic and a nonzero exit. Because the hook delegates to the project's `scripts/check-staged-quality.sh` when present, consumer projects can keep their own gates without modifying this repository.
+Required tools must be installed before the hook runs. The runner does not install tools or restage files. Clippy builds in a `staged-quality/` folder inside `$CARGO_TARGET_DIR` when it is set, else inside the checkout's `target/`, so compiled dependencies are reused from one commit to the next; it may also populate the Cargo registry cache; a cold cache can fetch registry crates under `--locked`. Missing tools produce a clear diagnostic and a nonzero exit. Because the hook delegates to the project's `scripts/check-staged-quality.sh` when present, consumer projects can keep their own gates without modifying this repository.
 
 ### Verification
 

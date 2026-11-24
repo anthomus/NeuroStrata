@@ -399,26 +399,31 @@ test('CLI dep-info rejects unbuilt staged Rust and preserves diagnostics', () =>
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-dep-cli-'))
   const depRoot = path.join(dir, 'target')
   fs.mkdirSync(path.join(depRoot, 'debug', 'deps'), { recursive: true })
+  const artifactPath = path.join(depRoot, 'debug', 'deps', 'libmain.rmeta')
   fs.writeFileSync(
     path.join(depRoot, 'debug', 'deps', 'main.d'),
-    `${dir}/target/debug/deps/main: ${dir}/src/main.rs\n`
+    `${artifactPath}: ${dir}/src/main.rs\n`
   )
+  const artifact = JSON.stringify({
+    reason: 'compiler-artifact',
+    filenames: [artifactPath]
+  })
   const common = ['--root', dir, '--dep-info-root', depRoot, '--staged']
   const clean = runFilter({
-    input: '',
+    input: artifact,
     args: [...common, 'src/main.rs']
   })
   assert.equal(clean.status, 0)
 
   const unbuilt = runFilter({
-    input: '',
+    input: artifact,
     args: [...common, 'src/main.rs', 'fixtures/input.rs']
   })
   assert.equal(unbuilt.status, 1)
   assert.match(unbuilt.stderr, /fixtures\/input\.rs.*not.*build/i)
 
   const both = runFilter({
-    input: JSON.stringify(diag({ file: `${dir}/src/main.rs` })),
+    input: `${artifact}\n${JSON.stringify(diag({ file: `${dir}/src/main.rs` }))}`,
     args: [...common, 'src/main.rs', 'fixtures/input.rs']
   })
   assert.equal(both.status, 1)
@@ -454,6 +459,129 @@ test('dep-info from Windows rustc keeps backslash paths and drive colons', async
     ]),
     ['src/other.rs']
   )
+})
+
+test('CLI dep-info ignores .d files this Cargo run did not write', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-dep-run-'))
+  const deps = path.join(dir, 'target', 'debug', 'deps')
+  fs.mkdirSync(deps, { recursive: true })
+  // A shared target dir keeps another build's dep-info, repo-relative.
+  fs.writeFileSync(
+    path.join(deps, 'old.d'),
+    `${path.join(deps, 'libold.rmeta')}: src/main.rs fixtures/input.rs\n`
+  )
+  fs.writeFileSync(
+    path.join(deps, 'main.d'),
+    `${path.join(deps, 'libmain.rmeta')}: src/main.rs\n`
+  )
+  const artifact = (name) =>
+    JSON.stringify({
+      reason: 'compiler-artifact',
+      filenames: [path.join(deps, name)]
+    })
+  const args = [
+    '--root',
+    dir,
+    '--dep-info-root',
+    path.join(dir, 'target'),
+    '--staged',
+    'src/main.rs',
+    'fixtures/input.rs'
+  ]
+  const res = runFilter({ input: artifact('libmain.rmeta'), args })
+  assert.equal(res.status, 1)
+  assert.match(res.stderr, /fixtures\/input\.rs.*not.*build/i)
+  assert.doesNotMatch(res.stderr, /src\/main\.rs/)
+
+  const none = runFilter({ input: '', args })
+  assert.equal(none.status, 1)
+  assert.match(none.stderr, /src\/main\.rs.*not.*build/i)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('dep-info rule splits at ": ", not at a colon inside a path', async () => {
+  const { parseDepInfoRules } = await import('./clippy-staged-diagnostics.mjs')
+  assert.deepEqual(
+    parseDepInfoRules('/tmp/a:b/target/libm.rmeta: src/main.rs\n')[0],
+    { targets: ['/tmp/a:b/target/libm.rmeta'], dependencies: ['src/main.rs'] }
+  )
+  assert.deepEqual(parseDepInfoRules('src/main.rs:\n')[0], {
+    targets: ['src/main.rs'],
+    dependencies: []
+  })
+})
+
+test('CLI dep-info rejects a workspace crate Cargo reported as fresh', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-dep-fresh-'))
+  const deps = path.join(dir, 'target', 'debug', 'deps')
+  fs.mkdirSync(deps, { recursive: true })
+  const rmeta = path.join(deps, 'libmain.rmeta')
+  fs.writeFileSync(path.join(deps, 'main.d'), `${rmeta}: src/main.rs\n`)
+  const manifest = path.join(dir, 'Cargo.toml')
+  fs.writeFileSync(manifest, '[package]\n')
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-dep-outside-'))
+  fs.writeFileSync(path.join(outside, 'Cargo.toml'), '[package]\n')
+  const artifact = (manifestPath, fresh, name = 'main') =>
+    JSON.stringify({
+      reason: 'compiler-artifact',
+      manifest_path: manifestPath,
+      target: { name },
+      filenames: [rmeta],
+      fresh
+    })
+  const args = [
+    '--root',
+    dir,
+    '--dep-info-root',
+    path.join(dir, 'target'),
+    '--staged',
+    'src/main.rs'
+  ]
+  const reused = runFilter({ input: artifact(manifest, true), args })
+  assert.equal(reused.status, 1)
+  assert.match(reused.stderr, /reused an earlier build of workspace target main/)
+
+  const checked = runFilter({ input: artifact(manifest, false), args })
+  assert.equal(checked.status, 0, checked.stderr)
+
+  // A path dependency outside the snapshot keeps its files and may be fresh.
+  const external = runFilter({
+    input: [
+      artifact(manifest, false),
+      artifact(path.join(outside, 'Cargo.toml'), true, 'external')
+    ].join('\n'),
+    args
+  })
+  assert.equal(external.status, 0, external.stderr)
+  fs.rmSync(dir, { recursive: true, force: true })
+  fs.rmSync(outside, { recursive: true, force: true })
+})
+
+test('CLI dep-info finds a build script reported by its hard link', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clippy-dep-build-'))
+  const unit = path.join(dir, 'target', 'debug', 'build', 'pkg-0123456789abcdef')
+  fs.mkdirSync(unit, { recursive: true })
+  const hashed = path.join(unit, 'build_script_build-0123456789abcdef')
+  fs.writeFileSync(
+    path.join(unit, 'build_script_build-0123456789abcdef.d'),
+    `${hashed}.d: build.rs\n\n${hashed}.exe: build.rs\n\nbuild.rs:\n`
+  )
+  const res = runFilter({
+    input: JSON.stringify({
+      reason: 'compiler-artifact',
+      filenames: [path.join(unit, 'build-script-build.exe')]
+    }),
+    args: [
+      '--root',
+      dir,
+      '--dep-info-root',
+      path.join(dir, 'target'),
+      '--staged',
+      'build.rs'
+    ]
+  })
+  assert.equal(res.status, 0, res.stderr)
+  fs.rmSync(dir, { recursive: true, force: true })
 })
 
 test('symlinked CLI path still runs main (exit 1)', () => {

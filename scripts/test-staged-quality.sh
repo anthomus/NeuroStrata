@@ -7,6 +7,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT_PATH="$REPO_ROOT/scripts/check-staged-quality.sh"
 HOOK_SCRIPT_PATH="$REPO_ROOT/scripts/hooks/pre-commit"
+# The gate reuses CARGO_TARGET_DIR; keep the fake cargo out of the caller's.
+unset CARGO_TARGET_DIR
 
 # Create fake tool wrappers that log invocations to FAKE_TOOL_LOG
 setup_fake_tools() {
@@ -30,16 +32,20 @@ RUSTFMT_EOF
 #!/usr/bin/env bash
 echo "cargo $*" >> "$FAKE_TOOL_LOG"
 if [[ "$*" == *"clippy"* ]] && [[ "$*" == *"--message-format=json"* ]]; then
-    mkdir -p "$CARGO_TARGET_DIR/debug/deps"
+    echo "target-dir $CARGO_TARGET_DIR" >> "$FAKE_TOOL_LOG"
+    deps="$CARGO_TARGET_DIR/debug/deps"
+    here="$(pwd -W 2>/dev/null || pwd)"
+    mkdir -p "$deps"
     {
-        printf 'fake-target:'
+        printf '%s/libfake.rmeta:' "$deps"
         while IFS= read -r -d '' file; do
             file=${file#./}
             escaped=${file// /\\ }
-            printf ' %s/%s' "$PWD" "$escaped"
+            printf ' %s/%s' "$here" "$escaped"
         done < <(find . -type f -name '*.rs' -print0)
         printf '\n'
-    } > "$CARGO_TARGET_DIR/debug/deps/fake.d"
+    } > "$deps/fake.d"
+    printf '{"reason":"compiler-artifact","filenames":["%s/libfake.rmeta"]}\n' "$deps"
     echo '{"reason":"compiler-message","message":{"spans":[{"file_name":"src/unstaged.rs","is_primary":true}],"message":"warning: unused variable","code":{"code":"unused_variables"},"level":"warning","rendered":"warning: unused variable: `y`\n --> src/unstaged.rs:1:10\n"}}'
     exit 0
 fi
@@ -1125,6 +1131,61 @@ CARGO_EOF
     rm -rf "$tmpdir"
 }
 
+# Clippy keeps its own staged-quality/ dir inside the caller's target dir
+# (CARGO_TARGET_DIR, else <repo>/target) between runs; dep-info left there by
+# earlier runs never vouches for a file.
+test_clippy_reuses_target_dir_and_ignores_stale_dep_info() {
+    local tmpdir repo bindir shared gate exit_code
+    tmpdir=$(mktemp -d)
+    repo="$tmpdir/repo"
+    bindir="$tmpdir/bin"
+    shared="$tmpdir/shared"
+    export FAKE_TOOL_LOG="$tmpdir/tool.log"
+    setup_fake_tools "$bindir"
+    # This run builds only src/main.rs.
+    cat > "$bindir/cargo" <<'CARGO_EOF'
+#!/usr/bin/env bash
+echo "target-dir $CARGO_TARGET_DIR" >> "$FAKE_TOOL_LOG"
+deps="$CARGO_TARGET_DIR/debug/deps"
+mkdir -p "$deps"
+printf '%s/libmain.rmeta: src/main.rs\n' "$deps" > "$deps/main.d"
+printf '{"reason":"compiler-artifact","filenames":["%s/libmain.rmeta"]}\n' "$deps"
+exit 0
+CARGO_EOF
+    chmod +x "$bindir/cargo"
+    mkdir -p "$repo/src" "$repo/fixtures" "$shared/staged-quality/debug/deps"
+    # Node and cargo see native paths; Git Bash on Windows needs pwd -W.
+    shared="$(cd "$shared" && { pwd -W 2>/dev/null || pwd; })"
+    gate="$shared/staged-quality"
+    # An earlier run's dep-info names fixtures/input.rs repo-relative.
+    printf '%s/debug/deps/libold.rmeta: src/main.rs fixtures/input.rs\n' "$gate" \
+        > "$gate/debug/deps/old.d"
+    printf 'fn main() {}\n' > "$repo/src/main.rs"
+    printf 'fn fixture() {}\n' > "$repo/fixtures/input.rs"
+    cd "$repo"
+    git init -q
+    git config user.email "test@test.com"
+    git config user.name "Test"
+    git add src/main.rs fixtures/input.rs
+
+    CARGO_TARGET_DIR="$shared" PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    exit_code=$?
+    [ $exit_code -ne 0 ] || { echo "Stale dep-info vouched for an unbuilt file" >&2; cd - >/dev/null; return 1; }
+    grep -q "fixtures/input.rs" "$tmpdir/out.log" || { echo "Missing unbuilt Rust diagnostic" >&2; cat "$tmpdir/out.log" >&2; cd - >/dev/null; return 1; }
+    grep -qx "target-dir $gate" "$FAKE_TOOL_LOG" || { echo "Gate dir is not CARGO_TARGET_DIR/staged-quality" >&2; cat "$FAKE_TOOL_LOG" >&2; cd - >/dev/null; return 1; }
+    [ -f "$gate/debug/deps/old.d" ] && [ -f "$gate/debug/deps/main.d" ] || { echo "Gate target dir was not kept" >&2; cd - >/dev/null; return 1; }
+
+    git rm -q --cached fixtures/input.rs
+    : > "$FAKE_TOOL_LOG"
+    PATH="$bindir:$PATH" bash "$SCRIPT_PATH" > "$tmpdir/out.log" 2>&1
+    exit_code=$?
+    [ $exit_code -eq 0 ] || { echo "Built staged Rust was rejected" >&2; cat "$tmpdir/out.log" >&2; cd - >/dev/null; return 1; }
+    grep -q "^target-dir .*/repo/target/staged-quality$" "$FAKE_TOOL_LOG" || { echo "Default gate dir is not <repo>/target/staged-quality" >&2; cat "$FAKE_TOOL_LOG" >&2; cd - >/dev/null; return 1; }
+    [ -f "$repo/target/staged-quality/debug/deps/main.d" ] || { echo "Default gate dir was not kept" >&2; cd - >/dev/null; return 1; }
+    cd - >/dev/null
+    rm -rf "$tmpdir"
+}
+
 # Test 22: quality and mutation regressions execute as blocking CI steps
 test_quality_suites_are_wired_into_ci() {
     local workflow="$REPO_ROOT/.github/workflows/ci.yml"
@@ -1345,6 +1406,7 @@ run_test "Good staged Rust passes despite bad worktree" test_good_staged_rust_pa
 run_test "Extensionless Bash hook is checked" test_extensionless_bash_hook_is_checked
 run_test "Direct /usr/bin shebangs are checked" test_direct_usr_bin_shebang_is_checked
 run_test "Unbuilt staged Rust fails" test_unbuilt_staged_rust_fails
+run_test "Clippy keeps its target dir; stale dep-info does not vouch" test_clippy_reuses_target_dir_and_ignores_stale_dep_info
 run_test "Release-reference scripts pass the shell gate" test_release_reference_scripts_pass_shell_gate
 run_test "Quality suites are wired into CI" test_quality_suites_are_wired_into_ci
 run_test "Local Rustfmt survives snapshot cwd" test_local_rustfmt_survives_snapshot_cwd
