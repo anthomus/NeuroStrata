@@ -37,6 +37,8 @@ Gracefully checkpoints the database and stops the running daemon.
 neurostrata-mcp shutdown
 ```
 
+Once a daemon holds the store lock it writes its process id to `<db_path>.daemon.pid`, and it removes that file on exit. A stopping daemon writes how its final checkpoint went to `<db_path>.daemon.exit`, not to the lock file, so a daemon started right after the stop cannot erase the report. `shutdown` reads only the report of the process it stopped. The MCP proxy starts a new daemon as soon as a stopping one releases the lock; a leftover lock file does not keep it from starting one.
+
 ### `setup`
 
 Installs or refreshes the user-level background service (`systemd` on Linux, `launchd` on macOS) and initializes default configuration under `~/.config/neurostrata/`.

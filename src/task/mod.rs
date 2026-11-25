@@ -651,34 +651,371 @@ pub async fn collect_golden_rules(
     out
 }
 
-/// Render the Golden Rules block for `neurostrata_get_snapshot`.
-pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
+/// Render the Golden Rules block for `neurostrata_get_snapshot`. `whole`
+/// shows each rule's whole text (a snapshot fitted to `max_bytes`); otherwise
+/// each is cut to 280 characters, as before.
+pub fn format_golden_rules_section(golden_rules: &[SearchResult], whole: bool) -> String {
     if golden_rules.is_empty() {
         return String::new();
     }
     let mut out = String::from("### Golden Rules (Global & Pinned — ALWAYS ENFORCED):");
     for r in golden_rules {
-        let snippet: String = r.payload.content.chars().take(280).collect();
         out.push_str(&format!(
             "\n  - [{}] `{}`: {}",
             r.payload.memory_type,
             r.id,
-            snippet.replace('\n', " ")
+            golden_rule_text(r, whole)
         ));
     }
     out
 }
 
-/// The in_progress task claimed in the worktree at `root`. A task claimed in
-/// another worktree, or with no worktree stamped, is never named, or its
-/// Breath note would land in this session.
-pub fn active_task_for_root<'a>(
-    rows: &'a [SearchResult],
-    root: &str,
-    is_active: impl Fn(&SearchResult) -> bool,
-) -> Option<&'a SearchResult> {
-    rows.iter()
-        .find(|r| is_active(r) && gate::task_in_worktree(r, root))
+/// A Golden Rule's text on one line: whole, or cut to 280 characters.
+fn golden_rule_text(r: &SearchResult, whole: bool) -> String {
+    let text: String = if whole {
+        r.payload.content.clone()
+    } else {
+        r.payload.content.chars().take(280).collect()
+    };
+    text.replace('\n', " ")
+}
+
+/// A named part of the session-start content, as `neurostrata_get_snapshot`'s
+/// `sections` argument names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSection {
+    /// The latest "Handoff:" note on the session's in-progress task.
+    Handoff,
+    /// The task's id, status and Goal (its title).
+    TaskLine,
+    /// Global and pinned rules.
+    GoldenRules,
+    /// The task block saved at claim (`subagent_prompt_injection`).
+    TaskBlock,
+    /// The namespace's rules, whole.
+    Rules,
+    /// The rules `Rules` does not show whole, by first sentence.
+    AlsoOnRecord,
+}
+
+impl SessionSection {
+    /// The order the content is fitted in when the caller names no sections.
+    pub const DEFAULT_ORDER: [SessionSection; 6] = [
+        SessionSection::Handoff,
+        SessionSection::TaskLine,
+        SessionSection::TaskBlock,
+        SessionSection::GoldenRules,
+        SessionSection::Rules,
+        SessionSection::AlsoOnRecord,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SessionSection::Handoff => "handoff",
+            SessionSection::TaskLine => "task_line",
+            SessionSection::GoldenRules => "golden_rules",
+            SessionSection::TaskBlock => "task_block",
+            SessionSection::Rules => "rules",
+            SessionSection::AlsoOnRecord => "also_on_record",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        Self::DEFAULT_ORDER.into_iter().find(|s| s.name() == name)
+    }
+}
+
+/// Parses `neurostrata_get_snapshot`'s `sections`: None when absent, else
+/// the named sections in the caller's order (a repeated name counts once).
+/// An unknown name, a non-string entry, or `also_on_record` before `rules`
+/// (it lists what `rules` leaves out) is an error.
+pub fn parse_session_sections(
+    value: Option<&Value>,
+) -> Result<Option<Vec<SessionSection>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let valid = SessionSection::DEFAULT_ORDER
+        .iter()
+        .map(|s| s.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "ERROR: 'sections' must be an array of section names. Valid: {valid}."
+        ));
+    };
+    let mut sections: Vec<SessionSection> = Vec::new();
+    for item in items {
+        let section = item
+            .as_str()
+            .and_then(SessionSection::parse)
+            .ok_or_else(|| {
+                format!("ERROR: unknown section {item} in 'sections'. Valid: {valid}.")
+            })?;
+        if !sections.contains(&section) {
+            sections.push(section);
+        }
+    }
+    let position = |s: SessionSection| sections.iter().position(|x| *x == s);
+    if let (Some(also), Some(rules)) = (
+        position(SessionSection::AlsoOnRecord),
+        position(SessionSection::Rules),
+    ) {
+        if also < rules {
+            return Err("ERROR: 'also_on_record' lists the rules 'rules' leaves out, so it must come after 'rules' in 'sections'.".to_string());
+        }
+    }
+    Ok(Some(sections))
+}
+
+/// The namespace's rules for the session file, picked by the snapshot's code
+/// (`server::pick_session_start`): `namespace_rules` are the rules block's
+/// lines whole, `namespace_rules_left_out` counts the rules it left out, and
+/// `also_on_record` holds the "Also on record" lines (first sentence each),
+/// `also_on_record_left_out` the ones that did not fit there either.
+/// Every line has the Golden Rules shape `[type] id: text`.
+/// `max_bytes` is the caller's budget the file was fitted to, or None when
+/// the default sizes apply; `sections` the caller's named sections (None:
+/// every section, in the default order). Under a budget,
+/// `golden_rules_left_out` counts the Golden Rules that did not fit,
+/// `golden_rules_first_sentence` lists the ones shown by first sentence
+/// only, `golden_rules_over_share` says the pinned set is over its share of
+/// the budget, and `task` says which task context did not fit.
+/// `left_out_rule_ids` names every rule (Golden or namespace) the fit left
+/// out entirely, not even by first sentence, most relevant first, so a
+/// reader can fetch them later.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionRules {
+    pub namespace_rules: Vec<String>,
+    pub namespace_rules_left_out: usize,
+    pub also_on_record: Vec<String>,
+    pub also_on_record_left_out: usize,
+    pub left_out_rule_ids: Vec<String>,
+    /// `left_out_rule_ids` by first sentence, same order, `[type] id: text`.
+    pub left_out_first_sentences: Vec<String>,
+    pub max_bytes: Option<usize>,
+    pub sections: Option<Vec<SessionSection>>,
+    pub golden_rules_left_out: usize,
+    pub golden_rules_first_sentence: Vec<String>,
+    pub golden_rules_over_share: bool,
+    pub task: SessionTaskFit,
+}
+
+impl SessionRules {
+    /// Whether the budget cut anything: a Golden Rule not shown whole, a
+    /// namespace rule not shown whole, or a part of the task context.
+    fn truncated_by_budget(&self) -> bool {
+        self.golden_rules_left_out > 0
+            || !self.golden_rules_first_sentence.is_empty()
+            || self.namespace_rules_left_out > 0
+            || self.task.handoff_left_out
+            || self.task.line_left_out
+            || self.task.block_left_out
+    }
+
+    /// Whether the caller asked for `section` (or named no sections).
+    fn requests(&self, section: SessionSection) -> bool {
+        self.sections
+            .as_ref()
+            .is_none_or(|sections| sections.contains(&section))
+    }
+
+    /// Whether the file carries `section`: the caller asked for it (or named
+    /// no sections) and the budget did not leave it out.
+    fn carries(&self, section: SessionSection) -> bool {
+        let requested = self.requests(section);
+        let left_out = match section {
+            SessionSection::Handoff => self.task.handoff_left_out,
+            SessionSection::TaskLine => self.task.line_left_out,
+            SessionSection::TaskBlock => self.task.block_left_out,
+            _ => false,
+        };
+        requested && !left_out
+    }
+}
+
+/// The session file keys a fit to a caller's budget or named sections
+/// writes; a write without one removes them.
+const SESSION_BUDGET_FIELDS: [&str; 10] = [
+    "max_bytes",
+    "sections",
+    "golden_rules_left_out",
+    "golden_rules_first_sentence",
+    "golden_rules_over_share",
+    "golden_rules_notice",
+    "truncated_by_budget",
+    "task_handoff_left_out",
+    "task_line_left_out",
+    "task_block_left_out",
+];
+
+/// The session file's keys written from `SessionRules`.
+const SESSION_RULE_FIELDS: [&str; 16] = [
+    "namespace_rules",
+    "namespace_rules_left_out",
+    "also_on_record",
+    "also_on_record_left_out",
+    "left_out_rule_ids",
+    "left_out_first_sentences",
+    "max_bytes",
+    "sections",
+    "golden_rules_left_out",
+    "golden_rules_first_sentence",
+    "golden_rules_over_share",
+    "golden_rules_notice",
+    "truncated_by_budget",
+    "task_handoff_left_out",
+    "task_line_left_out",
+    "task_block_left_out",
+];
+
+/// What session start says when the pinned set is over its share of the
+/// budget.
+pub const GOLDEN_RULES_OVER_SHARE_NOTICE: &str =
+    "Golden Rules exceed their share: shorten or unpin";
+
+/// A Golden Rule as a session file line: `[type] id: text`, the text whole
+/// (`whole`, a file fitted to `max_bytes`) or cut to 280 characters.
+pub fn golden_rule_file_line(r: &SearchResult, whole: bool) -> String {
+    format!(
+        "[{}] {}: {}",
+        r.payload.memory_type,
+        r.id,
+        golden_rule_text(r, whole)
+    )
+}
+
+/// The budget (`max_bytes`) the session file under `project_root` was last
+/// fitted to, if any. Task tools and a snapshot without the argument keep
+/// fitting to it, so the file never claims a budget it exceeds.
+pub fn session_file_max_bytes(project_root: &std::path::Path) -> Option<usize> {
+    let text = std::fs::read_to_string(
+        project_root
+            .join(".NeuroStrata")
+            .join("active_session.json"),
+    )
+    .ok()?;
+    serde_json::from_str::<Value>(&text)
+        .ok()?
+        .get("max_bytes")?
+        .as_u64()
+        .map(|b| b as usize)
+}
+
+/// The UTF-8 bytes each part of the session's task context takes in the
+/// session file: the handoff note (with its task title), the task line (id,
+/// status and Goal) and the saved task block. 0 for a part the task lacks.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SessionTaskParts {
+    pub handoff: usize,
+    pub line: usize,
+    pub block: usize,
+}
+
+/// Which parts of the task context a budget left out.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SessionTaskFit {
+    pub handoff_left_out: bool,
+    pub line_left_out: bool,
+    pub block_left_out: bool,
+}
+
+/// Measures the session's task context (see `SessionTaskParts`).
+pub fn session_task_parts(active_task: Option<(&str, &MemoryPayload)>) -> SessionTaskParts {
+    let Some((tid, payload)) = active_task else {
+        return SessionTaskParts::default();
+    };
+    let title = payload.content.len();
+    let handoff = task_handoff_value(tid, payload)
+        .get("note")
+        .and_then(|v| v.as_str())
+        .map(|note| note.len() + title + 1)
+        .unwrap_or(0);
+    let task_obj = payload.metadata.get("task");
+    let status = task_obj
+        .and_then(|t| t.get("status"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("in_progress");
+    let block = task_obj
+        .and_then(|t| t.get("subagent_prompt_injection"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.len() + 1)
+        .unwrap_or(0);
+    SessionTaskParts {
+        handoff,
+        line: tid.len() + status.len() + title + 2,
+        block,
+    }
+}
+
+/// The task row key holding the rule ids its claim-time search ranked, best
+/// first (`build_task_graph_context`).
+const RELEVANT_RULE_IDS_KEY: &str = "relevant_rule_ids";
+
+/// The rule ids the task's claim (or create) ranked by relevance, best first,
+/// as saved on the task row. Session start orders rules by them without a
+/// search of its own. None when the task has none saved.
+pub fn task_relevant_rule_ids(payload: &MemoryPayload) -> Option<Vec<String>> {
+    let ids: Vec<String> = payload
+        .metadata
+        .get("task")?
+        .get(RELEVANT_RULE_IDS_KEY)?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Saves what `build_task_graph_context` built on the task row: the task
+/// block and the rule ids its search ranked (`auto_retrieved_context`'s
+/// `relevant_rule_ids`).
+fn stamp_task_context(obj: &mut Map<String, Value>, hits_json: &Value, prompt: &str) {
+    obj.insert("subagent_prompt_injection".to_string(), json!(prompt));
+    obj.insert(
+        RELEVANT_RULE_IDS_KEY.to_string(),
+        hits_json
+            .get(RELEVANT_RULE_IDS_KEY)
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    );
+}
+
+/// The prefix that marks a task history note as a handoff for the next session.
+const HANDOFF_NOTE_PREFIX: &str = "Handoff:";
+
+/// The session file's `task_handoff`: the latest history note on an
+/// `in_progress` task that starts with "Handoff:", with the prefix removed and
+/// the rest whole. Null when the task is not in progress or has no such note.
+fn task_handoff_value(task_id: &str, payload: &MemoryPayload) -> Value {
+    let task_obj = payload.metadata.get("task");
+    let in_progress = task_obj
+        .and_then(|t| t.get("status"))
+        .and_then(|v| v.as_str())
+        == Some(Status::InProgress.as_str());
+    if !in_progress {
+        return Value::Null;
+    }
+    let latest = task_obj
+        .and_then(|t| t.get("history"))
+        .and_then(|h| h.as_array())
+        .and_then(|entries| {
+            entries.iter().rev().find_map(|entry| {
+                let note = entry.get("note")?.as_str()?;
+                let rest = note.trim_start().strip_prefix(HANDOFF_NOTE_PREFIX)?;
+                Some((entry, rest.trim_start()))
+            })
+        });
+    match latest {
+        Some((entry, note)) => json!({
+            "task_id": task_id,
+            "title": payload.content,
+            "at": entry.get("at").cloned().unwrap_or(Value::Null),
+            "note": note,
+        }),
+        None => Value::Null,
+    }
 }
 
 /// The line that opens the memory entries in a rendered task block.
@@ -893,20 +1230,36 @@ fn task_block_entry_id(line: &str) -> Option<&str> {
     (!id.is_empty()).then_some(id)
 }
 
+/// The in_progress task claimed in the worktree at `root`. A task claimed in
+/// another worktree, or with no worktree stamped, is never named, or its
+/// Breath note would land in this session.
+pub fn active_task_for_root<'a>(
+    rows: &'a [SearchResult],
+    root: &str,
+    is_active: impl Fn(&SearchResult) -> bool,
+) -> Option<&'a SearchResult> {
+    rows.iter()
+        .find(|r| is_active(r) && gate::task_in_worktree(r, root))
+}
+
 /// Best-effort persistence of `.NeuroStrata/active_session.json` so harness
-/// plugins can inject Golden Rules and active task context on session startup
-/// (`sessionContextHandler`) even before the first tool call.
+/// plugins can inject Golden Rules, the namespace's rules and active task
+/// context on session startup (`sessionContextHandler`) even before the first
+/// tool call. `rules` None (the read failed) leaves the rule fields as the
+/// file has them when the file is for the same namespace, else removes them.
 pub fn persist_active_session_file(
     project_root: &std::path::Path,
     namespace: &str,
     golden_rules: &[SearchResult],
     active_task: Option<(&str, &MemoryPayload)>,
+    rules: Option<&SessionRules>,
 ) {
     persist_active_session_file_with_home(
         project_root,
         namespace,
         golden_rules,
         active_task,
+        rules,
         &session_home_dirs(),
     );
 }
@@ -916,6 +1269,7 @@ fn persist_active_session_file_with_home(
     namespace: &str,
     golden_rules: &[SearchResult],
     active_task: Option<(&str, &MemoryPayload)>,
+    rules: Option<&SessionRules>,
     homes: &[std::path::PathBuf],
 ) {
     if is_home_without_git_with(project_root, homes) {
@@ -929,21 +1283,108 @@ fn persist_active_session_file_with_home(
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
 
+    // A failed rules read keeps the file's rule fields only when they belong
+    // to this namespace; another namespace's rules must not ride along.
+    let same_namespace = active.get("namespace").and_then(|v| v.as_str()) == Some(namespace);
+    if rules.is_none() && !same_namespace {
+        for key in SESSION_RULE_FIELDS {
+            active.remove(key);
+        }
+    }
     active.insert("namespace".to_string(), json!(namespace));
+    // A fit to a budget shows Golden Rules whole; without one they keep the
+    // 280-character lines older readers expect.
+    let fitted = rules.and_then(|r| r.max_bytes).is_some();
     let golden_strings: Vec<String> = golden_rules
         .iter()
-        .map(|r| {
-            let snippet: String = r.payload.content.chars().take(280).collect();
-            format!(
-                "[{}] {}: {}",
-                r.payload.memory_type,
-                r.id,
-                snippet.replace('\n', " ")
-            )
-        })
+        .map(|r| golden_rule_file_line(r, fitted))
         .collect();
     active.insert("golden_rules".to_string(), json!(golden_strings));
+    // The budget keys stay only while the file is fitted to that budget or
+    // those sections; a write without a fit (default sizes, or a failed rules
+    // read with unfitted Golden Rules) removes them so the plugin fits the
+    // file itself.
+    for key in SESSION_BUDGET_FIELDS {
+        active.remove(key);
+    }
+    // Which task parts the file carries: all of them without a fit.
+    let carries = |section: SessionSection| rules.is_none_or(|r| r.carries(section));
+    if let Some(rules) = rules {
+        active.insert("namespace_rules".to_string(), json!(rules.namespace_rules));
+        active.insert(
+            "namespace_rules_left_out".to_string(),
+            json!(rules.namespace_rules_left_out),
+        );
+        active.insert("also_on_record".to_string(), json!(rules.also_on_record));
+        active.insert(
+            "also_on_record_left_out".to_string(),
+            json!(rules.also_on_record_left_out),
+        );
+        active.insert(
+            "left_out_first_sentences".to_string(),
+            json!(rules.left_out_first_sentences),
+        );
+        active.insert(
+            "left_out_rule_ids".to_string(),
+            json!(rules.left_out_rule_ids),
+        );
+        if let Some(sections) = &rules.sections {
+            let names: Vec<&str> = sections.iter().map(|s| s.name()).collect();
+            active.insert("sections".to_string(), json!(names));
+        }
+        if let Some(max_bytes) = rules.max_bytes {
+            active.insert("max_bytes".to_string(), json!(max_bytes));
+            active.insert(
+                "golden_rules_left_out".to_string(),
+                json!(rules.golden_rules_left_out),
+            );
+            active.insert(
+                "golden_rules_first_sentence".to_string(),
+                json!(rules.golden_rules_first_sentence),
+            );
+            active.insert(
+                "golden_rules_over_share".to_string(),
+                json!(rules.golden_rules_over_share),
+            );
+            if rules.golden_rules_over_share {
+                active.insert(
+                    "golden_rules_notice".to_string(),
+                    json!(GOLDEN_RULES_OVER_SHARE_NOTICE),
+                );
+            }
+            active.insert(
+                "task_handoff_left_out".to_string(),
+                json!(rules.task.handoff_left_out),
+            );
+            active.insert(
+                "task_line_left_out".to_string(),
+                json!(rules.task.line_left_out),
+            );
+            active.insert(
+                "task_block_left_out".to_string(),
+                json!(rules.task.block_left_out),
+            );
+            // Truncation is always reported (agent-adoption spec 5.3).
+            active.insert(
+                "truncated_by_budget".to_string(),
+                json!(rules.truncated_by_budget()),
+            );
+        }
+    }
+    // The handoff note is written whole whenever it was asked for, also when
+    // the budget left it out of the fitted text (`task_handoff_left_out`):
+    // the plugin can still deliver it later.
+    active.insert(
+        "task_handoff".to_string(),
+        active_task
+            .filter(|_| rules.is_none_or(|r| r.requests(SessionSection::Handoff)))
+            .map(|(tid, payload)| task_handoff_value(tid, payload))
+            .unwrap_or(Value::Null),
+    );
 
+    // The task line's Goal: the task's title, only while the file carries
+    // the task line.
+    active.remove("task_goal");
     if let Some((tid, payload)) = active_task {
         active.insert("task_id".to_string(), json!(tid));
         let task_obj = payload.metadata.get("task");
@@ -952,13 +1393,18 @@ fn persist_active_session_file_with_home(
             .and_then(|v| v.as_str())
             .unwrap_or("in_progress");
         active.insert("status".to_string(), json!(status));
+        if carries(SessionSection::TaskLine) {
+            active.insert("task_goal".to_string(), json!(payload.content));
+        }
         if let Some(sid) = task_obj
             .and_then(|t| t.get("session_id"))
             .and_then(|v| v.as_str())
         {
             active.insert("session_id".to_string(), json!(sid));
         }
-        if let Some(inj) = task_obj
+        if !carries(SessionSection::TaskBlock) {
+            active.remove("subagent_prompt_injection");
+        } else if let Some(inj) = task_obj
             .and_then(|t| t.get("subagent_prompt_injection"))
             .and_then(|v| v.as_str())
         {
@@ -1157,8 +1603,10 @@ async fn in_progress_task(
 /// the row a claim has just saved, written as is. Otherwise a task is named
 /// only when its row is in progress at write time: `candidate` (the task the
 /// snapshot found), else the task the file already names (a claim that landed
-/// after the snapshot listed the tasks), else none. If a row cannot be read,
-/// the file is left as it is.
+/// after the snapshot listed the tasks) when [`active_task_for_root`] names it
+/// for `project_root`, fitted to the file's budget as a claim fits it, else
+/// none. If a row cannot be read, the file is left as it is. `rules` is
+/// passed on to [`persist_active_session_file`] for the snapshot's own pick.
 pub(crate) async fn refresh_active_session_file(
     store: &Arc<dyn VectorStore>,
     project_root: &std::path::Path,
@@ -1166,47 +1614,82 @@ pub(crate) async fn refresh_active_session_file(
     golden_rules: &[SearchResult],
     claimed: Option<(&str, &MemoryPayload)>,
     candidate: Option<&str>,
+    rules: Option<&SessionRules>,
 ) {
     let _session_guard = SESSION_FILE_LOCK.lock().await;
     if let Some(claimed) = claimed {
-        persist_active_session_file(project_root, namespace, golden_rules, Some(claimed));
+        persist_active_session_file(project_root, namespace, golden_rules, Some(claimed), rules);
         return;
     }
-    let mut active: Option<Task> = None;
-    // The task the file names counts only while the session that wrote it
-    // still holds the claim.
-    let named = session_file_task_id(project_root);
-    let candidates = candidate
-        .map(|id| (id.to_string(), None))
-        .into_iter()
-        .chain(named.map(|(id, session)| (id, Some(session))));
-    for (id, file_session) in candidates {
-        match in_progress_task(store, namespace, &id).await {
-            Ok(Some(task))
-                if file_session
-                    .as_ref()
-                    .is_none_or(|session| file_names_current_claim(session.as_deref(), &task)) =>
-            {
-                active = Some(task);
-                break;
-            }
-            Ok(_) => {}
+    if let Some(id) = candidate {
+        let active = match in_progress_task(store, namespace, id).await {
+            Ok(active) => active,
             Err(()) => return,
-        }
+        };
+        // The block cached at claim time, without the rules retired since.
+        let fresh = match &active {
+            Some(task) => Some((
+                task.id.clone(),
+                task_payload_without_retired_entries(store, namespace, &task.payload).await,
+            )),
+            None => None,
+        };
+        persist_active_session_file(
+            project_root,
+            namespace,
+            golden_rules,
+            fresh.as_ref().map(|(id, payload)| (id.as_str(), payload)),
+            rules,
+        );
+        return;
     }
-    // The block cached at claim time, without the rules retired since.
-    let fresh = match &active {
-        Some(task) => Some((
-            task.id.as_str(),
-            task_payload_without_retired_entries(store, namespace, &task.payload).await,
-        )),
+    // The caller saw no task in progress, but a claim may have landed and
+    // written the file since. Its task stays only when `active_task_for_root`
+    // names it for this root (never another worktree's task) and the session
+    // that wrote the file still holds the claim, fitted to the file's budget
+    // as a claim fits it.
+    let landed = match session_file_task_id(project_root) {
+        Some((id, file_session)) => match in_progress_task(store, namespace, &id).await {
+            Ok(task) => {
+                task.filter(|task| file_names_current_claim(file_session.as_deref(), task))
+            }
+            Err(()) => return,
+        },
         None => None,
+    };
+    let landed = landed.filter(|task| {
+        let row = SearchResult {
+            id: task.id.clone(),
+            score: 0.0,
+            payload: task.payload.clone(),
+            evidence: None,
+        };
+        let root = project_root.to_string_lossy();
+        active_task_for_root(std::slice::from_ref(&row), &root, |_| true).is_some()
+    });
+    let Some(task) = landed else {
+        persist_active_session_file(project_root, namespace, golden_rules, None, rules);
+        return;
+    };
+    let payload = task_payload_without_retired_entries(store, namespace, &task.payload).await;
+    let fit = crate::server::session_rules_from_store(
+        store,
+        namespace,
+        golden_rules,
+        (task.id.as_str(), &payload),
+        session_file_max_bytes(project_root),
+    )
+    .await;
+    let (golden, rules) = match fit {
+        Some((kept, rules)) => (kept, Some(rules)),
+        None => (golden_rules.to_vec(), None),
     };
     persist_active_session_file(
         project_root,
         namespace,
-        golden_rules,
-        fresh.as_ref().map(|(id, payload)| (*id, payload)),
+        &golden,
+        Some((task.id.as_str(), &payload)),
+        rules.as_ref(),
     );
 }
 
@@ -1266,9 +1749,17 @@ pub(crate) async fn clear_finished_task_from_session_file(
             Some(Ok(Some(task))) if file_names_current_claim(file_session, task) => continue,
             _ => {}
         }
-        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+        for key in [
+            "task_id",
+            "status",
+            "session_id",
+            "subagent_prompt_injection",
+            "task_goal",
+        ] {
             active.remove(key);
         }
+        // A handoff belongs to an in-progress task only.
+        active.insert("task_handoff".to_string(), Value::Null);
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
         if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
             let _ = harness_plugins::write_atomically(&session_path, &serialized);
@@ -1295,6 +1786,42 @@ fn caller_session_root(args: &Value) -> Option<std::path::PathBuf> {
         .or_else(|| arg_str(args, "project_root"))
         .or_else(|| arg_str(args, "cwd"))?;
     Some(resolve_session_root_dir(std::path::Path::new(explicit)))
+}
+
+/// The rows most relevant to a task, best first: the hybrid search (vector,
+/// lexical and graph expansion) with the task's own vector and `query_text`,
+/// tasks and archived rows left out. Stores without the hybrid path fall back
+/// to a vector search. Empty when the search fails.
+pub(crate) async fn task_hybrid_hits(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    vector: &[f32],
+    limit: usize,
+    query_text: &str,
+    include_code_ast: bool,
+) -> Vec<SearchResult> {
+    if let Some(lb) = VectorStore::as_any(&**store).downcast_ref::<LadybugStore>() {
+        lb.search_hybrid_with_domain(
+            namespace,
+            vector.to_vec(),
+            limit,
+            false,
+            false,
+            include_code_ast,
+            &[],
+            Some(query_text),
+            false,
+            crate::traits::SearchMode::Hybrid,
+        )
+        .await
+        .map(|o| o.results)
+        .unwrap_or_default()
+    } else {
+        store
+            .search(namespace, vector.to_vec(), limit, false, false)
+            .await
+            .unwrap_or_default()
+    }
 }
 
 /// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
@@ -1329,28 +1856,15 @@ pub async fn build_task_graph_context(
 
     // Hybrid seed selection (R2.1): use the hybrid search path rather than raw
     // vector `store.search`, so graph-expanded IDs are available as seeds.
-    let raw_hits = if let Some(lb) = VectorStore::as_any(&**store).downcast_ref::<LadybugStore>() {
-        lb.search_hybrid_with_domain(
-            namespace,
-            vector.to_vec(),
-            12,
-            false,
-            false,
-            true,
-            &[],
-            Some(&payload.content),
-            false,
-            crate::traits::SearchMode::Hybrid,
-        )
-        .await
-        .map(|o| o.results)
-        .unwrap_or_default()
-    } else {
-        store
-            .search(namespace, vector.to_vec(), 12, false, false)
-            .await
-            .unwrap_or_default()
-    };
+    let raw_hits = task_hybrid_hits(store, namespace, vector, 12, &payload.content, true).await;
+    // The rules among the hits, best first (Golden Rules included), saved on
+    // the task row so session start can rank rules without a search.
+    let relevant_rule_ids: Vec<String> = raw_hits
+        .iter()
+        .filter(|r| r.payload.memory_type == "rule")
+        .filter(|r| !crate::handlers::archive_memory::is_archived(&r.payload))
+        .map(|r| r.id.clone())
+        .collect();
     let mut hits_json = Vec::new();
     let mut hit_lines: Vec<String> = Vec::new();
     for r in raw_hits {
@@ -1568,6 +2082,7 @@ pub async fn build_task_graph_context(
 
     let auto_retrieved_context = json!({
         "query": payload.content,
+        "relevant_rule_ids": relevant_rule_ids,
         "golden_rules": golden_json,
         "items": hits_json,
         "related_edges": related_edges,
@@ -2645,22 +3160,14 @@ pub async fn handle_task_create(
             let claim_mutex = claim_lock(&id);
             let _claim_guard = claim_mutex.lock().await;
             if let Ok((mut latest_task, latest_vec)) = load_task(&store, &namespace, &id).await {
-                {
-                    let obj = task_obj_mut(&mut latest_task.payload);
-                    obj.insert(
-                        "subagent_prompt_injection".to_string(),
-                        json!(subagent_prompt),
-                    );
-                }
+                stamp_task_context(
+                    task_obj_mut(&mut latest_task.payload),
+                    &hits_json,
+                    &subagent_prompt,
+                );
                 let _ = save_task(&store, &namespace, &id, latest_vec, latest_task.payload).await;
             }
-            {
-                let obj = task_obj_mut(&mut payload);
-                obj.insert(
-                    "subagent_prompt_injection".to_string(),
-                    json!(subagent_prompt),
-                );
-            }
+            stamp_task_context(task_obj_mut(&mut payload), &hits_json, &subagent_prompt);
             let hits_json = if wants_metadata(&args) {
                 hits_json
             } else {
@@ -2769,6 +3276,90 @@ async fn resolve_task_scope(
         }
     }
     (chosen_root, scope)
+}
+
+/// The caller's explicit root: `worktree`, else `project_root`, else `cwd`.
+fn explicit_session_root(args: &Value) -> Option<std::path::PathBuf> {
+    arg_str(args, "worktree")
+        .or_else(|| arg_str(args, "project_root"))
+        .or_else(|| arg_str(args, "cwd"))
+        .map(std::path::PathBuf::from)
+}
+
+/// Where a task tool writes `active_session.json`: the caller's own worktree,
+/// not the global registry root. An explicit worktree/project_root/cwd wins
+/// (as `resolved_worktree` when the caller already resolved it, else its
+/// enclosing root); otherwise `task_worktree` (the worktree the task was
+/// claimed in); otherwise the registry project_root. Never the daemon's root:
+/// a worktree caller without a registry root must not write into the daemon
+/// checkout.
+async fn session_file_root(
+    args: &Value,
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    resolved_worktree: Option<&str>,
+    task_worktree: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    if let Some(exp) = explicit_session_root(args) {
+        return Some(
+            resolved_worktree
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| resolve_session_root_dir(&exp)),
+        );
+    }
+    if let Some(wt) = task_worktree.filter(|s| !s.trim().is_empty()) {
+        return Some(std::path::PathBuf::from(wt));
+    }
+    let rid = crate::registry::registry_row_id(namespace);
+    if let Ok(Some((_, reg_p))) = store.get(namespace, &rid).await {
+        reg_p
+            .metadata
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    }
+}
+
+/// Rewrites the session file for a task tool: Golden Rules, the namespace's
+/// rules (picked as the snapshot picks them) and the task with its handoff.
+/// Written under the session file lock, like every other write of the file.
+async fn persist_task_session_file(
+    root: &std::path::Path,
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+    payload: &MemoryPayload,
+) {
+    let mut golden = collect_golden_rules(store, namespace, None).await;
+    // The snapshot's row filter (conflicting mesh rows, the registry row),
+    // so a note cannot bring back a Golden Rule the snapshot leaves out.
+    golden.retain(|r| crate::server::snapshot_row_visible(r, false));
+    let max_bytes = session_file_max_bytes(root);
+    let fit = crate::server::session_rules_from_store(
+        store,
+        namespace,
+        &golden,
+        (task_id, payload),
+        max_bytes,
+    )
+    .await;
+    let (golden, rules) = match fit {
+        Some((kept, rules)) => (kept, Some(rules)),
+        None => (golden, None),
+    };
+    refresh_active_session_file(
+        store,
+        root,
+        namespace,
+        &golden,
+        Some((task_id, payload)),
+        None,
+        rules.as_ref(),
+    )
+    .await;
 }
 
 pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> String {
@@ -2971,13 +3562,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
 
     let (hits_json, subagent_prompt) =
         build_task_graph_context(&store, &namespace, &id, &vector, &task.payload).await;
-    {
-        let obj = task_obj_mut(&mut task.payload);
-        obj.insert(
-            "subagent_prompt_injection".to_string(),
-            json!(subagent_prompt),
-        );
-    }
+    stamp_task_context(
+        task_obj_mut(&mut task.payload),
+        &hits_json,
+        &subagent_prompt,
+    );
     if let Err(e) = save_task(
         &store,
         &namespace,
@@ -2989,45 +3578,12 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     {
         return e;
     }
-    // Write active_session.json into the caller's own worktree, not the global
-    // registry root: explicit worktree/project_root/cwd wins; otherwise use the
-    // registry project_root. Never fall back to daemon_root here -- a worktree
-    // caller without a registry root must not write into the daemon checkout.
-    let explicit_root = arg_str(&args, "worktree")
-        .or_else(|| arg_str(&args, "project_root"))
-        .or_else(|| arg_str(&args, "cwd"))
-        .map(std::path::PathBuf::from);
-    let session_root = if let Some(ref exp) = explicit_root {
-        scope
-            .worktree
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .or_else(|| Some(resolve_session_root_dir(exp)))
-    } else {
-        let rid = crate::registry::registry_row_id(&namespace);
-        if let Ok(Some((_, reg_p))) = store.get(&namespace, &rid).await {
-            reg_p
-                .metadata
-                .get("project_root")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(std::path::PathBuf::from)
-        } else {
-            None
-        }
-    };
+    let explicit_root = explicit_session_root(&args);
+    let session_root =
+        session_file_root(&args, &store, &namespace, scope.worktree.as_deref(), None).await;
     let hint_root = explicit_root.clone().or_else(|| session_root.clone());
     if let Some(root) = session_root {
-        let golden = collect_golden_rules(&store, &namespace, None).await;
-        refresh_active_session_file(
-            &store,
-            &root,
-            &namespace,
-            &golden,
-            Some((&id, &task.payload)),
-            None,
-        )
-        .await;
+        persist_task_session_file(&root, &store, &namespace, &id, &task.payload).await;
     }
     // After the new claim is written: a file there that names this task under
     // the new session is kept.
@@ -3114,7 +3670,16 @@ pub async fn handle_task_update(
             }
         },
     };
-    let note = arg_str(&args, "note").map(|s| s.to_string());
+    // A note is never refused (a handoff must not be lost): add_memory's
+    // secret scanner finds each secret and the note is stored with it
+    // replaced by `[REDACTED:<category>]`. The reply names the categories.
+    let (note, note_redactions) = match arg_str(&args, "note") {
+        Some(raw) => {
+            let (scrubbed, found) = crate::secrets::redact(raw);
+            (Some(scrubbed), found)
+        }
+        None => (None, Vec::new()),
+    };
     // The title is the task's content (section 1.1), so renaming it means
     // rewriting content AND re-embedding: a title is what search_memory reads.
     let new_title = match args.get("title") {
@@ -3160,12 +3725,12 @@ pub async fn handle_task_update(
         Err(e) => return e,
     };
     let from = task.status();
+    // Before an unclaim drops the worktree mark the claim recorded.
+    let session_roots = session_file_roots_for(&args, &task);
     let history_before = task
         .task_field("history")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    // Before an unclaim drops the worktree mark the claim recorded.
-    let session_roots = session_file_roots_for(&args, &task);
 
     // A rename is history, not a transition: without a caller's note the
     // history entry says what the title became, so Working Memory keeps the
@@ -3283,9 +3848,7 @@ pub async fn handle_task_update(
     }
 
     let refreshed_prompt = if rename_note.is_some() && task.status() == Status::InProgress {
-        let (_hits, prompt) =
-            build_task_graph_context(&store, &namespace, &id, &vector, &task.payload).await;
-        Some(prompt)
+        Some(build_task_graph_context(&store, &namespace, &id, &vector, &task.payload).await)
     } else {
         None
     };
@@ -3294,10 +3857,11 @@ pub async fn handle_task_update(
     {
         let obj = task_obj_mut(&mut task.payload);
         if rename_note.is_some() {
-            if let Some(prompt) = refreshed_prompt {
-                obj.insert("subagent_prompt_injection".to_string(), json!(prompt));
+            if let Some((hits, prompt)) = refreshed_prompt {
+                stamp_task_context(obj, &hits, &prompt);
             } else {
                 obj.remove("subagent_prompt_injection");
+                obj.remove(RELEVANT_RULE_IDS_KEY);
             }
         }
         if let Some(p) = priority {
@@ -3330,6 +3894,20 @@ pub async fn handle_task_update(
     }
     if from == Status::InProgress && task.status() != Status::InProgress {
         clear_finished_task_from_session_file(&store, &namespace, &id, &session_roots).await;
+    }
+    // A note on the in-progress task (a Breath note, or a "Handoff:" note for
+    // the next session) refreshes the session file, so a session that starts
+    // later reads it from there.
+    if note.is_some() && task.status() == Status::InProgress {
+        let task_worktree = task
+            .task_field("worktree")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if let Some(root) =
+            session_file_root(&args, &store, &namespace, None, task_worktree.as_deref()).await
+        {
+            persist_task_session_file(&root, &store, &namespace, &id, &task.payload).await;
+        }
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("update-{}", id))
@@ -3385,6 +3963,12 @@ pub async fn handle_task_update(
         "task": task_summary(&id, &task.payload, false),
         "graph_queries_count": graph_queries_count,
         "graph_lookup_nudge": Value::Null,
+        // One entry per secret replaced in the note, by the scanner's finding
+        // type; empty when none. Never the secret itself.
+        "redactions": note_redactions
+            .iter()
+            .map(|category| json!({ "category": category }))
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -3437,7 +4021,8 @@ pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String
         Ok((task, _)) => task,
         Err(e) => return e,
     };
-    let mut summary = task_summary(&task.id, &task.payload);
+    // The whole history first: the reply cuts it to the latest notes itself.
+    let mut summary = task_summary(&task.id, &task.payload, true);
     let notes = summary
         .get("history")
         .and_then(|h| h.as_array())
@@ -10321,6 +10906,7 @@ exit 0
             "example-project",
             &[],
             None,
+            None,
             &[home.path().to_path_buf()],
         );
         assert!(!home
@@ -10334,6 +10920,7 @@ exit 0
             "example-project",
             &[],
             None,
+            None,
             &[home.path().to_path_buf()],
         );
         assert!(
@@ -10346,6 +10933,7 @@ exit 0
             &work,
             "example-project",
             &[],
+            None,
             None,
             &[home.path().to_path_buf()],
         );
@@ -10371,6 +10959,7 @@ exit 0
             &scratch,
             "example-project",
             &[],
+            None,
             None,
             &[home.clone()],
         );
@@ -10730,6 +11319,293 @@ exit 0
             !nested_session.exists(),
             "active_session.json must not be stranded in a nested subdirectory"
         );
+    }
+
+    fn handoff_payload(status: &str, notes: &[(&str, &str)]) -> MemoryPayload {
+        let history: Vec<Value> = notes
+            .iter()
+            .map(|(at, note)| json!({ "from": status, "to": status, "at": at, "note": note }))
+            .collect();
+        MemoryPayload {
+            content: "the work".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({ "task": { "status": status, "history": history } }),
+        }
+    }
+
+    #[test]
+    fn the_task_handoff_is_the_latest_handoff_note_whole_without_its_prefix() {
+        let payload = handoff_payload(
+            "in_progress",
+            &[
+                ("2026-11-20T10:00:00Z", "Handoff: the first one"),
+                (
+                    "2026-11-21T10:00:00Z",
+                    "  Handoff:   next, run the suite.\nThen push.",
+                ),
+                ("2026-11-22T10:00:00Z", "Breath: tests written"),
+                (
+                    "2026-11-22T11:00:00Z",
+                    "a note that mentions Handoff: later",
+                ),
+            ],
+        );
+        assert_eq!(
+            task_handoff_value("t-1", &payload),
+            json!({
+                "task_id": "t-1",
+                "title": "the work",
+                "at": "2026-11-21T10:00:00Z",
+                "note": "next, run the suite.\nThen push.",
+            })
+        );
+        assert_eq!(
+            task_handoff_value("t-1", &handoff_payload("in_progress", &[("x", "Breath")])),
+            Value::Null,
+            "no handoff note"
+        );
+        assert_eq!(
+            task_handoff_value("t-1", &handoff_payload("open", &[("x", "Handoff: stale")])),
+            Value::Null,
+            "only the in-progress task hands off"
+        );
+    }
+
+    /// Claim and a note on the in-progress task write the namespace's rules
+    /// and the latest handoff into the session file, and keep the keys the
+    /// plugins own.
+    #[tokio::test]
+    async fn claim_and_a_note_write_rules_and_the_handoff_and_keep_plugin_keys() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".NeuroStrata")).unwrap();
+        let session_file = dir.path().join(".NeuroStrata").join("active_session.json");
+        std::fs::write(
+            &session_file,
+            r#"{"claude_session_dirs":{"ses_1":"/x"},"conceptual_bridges":[{"id":"b"}]}"#,
+        )
+        .unwrap();
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "hand me off", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent",
+                "session_id": "ses_1",
+                "cwd": dir.path().to_string_lossy().to_string(),
+            }),
+            store.clone(),
+        )
+        .await;
+        let read = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&session_file).unwrap()).unwrap()
+        };
+        let body = read();
+        let rules = body["namespace_rules"].as_array().expect("namespace_rules");
+        assert_eq!(rules.len(), 1, "{body}");
+        let line = rules[0].as_str().unwrap();
+        assert!(
+            line.starts_with("[rule] ") && line.ends_with(": always use podman"),
+            "{line}"
+        );
+        assert_eq!(body["namespace_rules_left_out"], json!(0));
+        assert_eq!(body["also_on_record"], json!([]));
+        assert_eq!(body["task_handoff"], Value::Null);
+        assert_eq!(body["claude_session_dirs"], json!({ "ses_1": "/x" }));
+        // The claim saves the rule ids its search ranked on the task row;
+        // session start orders rules by them without a search of its own.
+        let (_, claimed) = store.get("MyProj", &id).await.unwrap().unwrap();
+        let ranked = task_relevant_rule_ids(&claimed).expect("relevant_rule_ids saved");
+        assert!(
+            ranked.iter().any(|rid| line.contains(rid.as_str())),
+            "{ranked:?} names the namespace's rule ({line})"
+        );
+
+        // The update names no folder: the file is the one the claim wrote.
+        for note in ["Handoff: next, run the suite", "Breath: suite running"] {
+            handle_task_update(
+                json!({ "namespace": "MyProj", "id": id, "note": note }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+        }
+        let body = read();
+        assert_eq!(body["task_handoff"]["task_id"], json!(id));
+        assert_eq!(body["task_handoff"]["title"], json!("hand me off"));
+        assert_eq!(body["task_handoff"]["note"], json!("next, run the suite"));
+        assert!(body["task_handoff"]["at"].is_string(), "{body}");
+        assert_eq!(body["claude_session_dirs"], json!({ "ses_1": "/x" }));
+        assert_eq!(body["conceptual_bridges"], json!([{ "id": "b" }]));
+        assert_eq!(body["namespace_rules"].as_array().map(Vec::len), Some(1));
+    }
+
+    /// A note is never refused: a secret in it is stored as
+    /// `[REDACTED:<category>]` and the reply says how many and which kinds,
+    /// never the secret. A clean note is stored as written.
+    #[tokio::test]
+    async fn a_note_is_stored_with_its_secrets_redacted() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "keep secrets out", 1).await;
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let history = || {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let (_, p) = store.get("MyProj", &id).await.unwrap().unwrap();
+                p.metadata["task"]["history"].to_string()
+            }
+        };
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": format!("Handoff: push with {key}") }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.contains(key), "{reply}");
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
+        let stored = history().await;
+        assert!(!stored.contains(key), "{stored}");
+        assert!(
+            stored.contains("Handoff: push with [REDACTED:github_pat]"),
+            "{stored}"
+        );
+
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": "Handoff: run the suite" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"], json!([]));
+        assert!(history().await.contains("Handoff: run the suite"));
+    }
+
+    /// The task line counts the task's id, status and Goal (its title), and
+    /// the file carries the Goal as `task_goal` while it carries the task
+    /// line. A part the fit left out is not written and is flagged.
+    #[test]
+    fn task_line_includes_the_goal_and_left_out_parts_are_flagged() {
+        let mut payload = handoff_payload(
+            "in_progress",
+            &[(
+                "2026-11-22T10:00:00Z",
+                &format!("Handoff: {}", "h".repeat(900)),
+            )],
+        );
+        payload.metadata["task"]["subagent_prompt_injection"] = json!("b".repeat(100));
+        let task = Some(("t-1", &payload));
+        let parts = session_task_parts(task);
+        assert_eq!(
+            parts.line,
+            "t-1".len() + "in_progress".len() + "the work".len() + 2,
+            "id, status and Goal"
+        );
+        assert_eq!(parts.handoff, 900 + "the work".len() + 1);
+        assert_eq!(parts.block, 101);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".NeuroStrata")).unwrap();
+        let read = || -> Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join(".NeuroStrata/active_session.json"))
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let rules = SessionRules {
+            max_bytes: Some(300),
+            task: SessionTaskFit {
+                handoff_left_out: true,
+                ..SessionTaskFit::default()
+            },
+            ..SessionRules::default()
+        };
+        persist_active_session_file_with_home(dir.path(), "ns", &[], task, Some(&rules), &[]);
+        let body = read();
+        // Left out of the fitted text, but still written whole for later.
+        assert_eq!(body["task_handoff"]["note"], json!("h".repeat(900)));
+        assert_eq!(body["task_handoff"]["task_id"], json!("t-1"));
+        assert_eq!(body["task_handoff_left_out"], json!(true));
+        assert_eq!(body["task_line_left_out"], json!(false));
+        assert_eq!(body["task_block_left_out"], json!(false));
+        assert_eq!(body["task_goal"], json!("the work"));
+        assert_eq!(body["subagent_prompt_injection"], json!("b".repeat(100)));
+        assert_eq!(body["truncated_by_budget"], json!(true));
+        assert_eq!(body["task_id"], json!("t-1"));
+        assert_eq!(body["max_bytes"], json!(300));
+
+        // Named sections without the task line and block: neither is
+        // written, and neither counts as left out.
+        let rules = SessionRules {
+            max_bytes: Some(300),
+            sections: Some(vec![SessionSection::Handoff, SessionSection::Rules]),
+            ..SessionRules::default()
+        };
+        persist_active_session_file_with_home(dir.path(), "ns", &[], task, Some(&rules), &[]);
+        let body = read();
+        assert!(body.get("task_goal").is_none(), "{body}");
+        assert!(body.get("subagent_prompt_injection").is_none(), "{body}");
+        assert_eq!(body["task_line_left_out"], json!(false));
+        assert_eq!(body["sections"], json!(["handoff", "rules"]));
+        assert_eq!(body["task_handoff"]["note"], json!("h".repeat(900)));
+        assert_eq!(
+            body["task_id"],
+            json!("t-1"),
+            "the task id still names the task"
+        );
+
+        // A handoff note that was not asked for is not written.
+        let rules = SessionRules {
+            max_bytes: Some(300),
+            sections: Some(vec![SessionSection::Rules]),
+            left_out_rule_ids: vec!["r-9".to_string()],
+            ..SessionRules::default()
+        };
+        persist_active_session_file_with_home(dir.path(), "ns", &[], task, Some(&rules), &[]);
+        let body = read();
+        assert_eq!(body["task_handoff"], Value::Null);
+        assert_eq!(body["left_out_rule_ids"], json!(["r-9"]));
+    }
+
+    /// A failed rules read (`rules` None) keeps the file's rule fields for the
+    /// same namespace and removes them when the file held another namespace.
+    #[test]
+    fn failed_rules_read_drops_another_namespaces_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".NeuroStrata")).unwrap();
+        let session_file = dir.path().join(".NeuroStrata").join("active_session.json");
+        let rules = SessionRules {
+            namespace_rules: vec!["[rule] r-1: old rule".to_string()],
+            namespace_rules_left_out: 2,
+            also_on_record: vec!["[rule] r-2: older…".to_string()],
+            max_bytes: Some(4_000),
+            ..SessionRules::default()
+        };
+        let write = |namespace: &str, rules: Option<&SessionRules>| {
+            persist_active_session_file_with_home(dir.path(), namespace, &[], None, rules, &[]);
+            serde_json::from_str::<Value>(&std::fs::read_to_string(&session_file).unwrap()).unwrap()
+        };
+        write("ns-a", Some(&rules));
+        let body = write("ns-a", None);
+        assert_eq!(body["namespace_rules"], json!(["[rule] r-1: old rule"]));
+        assert_eq!(body["namespace_rules_left_out"], json!(2));
+        assert!(
+            body.get("max_bytes").is_none(),
+            "an unfitted write drops the budget keys: {body}"
+        );
+        let body = write("ns-b", None);
+        assert_eq!(body["namespace"], json!("ns-b"));
+        for key in SESSION_RULE_FIELDS {
+            assert!(body.get(key).is_none(), "{key} must be gone: {body}");
+        }
     }
 
     #[test]

@@ -173,7 +173,30 @@ import {
   extractDaemonMemoryAdvisory,
   daemonTokenPath,
   addSessionWorktree,
-  isSessionScopedTool
+  isSessionScopedTool,
+  handleSessionStartEvent,
+  buildSessionStartUnits,
+  fitSessionStartUnits,
+  utf8Bytes,
+  SESSION_START_MAX_BYTES,
+  buildHandoffSummary,
+  writeSessionHandoff,
+  sessionStartIsResume,
+  sessionStartText,
+  SESSION_START_CONTENT_BUDGET,
+  SESSION_START_FRAMING_BYTES,
+  resetAllSessionEpochs,
+  copilotPreToolUseReply,
+  memoryContentFromReply,
+  LEFT_OUT_WHOLE_RULES,
+  stampHarnessSessionId,
+  taskBlockForInjection,
+  handoffRedactions,
+  handlePostToolUseEvent,
+  setHookProgressWriterForTesting,
+  loadPersistedSessionEpoch,
+  SNAPSHOT_WAIT_MS,
+  openCodeUserLineNote
 } from './dist/index.js'
 
 // ──────────────────────────────────────────────────────────────────────
@@ -4753,6 +4776,29 @@ describe('resolveActiveTaskFromDaemon session/worktree scoping', () => {
     })
   })
 
+  it('matches a worktree stored in the Windows verbatim spelling (\\?\C:\...)', async (t) => {
+    if (process.platform !== 'win32') return t.skip('Windows spelling')
+    const tasks = [
+      {
+        id: 'same-session-other-worktree',
+        session_id: 'ses-mine',
+        worktree: 'C:\\no-such-other-wt',
+        status: 'in_progress'
+      },
+      {
+        id: 'verbatim',
+        session_id: 'ses-mine',
+        worktree: `\\\\?\\${root.toUpperCase()}`,
+        status: 'in_progress'
+      }
+    ]
+    await withDaemon(tasks, async () => {
+      await seedSession('ses-mine')
+      const res = await resolveActiveTaskFromDaemon('scope-ns')
+      assert.equal(res.taskId, 'verbatim', 'session + same worktree wins')
+    })
+  })
+
   it('prefers a session match over a worktree-only match', async () => {
     const tasks = [
       {
@@ -5841,6 +5887,2531 @@ describe('PR #400 namespace resolution regressions', () => {
       assert.notEqual(cfg.namespace, invalid)
     } finally {
       delete process.env.NEUROSTRATA_NAMESPACE
+    }
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────────
+// Session start and handoff, every harness: the daemon writes
+// active_session.json, the plugin builds the text from it, fits it, and on a
+// resume leaves out what the session was already shown.
+// ──────────────────────────────────────────────────────────────────────
+
+describe('session start from active_session.json (every harness)', () => {
+  const RULES = {
+    golden_rules: ['[rule] g1: Golden one.'],
+    namespace_rules: [
+      '[rule] n1: Namespace one, whole.',
+      '[rule] g1: Golden one.'
+    ],
+    namespace_rules_left_out: 1,
+    also_on_record: ['[rule] a1: First sentence only…']
+  }
+
+  // A daemon that answers every tool call and, on get_snapshot, writes
+  // `fileOnSnapshot` into the project's active_session.json (as the daemon does).
+  async function withSessionDaemon(root, opts, fn) {
+    const calls = []
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        const msg = JSON.parse(body)
+        const name = msg.params?.name
+        calls.push({ name, args: msg.params?.arguments })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        if (opts.fail?.includes(name)) {
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: msg.id,
+              error: { code: -32000, message: 'down' }
+            })
+          )
+          return
+        }
+        if (name === 'neurostrata_get_snapshot' && opts.fileOnSnapshot) {
+          writeFileSync(
+            join(root, '.NeuroStrata', 'active_session.json'),
+            JSON.stringify(opts.fileOnSnapshot)
+          )
+        }
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    name === 'neurostrata_get_memory' &&
+                    opts.memories?.[msg.params?.arguments?.id] !== undefined
+                      ? `--- Memory ID: ${msg.params.arguments.id} ---\nType: rule\nContent: ${opts.memories[msg.params.arguments.id]}\nFile Location: x.rs`
+                      : (opts.text?.[name] ?? 'ok')
+                }
+              ]
+            }
+          })
+        )
+      })
+    })
+    await new Promise((r) => server.listen(0, '127.0.0.1', r))
+    const url = `http://127.0.0.1:${server.address().port}/mcp`
+    try {
+      resetClientForTesting()
+      await initialize({
+        config: {
+          namespace: 'ss-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          requestTimeoutMs: 2000
+        },
+        projectDir: root,
+        skipHandshake: true,
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+      return await fn(calls)
+    } finally {
+      server.close()
+      resetModuleState()
+    }
+  }
+
+  function project(file) {
+    const root = mkdtempSync(join(tmpdir(), 'ns-ss-'))
+    mkdirSync(join(root, '.NeuroStrata'), { recursive: true })
+    if (file)
+      writeFileSync(
+        join(root, '.NeuroStrata', 'active_session.json'),
+        JSON.stringify(file)
+      )
+    return root
+  }
+
+  const ctxOf = (out) =>
+    out.hookSpecificOutput?.additionalContext ?? out.additionalContext ?? ''
+
+  it('only an explicit resume skips; every other start value gets everything', () => {
+    assert.equal(sessionStartIsResume('resume'), true)
+    for (const s of ['startup', 'clear', 'compact', 'fork', 'new', undefined])
+      assert.equal(sessionStartIsResume(s), false, String(s))
+  })
+
+  it('Claude Code: compact of the claiming session refreshes the file, injects every section in order, each rule once', async () => {
+    const root = project({ namespace: 'ss-ns' })
+    const file = {
+      namespace: 'ss-ns',
+      task_id: 't-1',
+      status: 'in_progress',
+      session_id: 'cl-1',
+      subagent_prompt_injection: 'TASK BLOCK',
+      task_handoff: {
+        task_id: 't-1',
+        title: 'Do it',
+        at: '2026-11-23T10:00:00Z',
+        note: 'Stopped at step 3.'
+      },
+      ...RULES
+    }
+    try {
+      await withSessionDaemon(root, { fileOnSnapshot: file }, async (calls) => {
+        const out = await handleHookEvent({
+          hook_event_name: 'SessionStart',
+          session_id: 'cl-1',
+          source: 'compact',
+          cwd: root
+        })
+        assert.equal(out.hookSpecificOutput.hookEventName, 'SessionStart')
+        assert.equal(out.hookSpecificOutput.permissionDecision, undefined)
+        const text = ctxOf(out)
+        const snap = calls.find((c) => c.name === 'neurostrata_get_snapshot')
+        assert.equal(snap.args.project_root, root)
+        const order = [
+          'Where the last session stopped',
+          'Stopped at step 3.',
+          'Active Task',
+          'TASK BLOCK',
+          'g1: Golden one.',
+          'n1: Namespace one',
+          'a1: First sentence only…'
+        ]
+        let at = -1
+        for (const part of order) {
+          const i = text.indexOf(part)
+          assert.ok(i > at, `${part} in order:\n${text}`)
+          at = i
+        }
+        assert.equal(text.split('g1: Golden one.').length, 2, 'g1 listed once')
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('Claude Code: resume shows only what is new; clear and compact show everything again', async () => {
+    const file = {
+      namespace: 'ss-ns',
+      task_handoff: {
+        task_id: 't-2',
+        at: '2026-11-23T11:00:00Z',
+        note: 'Note A.'
+      },
+      ...RULES
+    }
+    const root = project(file)
+    try {
+      await withSessionDaemon(root, {}, async () => {
+        const ev = (source) => ({
+          hook_event_name: 'SessionStart',
+          session_id: 'cl-r',
+          source,
+          cwd: root
+        })
+        const start = ctxOf(await handleHookEvent(ev('startup')))
+        assert.match(start, /Note A\./)
+        const same = ctxOf(await handleHookEvent(ev('resume')))
+        assert.match(same, /unchanged since this session last saw them/)
+        assert.doesNotMatch(same, /Note A\.|g1: Golden/)
+        writeFileSync(
+          join(root, '.NeuroStrata', 'active_session.json'),
+          JSON.stringify({
+            ...file,
+            golden_rules: [...RULES.golden_rules, '[rule] g2: New rule.']
+          })
+        )
+        const added = ctxOf(await handleHookEvent(ev('resume')))
+        assert.match(added, /g2: New rule\./)
+        assert.doesNotMatch(added, /g1: Golden|Note A\./)
+        for (const source of ['clear', 'compact']) {
+          const again = ctxOf(await handleHookEvent(ev(source)))
+          assert.match(again, /Note A\./, source)
+          assert.match(again, /g1: Golden one\./, source)
+        }
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a resume with no record for the session gets everything (never skips on a guess)', async () => {
+    const root = project({ namespace: 'ss-ns', ...RULES })
+    try {
+      await withSessionDaemon(root, {}, async () => {
+        const out = await handleHookEvent({
+          hook_event_name: 'SessionStart',
+          session_id: 'never-seen',
+          source: 'resume',
+          cwd: root
+        })
+        assert.match(ctxOf(out), /g1: Golden one\./)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('shows the task line only to the session that claimed it; the handoff note to any session', async () => {
+    const root = project({
+      namespace: 'ss-ns',
+      task_id: 't-3',
+      status: 'in_progress',
+      session_id: 'owner',
+      subagent_prompt_injection: 'BLOCK',
+      task_handoff: { task_id: 't-3', at: 'x', note: 'Where it stopped.' }
+    })
+    try {
+      await withSessionDaemon(root, {}, async () => {
+        const other = ctxOf(
+          await handleHookEvent({
+            hook_event_name: 'SessionStart',
+            session_id: 'other',
+            source: 'startup',
+            cwd: root
+          })
+        )
+        assert.match(other, /Where it stopped\./)
+        assert.doesNotMatch(other, /Active Task|BLOCK/)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  describe('task context goes only to the session\'s own task on resume, clear and compact', () => {
+    const LINK = 'r1 -> NeuroStrata::3::src/a.rs -> r2'
+    const BLOCK = [
+      '### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)',
+      '- Namespace: `ss-ns` | Task ID: `t-own` | Goal: Finish the parser',
+      '### Cross-Domain Bridges',
+      `  - ${LINK}`,
+      '- Mandatory Graph-First Lookup Rule: Before editing any file, look it up.',
+      '- Formal Verification Reflex: When adding a gate, prove it.'
+    ].join('\n')
+    const file = () => ({
+      namespace: 'ss-ns',
+      task_id: 't-own',
+      status: 'in_progress',
+      session_id: 'own-1',
+      subagent_prompt_injection: BLOCK,
+      conceptual_bridges: [
+        { path: LINK, target_id: 'r2' },
+        { path: 'x1 -> NeuroStrata::3::src/b.rs -> x2', target_id: 'x2' }
+      ],
+      task_handoff: { task_id: 't-own', at: 'x', note: 'Stopped at the lexer.' },
+      ...RULES
+    })
+    const start = async (root, session, source, extra = {}) =>
+      ctxOf(
+        await handleHookEvent({
+          hook_event_name: 'SessionStart',
+          session_id: session,
+          source,
+          cwd: root,
+          ...extra
+        })
+      )
+    const withRoot = async (fn) => {
+      const root = project(file())
+      try {
+        await withSessionDaemon(root, {}, () => fn(root))
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    }
+
+    for (const source of ['resume', 'compact']) {
+      it(`${source} of the claiming session: task line, Goal and block, without the AGENTS.md paragraphs; each link once`, async () => {
+        await withRoot(async (root) => {
+          const text = await start(root, 'own-1', source)
+          assert.match(text, /Active Task: `?t-own/)
+          assert.match(text, /Goal: Finish the parser/)
+          assert.doesNotMatch(text, /Mandatory Graph-First Lookup Rule/)
+          assert.doesNotMatch(text, /Formal Verification Reflex/)
+          assert.equal(text.split(LINK).length, 2, 'the block link once')
+          assert.match(text, /x1 -> NeuroStrata::3::src\/b\.rs -> x2/)
+          assert.match(text, /Stopped at the lexer\./)
+        })
+      })
+    }
+
+    it('resume after the block was shown: the task line and Goal again, the rest of the block not', async () => {
+      await withRoot(async (root) => {
+        await start(root, 'own-1', 'compact')
+        resetAllSessionEpochs() // a new hook process starts with no memory
+        const text = await start(root, 'own-1', 'resume')
+        assert.match(text, /Active Task: `?t-own/)
+        assert.match(text, /Goal: Finish the parser/)
+        assert.doesNotMatch(text, /Cross-Domain Bridges|Task & Graph Context/)
+        assert.match(text, /unchanged since this session last saw them/)
+      })
+    })
+
+    it('clear: the new session id after the claiming session\'s SessionEnd (reason clear) gets the task', async () => {
+      await withRoot(async (root) => {
+        await handleHookEvent({
+          hook_event_name: 'SessionEnd',
+          session_id: 'own-1',
+          reason: 'clear',
+          cwd: root
+        })
+        resetAllSessionEpochs() // a new hook process starts with no memory
+        const text = await start(root, 'cleared-2', 'clear')
+        assert.match(text, /Goal: Finish the parser/)
+        resetAllSessionEpochs()
+        // A later compact of that session still knows its predecessor.
+        assert.match(await start(root, 'cleared-2', 'compact'), /Goal: Finish the parser/)
+      })
+    })
+
+    it('clear without a cleared predecessor gets no task', async () => {
+      await withRoot(async (root) => {
+        const text = await start(root, 'cleared-3', 'clear')
+        assert.doesNotMatch(text, /Active Task|Goal:/)
+        assert.match(text, /Stopped at the lexer\./)
+      })
+    })
+
+    for (const [label, source, extra] of [
+      ['startup', 'startup', {}],
+      ['Codex fork', 'fork', {}],
+      ['no start value', undefined, {}]
+    ]) {
+      it(`${label}, even with the claiming session's id: no task line, Goal or block; the handoff note stays`, async () => {
+        await withRoot(async (root) => {
+          const text = await start(root, 'own-1', source, extra)
+          assert.doesNotMatch(text, /Active Task|Goal:|Cross-Domain Bridges/)
+          assert.match(text, /Stopped at the lexer\./)
+        })
+      })
+    }
+
+    it('Copilot new: no task line, Goal or block; the handoff note stays', async () => {
+      await withRoot(async (root) => {
+        process.env.NEUROSTRATA_HOOK_EVENT = 'sessionStart'
+        try {
+          const out = await handleHookEvent({
+            cwd: root,
+            timestamp: 1,
+            sessionId: 'own-1',
+            source: 'new'
+          })
+          assert.doesNotMatch(out.additionalContext, /Active Task|Goal:/)
+          assert.match(out.additionalContext, /Stopped at the lexer\./)
+        } finally {
+          delete process.env.NEUROSTRATA_HOOK_EVENT
+        }
+      })
+    })
+
+    it('taskBlockForInjection keeps everything but the two AGENTS.md paragraphs', () => {
+      assert.equal(
+        taskBlockForInjection(BLOCK),
+        BLOCK.split('\n').slice(0, 4).join('\n')
+      )
+    })
+  })
+
+  describe('named sections (a daemon that fills get_snapshot `sections`)', () => {
+    const sectionsFile = (sections) => ({
+      namespace: 'ss-ns',
+      sections,
+      max_bytes: 8000,
+      task_id: 't-sec',
+      status: 'in_progress',
+      session_id: 'sec-1',
+      task_goal: 'Finish the parser',
+      subagent_prompt_injection: 'TASK BLOCK BODY',
+      task_handoff: { task_id: 't-sec', at: 'x', note: 'Stopped at the lexer.' },
+      golden_rules: ['[rule] g1: Golden one.'],
+      golden_rules_first_sentence: ['[rule] g2: Golden two, first sentence…'],
+      golden_rules_over_share: true,
+      golden_rules_notice: 'Golden Rules exceed their share: shorten or unpin',
+      namespace_rules: ['[rule] n1: Namespace one.']
+    })
+    const start = async (root, file, session_id, source) => {
+      let asked
+      await withSessionDaemon(root, { fileOnSnapshot: file }, async (calls) => {
+        const out = await handleHookEvent({
+          hook_event_name: 'SessionStart',
+          session_id,
+          source,
+          cwd: root
+        })
+        asked = calls.find((c) => c.name === 'neurostrata_get_snapshot')?.args
+        start.text = ctxOf(out)
+      })
+      return { asked, text: start.text }
+    }
+
+    for (const source of ['startup', 'fork']) {
+      it(`${source}: asks for handoff, golden rules, rules and first sentences; no task; the handoff says how to continue`, async () => {
+        const root = project(null)
+        try {
+          const { asked, text } = await start(
+            root,
+            sectionsFile(['handoff', 'golden_rules', 'rules', 'also_on_record']),
+            'sec-1',
+            source
+          )
+          assert.deepEqual(asked.sections, [
+            'handoff',
+            'golden_rules',
+            'rules',
+            'also_on_record'
+          ])
+          assert.doesNotMatch(text, /Active Task|TASK BLOCK BODY/)
+          assert.match(
+            text,
+            /Stopped at the lexer\.\nTo continue, claim task t-sec \(neurostrata_task_claim\); the claim returns the task's rules and code\./
+          )
+        } finally {
+          rmSync(root, { recursive: true, force: true })
+        }
+      })
+    }
+
+    for (const source of ['compact', 'resume']) {
+      it(`${source} of the claiming session: asks for the task line too; task line with Goal, no task block, no claim hint`, async () => {
+        const root = project(null)
+        try {
+          const { asked, text } = await start(
+            root,
+            sectionsFile([
+              'handoff',
+              'task_line',
+              'golden_rules',
+              'rules',
+              'also_on_record'
+            ]),
+            'sec-1',
+            source
+          )
+          assert.deepEqual(asked.sections, [
+            'handoff',
+            'task_line',
+            'golden_rules',
+            'rules',
+            'also_on_record'
+          ])
+          assert.match(
+            text,
+            /Active Task: `?t-sec`? \[`?in_progress`?\] \| Goal: Finish the parser/
+          )
+          assert.doesNotMatch(text, /TASK BLOCK BODY|To continue, claim task/)
+          assert.match(text, /g2: Golden two, first sentence…/)
+          assert.match(
+            text,
+            /\[NeuroStrata\] Golden Rules exceed their share: shorten or unpin\./
+          )
+        } finally {
+          rmSync(root, { recursive: true, force: true })
+        }
+      })
+    }
+
+    it('an older daemon (no `sections` in the file) keeps the task block', async () => {
+      const root = project(null)
+      try {
+        const file = sectionsFile(undefined)
+        delete file.sections
+        const { text } = await start(root, file, 'sec-1', 'compact')
+        assert.match(text, /TASK BLOCK BODY/)
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+  })
+
+  describe('left-out parts are delivered on the next tool calls of the epoch', () => {
+    const fitted = () => ({
+      namespace: 'ss-ns',
+      sections: ['handoff', 'golden_rules', 'rules', 'also_on_record'],
+      max_bytes: 8000,
+      golden_rules: ['[rule] g1: Golden one.'],
+      golden_rules_first_sentence: ['[rule] g2: Golden two, first sentence…'],
+      golden_rules_over_share: true,
+      namespace_rules: ['[rule] n1: Namespace one.'],
+      also_on_record: [
+        '[rule] a1: Also one, first sentence…',
+        '[rule] big: Too big, first sentence…',
+        '[rule] a2: Also two, first sentence…'
+      ],
+      also_on_record_left_out: 3
+    })
+    const memories = {
+      g2: 'Golden two, first sentence. And the rest of golden two.',
+      a1: 'Also one, first sentence. And the rest of also one.',
+      a2: 'Also two, first sentence. And the rest of also two.',
+      big: '→—'.repeat(2000)
+    }
+    const tool = (root, session_id, extra = {}) =>
+      handleHookEvent({
+        hook_event_name: 'PreToolUse',
+        session_id,
+        cwd: root,
+        tool_name: 'Read',
+        tool_input: { file_path: join(root, 'src', 'a.rs') },
+        ...extra
+      })
+    const ctxOfTool = (out) => out.hookSpecificOutput?.additionalContext ?? ''
+
+    it('golden past their share first, then the rules by first sentence, whole; each once; too big waits', async () => {
+      const root = project(null)
+      try {
+        await withSessionDaemon(
+          root,
+          { fileOnSnapshot: fitted(), memories },
+          async (calls) => {
+            await handleHookEvent({
+              hook_event_name: 'SessionStart',
+              session_id: 'lo-1',
+              source: 'startup',
+              cwd: root
+            })
+            resetAllSessionEpochs() // the tool hook is a new process
+            const first = ctxOfTool(await tool(root, 'lo-1'))
+            assert.match(first, /Left out at session start, now whole:/)
+            const g2 = first.indexOf('And the rest of golden two.')
+            // Also-on-record rules already show their first sentence at
+            // session start: they are not sent again whole.
+            assert.ok(g2 > 0, first)
+            assert.doesNotMatch(first, /rest of also one/)
+            assert.doesNotMatch(first, /→—→—/, 'too big for the reply waits')
+            assert.ok(utf8Bytes(first) <= SESSION_START_MAX_BYTES)
+            resetAllSessionEpochs()
+            const second = ctxOfTool(await tool(root, 'lo-1'))
+            assert.doesNotMatch(second, /Left out at session start|rest of/)
+            const fetched = calls.filter((c) => c.name === 'neurostrata_get_memory').map((c) => c.args.id)
+            assert.equal(fetched.filter((id) => id === 'g2').length, 1, 'g2 read once')
+          }
+        )
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+
+    it('a new epoch starts over; no session start this epoch, nothing; Copilot gets nothing and keeps it pending', async () => {
+      const root = project(null)
+      try {
+        await withSessionDaemon(
+          root,
+          { fileOnSnapshot: fitted(), memories },
+          async () => {
+            assert.doesNotMatch(
+              ctxOfTool(await tool(root, 'lo-2')),
+              /Left out at session start/,
+              'no session start yet'
+            )
+            await handleHookEvent({
+              hook_event_name: 'SessionStart',
+              session_id: 'lo-2',
+              source: 'startup',
+              cwd: root
+            })
+            process.env.NEUROSTRATA_HOOK_EVENT = 'preToolUse'
+            try {
+              const copilot = await handleHookEvent({
+                sessionId: 'lo-2',
+                timestamp: 1,
+                cwd: root,
+                toolName: 'view',
+                toolArgs: JSON.stringify({ path: 'src/a.rs' })
+              })
+              assert.equal(copilot.additionalContext, undefined)
+            } finally {
+              delete process.env.NEUROSTRATA_HOOK_EVENT
+            }
+            assert.match(ctxOfTool(await tool(root, 'lo-2')), /rest of golden two/)
+            assert.doesNotMatch(ctxOfTool(await tool(root, 'lo-2')), /rest of golden two/)
+            await handleHookEvent({
+              hook_event_name: 'SessionStart',
+              session_id: 'lo-2',
+              source: 'compact',
+              cwd: root
+            })
+            assert.match(ctxOfTool(await tool(root, 'lo-2')), /rest of golden two/)
+          }
+        )
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+
+    it('a handoff left out of the fit and rules left out entirely come on the next tool call, once', async () => {
+      const root = project(null)
+      const file = {
+        ...fitted(),
+        task_id: 't-h',
+        status: 'in_progress',
+        session_id: 'someone-else',
+        task_handoff: { task_id: 't-h', at: 'x', note: 'Stopped at the lexer.' },
+        task_handoff_left_out: true,
+        left_out_rule_ids: ['lo1', 'lo2']
+      }
+      try {
+        await withSessionDaemon(
+          root,
+          {
+            fileOnSnapshot: file,
+            memories: {
+              ...memories,
+              lo1: 'Left out one, whole.',
+              lo2: 'Left out two, whole.'
+            }
+          },
+          async () => {
+            const start = ctxOf(
+              await handleHookEvent({
+                hook_event_name: 'SessionStart',
+                session_id: 'lo-3',
+                source: 'startup',
+                cwd: root
+              })
+            )
+            assert.doesNotMatch(start, /Stopped at the lexer\./, 'left out of session start')
+            resetAllSessionEpochs()
+            const first = ctxOfTool(await tool(root, 'lo-3'))
+            const g2 = first.indexOf('rest of golden two')
+            const handoff = first.indexOf('Stopped at the lexer.')
+            const a2 = first.indexOf('rest of also two')
+            const lo1 = first.indexOf('Left out one, whole.')
+            const lo2 = first.indexOf('Left out two, whole.')
+            assert.ok(g2 > 0 && handoff > g2 && lo1 > handoff && lo2 > lo1, first)
+            assert.match(first, /To continue, claim task t-h/)
+            resetAllSessionEpochs()
+            const second = ctxOfTool(await tool(root, 'lo-3'))
+            assert.doesNotMatch(second, /Stopped at the lexer|Left out one/)
+          }
+        )
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+
+    it('66 rules left out: 5 whole, the rest once by first sentence, then nothing; an older daemon gets a count', async () => {
+      const ids = Array.from({ length: 66 }, (_, i) => `lo${i}`)
+      const lo66 = (withSentences) => ({
+        ...fitted(),
+        also_on_record: [],
+        left_out_rule_ids: ids,
+        ...(withSentences
+          ? { left_out_first_sentences: ids.map((id) => `[rule] ${id}: Rule ${id} says something about ${'x'.repeat(120)}…`) }
+          : {})
+      })
+      const whole = { ...memories }
+      for (const id of ids) whole[id] = `Rule ${id} whole. ${'y'.repeat(1500)}`
+      for (const withSentences of [true, false]) {
+        const root = project(null)
+        try {
+          await withSessionDaemon(root, { fileOnSnapshot: lo66(withSentences), memories: whole }, async (calls) => {
+            await handleHookEvent({ hook_event_name: 'SessionStart', session_id: 'lo66', source: 'startup', cwd: root })
+            const out = []
+            for (let call = 0; call < 4; call++) {
+              resetAllSessionEpochs()
+              out.push(ctxOfTool(await tool(root, 'lo66')))
+            }
+            const parts = out.map((t) => (t.includes('Left out at session start') ? t.slice(t.indexOf('[NeuroStrata] Left out')) : ''))
+            for (const t of out) assert.ok(utf8Bytes(t) <= SESSION_START_MAX_BYTES, `${utf8Bytes(t)} bytes`)
+            const all = parts.join('\n')
+            for (const id of ids.slice(0, LEFT_OUT_WHOLE_RULES)) assert.match(all, new RegExp(`Rule ${id} whole\\.`))
+            assert.doesNotMatch(all, /Rule lo5 whole\./)
+            const reads = calls.filter((c) => c.name === 'neurostrata_get_memory').map((c) => c.args.id)
+            assert.deepEqual(reads.filter((id) => id.startsWith('lo')), ids.slice(0, LEFT_OUT_WHOLE_RULES))
+            if (withSentences) {
+              assert.match(all, /More rules left out at session start, first sentence each \(neurostrata_get_memory\(id, namespace\) returns the whole rule\):/)
+              assert.equal(all.split('More rules left out at session start').length, 2, 'the list once')
+              assert.match(all, /\[rule\] lo5: Rule lo5 says/)
+              assert.match(all, /… \d+ more not listed here; neurostrata_search_memory finds them\./)
+              const used = parts.filter(Boolean)
+              console.error(`[lo66] delivered ${used.reduce((n, t) => n + utf8Bytes(t), 0)} bytes in ${used.length} call(s)`)
+            } else {
+              assert.match(all, /… 61 more rules left out at session start are not listed; neurostrata_search_memory finds them\./)
+            }
+          })
+        } finally {
+          rmSync(root, { recursive: true, force: true })
+        }
+      }
+    })
+
+    it('reads the whole content out of get_memory replies, not a retired one', () => {
+      assert.equal(
+        memoryContentFromReply('--- Memory ID: x ---\nType: rule\nContent: Line one.\nLine two.\nFile Location: a.rs'),
+        'Line one.\nLine two.'
+      )
+      assert.equal(memoryContentFromReply('No memory with id x'), undefined)
+      assert.equal(
+        memoryContentFromReply('[DEPRECATED] superseded\n--- Memory ID: x ---\nContent: old'),
+        undefined
+      )
+    })
+  })
+
+  it('daemon down: the file is used as it stands', async () => {
+    const root = project({ namespace: 'ss-ns', ...RULES })
+    try {
+      await withSessionDaemon(
+        root,
+        { fail: ['neurostrata_get_snapshot'] },
+        async () => {
+          const out = await handleHookEvent({
+            hook_event_name: 'SessionStart',
+            session_id: 'down-1',
+            source: 'startup',
+            cwd: root
+          })
+          assert.match(ctxOf(out), /n1: Namespace one/)
+        }
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('Codex: fork is a full start, resume skips seen rules (same payload format as Claude Code)', async () => {
+    const root = project({ namespace: 'ss-ns', ...RULES })
+    try {
+      await withSessionDaemon(root, {}, async () => {
+        const base = {
+          hook_event_name: 'SessionStart',
+          cwd: root,
+          model: 'm',
+          permission_mode: 'default',
+          transcript_path: null
+        }
+        await handleHookEvent({
+          ...base,
+          session_id: 'cx-1',
+          source: 'startup'
+        })
+        const resumed = ctxOf(
+          await handleHookEvent({
+            ...base,
+            session_id: 'cx-1',
+            source: 'resume'
+          })
+        )
+        assert.doesNotMatch(resumed, /g1: Golden/)
+        const forked = await handleHookEvent({
+          ...base,
+          session_id: 'cx-1',
+          source: 'fork'
+        })
+        // Codex rejects unknown keys in a SessionStart reply.
+        assert.deepEqual(Object.keys(forked), ['hookSpecificOutput'])
+        assert.deepEqual(Object.keys(forked.hookSpecificOutput).sort(), [
+          'additionalContext',
+          'hookEventName'
+        ])
+        assert.match(ctxOf(forked), /g1: Golden one\./)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('the session-start text says whether the snapshot ran: success, failure, resume', async () => {
+    const OK = /^neurostrata_get_snapshot already ran for this session at \d{4}-\d{2}-\d{2} \d{2}:\d{2}; its result is below\. Do not call it again unless you switch projects or this text says loading failed\.\n/
+    // A failed snapshot no longer sends the agent to get_snapshot: the saved
+    // file goes in and the first tool round loads the snapshot.
+    const FAILED =
+      'The NeuroStrata daemon was not answering at session start, so this text is from the last saved session file; the fresh snapshot comes with your first tool call. Do not call neurostrata_get_snapshot.'
+    const FAILED_NO_FILE =
+      'The NeuroStrata daemon was not answering at session start and no session file is saved yet; the session snapshot comes with your first tool call. Do not call neurostrata_get_snapshot.'
+    const ev = (source, session_id, cwd) => ({
+      hook_event_name: 'SessionStart',
+      session_id,
+      source,
+      cwd
+    })
+    const root = project({ namespace: 'ss-ns', ...RULES })
+    try {
+      await withSessionDaemon(root, {}, async (calls) => {
+        const first = ctxOf(await handleHookEvent(ev('startup', 'snap-1', root)))
+        assert.match(first, OK)
+        assert.match(first, /g1: Golden one\./)
+        assert.equal(
+          calls.filter((c) => c.name === 'neurostrata_get_snapshot').length,
+          1
+        )
+        // A resume with nothing new: the status line and the unchanged line,
+        // which says the snapshot is already in context.
+        const resumed = ctxOf(
+          await handleHookEvent(ev('resume', 'snap-1', root))
+        )
+        assert.match(resumed, OK)
+        assert.match(
+          resumed,
+          /unchanged since this session last saw them \(\d+ items?\); the session snapshot is already in context\./
+        )
+        assert.doesNotMatch(resumed, /g1: Golden/)
+      })
+      // The refresh fails: the file is used as it stands, under the failure line.
+      await withSessionDaemon(
+        root,
+        { fail: ['neurostrata_get_snapshot'] },
+        async () => {
+          const reply = await handleHookEvent(ev('startup', 'snap-2', root))
+          const out = ctxOf(reply)
+          assert.ok(out.startsWith(`${FAILED}\n`), out.slice(0, 200))
+          assert.equal(
+            reply.systemMessage,
+            'NeuroStrata: at session start the snapshot call failed ([-32000] down); session rules load on the first tool call.'
+          )
+          assert.match(out, /g1: Golden one\./)
+          assert.doesNotMatch(out, /already ran/)
+        }
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+    // No session file and no snapshot: the failure line alone.
+    const empty = project(null)
+    try {
+      await withSessionDaemon(
+        empty,
+        { fail: ['neurostrata_get_snapshot'] },
+        async () => {
+          assert.equal(
+            ctxOf(await handleHookEvent(ev('startup', 'snap-3', empty))),
+            FAILED_NO_FILE
+          )
+        }
+      )
+    } finally {
+      rmSync(empty, { recursive: true, force: true })
+    }
+  })
+
+  it('Copilot: camelCase sessionStart (event named by NEUROSTRATA_HOOK_EVENT) maps new and resume', async () => {
+    const root = project({ namespace: 'ss-ns', ...RULES })
+    process.env.NEUROSTRATA_HOOK_EVENT = 'sessionStart'
+    try {
+      await withSessionDaemon(root, {}, async () => {
+        const base = { cwd: root, timestamp: 1, sessionId: 'cp-1' }
+        const fresh = await handleHookEvent({ ...base, source: 'new' })
+        assert.equal(fresh.hookSpecificOutput, undefined)
+        assert.match(fresh.additionalContext, /g1: Golden one\./)
+        const resumed = await handleHookEvent({ ...base, source: 'resume' })
+        assert.match(resumed.additionalContext, /unchanged/)
+        assert.doesNotMatch(resumed.additionalContext, /g1: Golden/)
+        const startup = await handleHookEvent({ ...base, source: 'startup' })
+        assert.match(startup.additionalContext, /g1: Golden one\./)
+      })
+    } finally {
+      delete process.env.NEUROSTRATA_HOOK_EVENT
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('measures the limit in UTF-8 bytes: 3-byte characters that pass a character count are fitted', async () => {
+    // 80 rules of about 106 characters each: 8,500 characters (under 9,500)
+    // but about 25,000 UTF-8 bytes (→ and — are 3 bytes each).
+    const units = Array.from({ length: 80 }, (_, i) => ({
+      kind: 'rule',
+      key: `b${i}`,
+      text: `  - [rule] b${i}: ${'→—'.repeat(50)}`
+    }))
+    const all = units.map((u) => u.text).join('\n')
+    assert.ok(all.length < SESSION_START_MAX_BYTES, `chars ${all.length}`)
+    assert.ok(utf8Bytes(all) > SESSION_START_MAX_BYTES, `bytes ${utf8Bytes(all)}`)
+    const { text, shownKeys } = fitSessionStartUnits(units)
+    assert.ok(utf8Bytes(text) <= SESSION_START_MAX_BYTES, `bytes ${utf8Bytes(text)}`)
+    assert.ok(shownKeys.length > 0 && shownKeys.length < 80)
+    assert.match(text, /more NeuroStrata rules not shown here/)
+    // Through the hook, with the snapshot status line in front.
+    const root = project({
+      namespace: 'ss-ns',
+      golden_rules: units.map((u) => u.text.replace(/^  - /, ''))
+    })
+    try {
+      await withSessionDaemon(root, {}, async () => {
+        const out = ctxOf(
+          await handleHookEvent({
+            hook_event_name: 'SessionStart',
+            session_id: 'bytes-1',
+            source: 'startup',
+            cwd: root
+          })
+        )
+        assert.match(out, /^neurostrata_get_snapshot already ran/)
+        assert.ok(
+          utf8Bytes(out) <= SESSION_START_MAX_BYTES,
+          `bytes ${utf8Bytes(out)}`
+        )
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fits whole lines under the limit and counts the rules left out', () => {
+    const units = [
+      { kind: 'other', text: '[NeuroStrata Golden Rules — ALWAYS ENFORCED]' },
+      ...Array.from({ length: 80 }, (_, i) => ({
+        kind: 'rule',
+        key: `r${i}`,
+        text: `  - [rule] r${i}: ${'x'.repeat(200)}`
+      }))
+    ]
+    const { text, shownKeys } = fitSessionStartUnits(
+      units,
+      SESSION_START_MAX_BYTES
+    )
+    assert.ok(text.length <= SESSION_START_MAX_BYTES, `length ${text.length}`)
+    for (const line of text.split('\n').filter((l) => l.startsWith('  - ')))
+      assert.ok(line.endsWith('x'), 'no cut line')
+    const left = 80 - shownKeys.length
+    assert.ok(left > 0)
+    assert.ok(
+      text.includes(
+        `… ${left} more NeuroStrata rules not shown here; neurostrata_search_memory or neurostrata_get_memory(id) reaches them.`
+      ),
+      text.slice(-300)
+    )
+  })
+
+  it('a resume records only what survived the fit as seen', async () => {
+    const many = Array.from(
+      { length: 80 },
+      (_, i) => `[rule] m${i}: ${'y'.repeat(200)}`
+    )
+    const root = project({ namespace: 'ss-ns', golden_rules: many })
+    try {
+      await withSessionDaemon(root, {}, async () => {
+        const ev = (source) => ({
+          hook_event_name: 'SessionStart',
+          session_id: 'fit-1',
+          source,
+          cwd: root
+        })
+        const first = ctxOf(await handleHookEvent(ev('startup')))
+        assert.doesNotMatch(first, /m79:/)
+        const resumed = ctxOf(await handleHookEvent(ev('resume')))
+        assert.match(resumed, /m79:/, 'left out at startup, so new on resume')
+        assert.doesNotMatch(resumed, /m0:/)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('hook processes: the epoch state is saved per session, so a resume in a new process skips what was shown', async () => {
+    const root = project({ namespace: 'ss-ns', ...RULES })
+    try {
+      await withSessionDaemon(root, {}, async () => {
+        const ev = (source) => ({
+          hook_event_name: 'SessionStart',
+          session_id: 'ep-1',
+          source,
+          cwd: root
+        })
+        assert.match(ctxOf(await handleHookEvent(ev('startup'))), /g1: Golden/)
+        const saved = JSON.parse(
+          readFileSync(
+            join(root, '.NeuroStrata', 'session_epochs.json'),
+            'utf8'
+          )
+        )['ep-1']
+        assert.equal(saved.baselineInjectedEpoch, saved.epoch)
+        assert.ok(saved.injectedKeys.some((k) => k.startsWith('g1#')))
+        resetAllSessionEpochs() // a new hook process starts with no memory
+        const resumed = ctxOf(await handleHookEvent(ev('resume')))
+        assert.match(resumed, /unchanged since this session last saw them/)
+        assert.doesNotMatch(resumed, /g1: Golden/)
+        resetAllSessionEpochs()
+        const compacted = ctxOf(await handleHookEvent(ev('compact')))
+        assert.match(compacted, /g1: Golden one\./, 'compact is a new epoch')
+        const after = JSON.parse(
+          readFileSync(
+            join(root, '.NeuroStrata', 'session_epochs.json'),
+            'utf8'
+          )
+        )['ep-1']
+        assert.equal(after.epoch, saved.epoch + 1)
+        assert.ok(
+          !existsSync(join(root, '.NeuroStrata', 'session_start_seen.json'))
+        )
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resume: a rule or handoff note edited under the same id is shown again (dedup keys on content revision)', async () => {
+    const file = {
+      namespace: 'ss-ns',
+      task_handoff: { task_id: 't-e', note: 'Note one.' },
+      ...RULES
+    }
+    const root = project(file)
+    try {
+      await withSessionDaemon(root, {}, async () => {
+        const ev = (source) => ({
+          hook_event_name: 'SessionStart',
+          session_id: 'rev-1',
+          source,
+          cwd: root
+        })
+        await handleHookEvent(ev('startup'))
+        writeFileSync(
+          join(root, '.NeuroStrata', 'active_session.json'),
+          JSON.stringify({
+            ...file,
+            task_handoff: { task_id: 't-e', note: 'Note two.' },
+            golden_rules: ['[rule] g1: Golden one, reworded.']
+          })
+        )
+        const resumed = ctxOf(await handleHookEvent(ev('resume')))
+        assert.match(resumed, /g1: Golden one, reworded\./)
+        assert.match(resumed, /Note two\./)
+        assert.doesNotMatch(resumed, /n1: Namespace one/)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('budget: get_snapshot gets max_bytes; a daemon-fitted file goes in as it is', async () => {
+    const lines = Array.from(
+      { length: 30 },
+      (_, i) => `[rule] b${i}: ${'z'.repeat(250)}`
+    )
+    const fitted = {
+      namespace: 'ss-ns',
+      namespace_rules: lines,
+      max_bytes: SESSION_START_CONTENT_BUDGET
+    }
+    const root = project({ namespace: 'ss-ns' })
+    try {
+      await withSessionDaemon(
+        root,
+        { fileOnSnapshot: fitted },
+        async (calls) => {
+          const out = await handleHookEvent({
+            hook_event_name: 'SessionStart',
+            session_id: 'bud-1',
+            source: 'startup',
+            cwd: root
+          })
+          const snap = calls.find((c) => c.name === 'neurostrata_get_snapshot')
+          assert.equal(
+            snap.args.max_bytes,
+            SESSION_START_CONTENT_BUDGET
+          )
+          assert.equal(
+            SESSION_START_CONTENT_BUDGET,
+            SESSION_START_MAX_BYTES - SESSION_START_FRAMING_BYTES
+          )
+          const text = ctxOf(out)
+          for (let i = 0; i < 30; i++) assert.match(text, new RegExp(`b${i}: `))
+          assert.doesNotMatch(text, /not shown here/)
+        }
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('budget guard: a file without max_bytes (older daemon) or fitted to a larger budget is fitted by whole lines', () => {
+    const lines = Array.from(
+      { length: 60 },
+      (_, i) => `[rule] o${i}: ${'w'.repeat(250)}`
+    )
+    for (const extra of [{}, { max_bytes: 18000 }]) {
+      const active = { namespace: 'ss-ns', namespace_rules: lines, ...extra }
+      const { text } = sessionStartText(active, buildSessionStartUnits(active))
+      assert.ok(text.length <= SESSION_START_MAX_BYTES, `length ${text.length}`)
+      assert.match(text, /more NeuroStrata rules not shown here/)
+      for (const line of text.split('\n').filter((l) => l.startsWith('  - ')))
+        assert.ok(line.endsWith('w'), 'no cut line')
+    }
+    // The daemon fitted to our budget but the framing estimate fell short:
+    // still never past the harness limit.
+    const over = {
+      namespace: 'ss-ns',
+      namespace_rules: lines,
+      max_bytes: SESSION_START_CONTENT_BUDGET
+    }
+    const { text } = sessionStartText(over, buildSessionStartUnits(over))
+    assert.ok(text.length <= SESSION_START_MAX_BYTES)
+  })
+
+  it('fit: a long task id in the handoff footer never pushes the text past the limit', () => {
+    const units = [
+      {
+        kind: 'handoff',
+        key: `handoff:${'t'.repeat(2000)}#abc`,
+        text: 'h'.repeat(5000)
+      },
+      { kind: 'rule', key: 'r#1', text: '  - [rule] r: ' + 'x'.repeat(300) }
+    ]
+    const { text } = fitSessionStartUnits(units, 1000)
+    assert.ok(text.length <= 1000, `length ${text.length}`)
+  })
+
+  it('budget: a daemon-fitted file reports every left-out the daemon writes, each rule once', () => {
+    const active = {
+      namespace: 'ss-ns',
+      task_id: 't-9',
+      status: 'in_progress',
+      session_id: 'own',
+      golden_rules: ['[rule] g1: Golden one.'],
+      also_on_record: ['[rule] a1: First…', '[rule] a2: Second…'],
+      max_bytes: SESSION_START_CONTENT_BUDGET,
+      golden_rules_left_out: 1,
+      namespace_rules_left_out: 5,
+      also_on_record_left_out: 3,
+      task_handoff_left_out: true,
+      task_block_left_out: true,
+      truncated_by_budget: true
+    }
+    const own = sessionStartText(
+      active,
+      buildSessionStartUnits(active),
+      SESSION_START_MAX_BYTES,
+      true
+    ).text
+    assert.match(own, /handoff note was left out to fit; it is the latest "Handoff:" note on task t-9/)
+    assert.match(own, /task block was left out to fit; neurostrata_task_list for task t-9 returns it/)
+    assert.match(own, /1 Golden Rule left out to fit/)
+    assert.match(own, /2 rules of this namespace shown only by first sentence above/)
+    assert.match(own, /3 more rules of this namespace not shown here/)
+    const other = sessionStartText(
+      active,
+      buildSessionStartUnits(active),
+      SESSION_START_MAX_BYTES,
+      false
+    ).text
+    assert.doesNotMatch(other, /task block was left out/)
+    assert.match(other, /handoff note was left out/)
+    const none = sessionStartText(
+      { ...active, golden_rules_left_out: 0, namespace_rules_left_out: 0, also_on_record_left_out: 0, task_handoff_left_out: false, task_block_left_out: false },
+      buildSessionStartUnits(active)
+    ).text
+    assert.doesNotMatch(none, /left out|not shown here|first sentence above/)
+  })
+
+  it('the task block keeps a rule whole when the rule sections list it only as an excerpt', () => {
+    const block = [
+      'TASK BLOCK',
+      '- Auto-Retrieved Governing Rules & Graph Nodes:',
+      '  - [GOLDEN rule] `a1`: Whole text of a1.',
+      '  - [GOLDEN rule] `g1`: Golden one.'
+    ].join('\n')
+    const units = buildSessionStartUnits(
+      {
+        namespace: 'ss-ns',
+        task_id: 't-x',
+        status: 'in_progress',
+        subagent_prompt_injection: block,
+        golden_rules: ['[rule] g1: Golden one.'],
+        also_on_record: ['[rule] a1: Whole text…']
+      },
+      {}
+    )
+    const text = units.map((u) => u.text).join('\n')
+    assert.match(text, /\[GOLDEN rule\] `a1`: Whole text of a1\./)
+    assert.doesNotMatch(text, /\[GOLDEN rule\] `g1`/)
+  })
+
+  it('OpenCode V2: the context hook pushes the text into system on every request after one refresh', async () => {
+    const root = project({
+      namespace: 'ss-ns',
+      task_id: 't-oc',
+      status: 'in_progress',
+      ...RULES
+    })
+    try {
+      await withSessionDaemon(root, {}, async (calls) => {
+        const config = {
+          projectRoot: root,
+          namespace: 'ss-ns',
+          intentDetection: { enabled: false, injectReminder: false }
+        }
+        for (let i = 0; i < 2; i++) {
+          const ev = {
+            sessionID: 'oc-1',
+            system: [{ type: 'text', text: 'base' }],
+            messages: []
+          }
+          await sessionContextHandler(ev, config)
+          assert.equal(ev.system.length, 2, `request ${i}`)
+          assert.equal(ev.system[1].type, 'text')
+          assert.match(ev.system[1].text, /n1: Namespace one/)
+          assert.match(ev.system[1].text, /t-oc/)
+          assert.ok(ev.system[1].text.length <= SESSION_START_MAX_BYTES)
+        }
+        assert.equal(
+          calls.filter((c) => c.name === 'neurostrata_get_snapshot').length,
+          1
+        )
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  function transcript(root) {
+    const path = join(root, 't.jsonl')
+    writeFileSync(
+      path,
+      [
+        { type: 'user', message: { content: 'Please fix the parser.' } },
+        {
+          type: 'user',
+          message: { content: [{ type: 'tool_result', content: 'x' }] }
+        },
+        {
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'Fixed; tests pass.' }] }
+        }
+      ]
+        .map((r) => JSON.stringify(r))
+        .join('\n')
+    )
+    return path
+  }
+
+  it("handoff: SessionEnd writes a note on the session's own in-progress task", async () => {
+    const root = project({
+      namespace: 'ss-ns',
+      task_id: 't-h',
+      status: 'in_progress',
+      session_id: 'h-1'
+    })
+    try {
+      await withSessionDaemon(root, {}, async (calls) => {
+        const out = await handleHookEvent({
+          hook_event_name: 'SessionEnd',
+          session_id: 'h-1',
+          reason: 'clear',
+          cwd: root,
+          transcript_path: transcript(root)
+        })
+        assert.deepEqual(out, {})
+        const call = calls.find((c) => c.name === 'neurostrata_task_update')
+        assert.equal(call.args.id, 't-h')
+        assert.equal(call.args.session_id, 'h-1')
+        assert.match(call.args.note, /^Handoff: /)
+        assert.match(call.args.note, /Please fix the parser\./)
+        assert.match(call.args.note, /Fixed; tests pass\./)
+        assert.ok(!calls.some((c) => c.name === 'neurostrata_append_log'))
+        assert.ok(
+          !existsSync(join(root, '.NeuroStrata', 'handoff')),
+          'no handoff file'
+        )
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('handoff: PreCompact without an own task goes to the log with tag handoff', async () => {
+    const root = project({
+      namespace: 'ss-ns',
+      task_id: 't-x',
+      status: 'in_progress',
+      session_id: 'someone-else'
+    })
+    try {
+      await withSessionDaemon(root, {}, async (calls) => {
+        await handleHookEvent({
+          hook_event_name: 'PreCompact',
+          session_id: 'h-2',
+          trigger: 'auto',
+          cwd: root,
+          transcript_path: transcript(root)
+        })
+        const call = calls.find((c) => c.name === 'neurostrata_append_log')
+        assert.deepEqual(call.args.tags, ['handoff'])
+        assert.equal(call.args.project_root, root)
+        assert.match(call.args.content, /^Handoff: /)
+        assert.ok(!calls.some((c) => c.name === 'neurostrata_task_update'))
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('handoff: Stop writes nothing', async () => {
+    const root = project({
+      namespace: 'ss-ns',
+      task_id: 't-s',
+      status: 'in_progress',
+      session_id: 'h-4'
+    })
+    try {
+      await withSessionDaemon(root, {}, async (calls) => {
+        await handleHookEvent({
+          hook_event_name: 'Stop',
+          session_id: 'h-4',
+          cwd: root,
+          transcript_path: transcript(root)
+        })
+        assert.ok(
+          !calls.some((c) =>
+            ['neurostrata_task_update', 'neurostrata_append_log'].includes(
+              c.name
+            )
+          )
+        )
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('handoff: secrets the daemon scrubbed from the note are logged by count and type only', async () => {
+    const root = project({
+      namespace: 'ss-ns',
+      task_id: 't-sec',
+      status: 'in_progress',
+      session_id: 'h-sec'
+    })
+    const logged = []
+    const realError = console.error
+    console.error = (...args) => logged.push(args.map(String).join(' '))
+    try {
+      await withSessionDaemon(
+        root,
+        { text: { neurostrata_task_update: '{"id":"t-sec","redactions":[{"category":"provider_token"},{"category":"provider_token"},{"category":"jwt"}]}' } },
+        async (calls) => {
+          const event = {
+            hook_event_name: 'SessionEnd',
+            session_id: 'h-sec',
+            cwd: root,
+            transcript_path: transcript(root)
+          }
+          assert.deepEqual(await writeSessionHandoff(event), {
+            action: 'task_note',
+            task_id: 't-sec',
+            redactions: { count: 3, types: ['jwt', 'provider_token'] }
+          })
+          assert.ok(!existsSync(join(root, '.NeuroStrata', 'handoff')))
+          logged.length = 0
+          assert.deepEqual(await handleHookEvent(event), {})
+          const writes = calls.filter((c) =>
+            ['neurostrata_task_update', 'neurostrata_append_log'].includes(
+              c.name
+            )
+          )
+          assert.equal(writes.length, 2, 'one write per call, no fallback')
+          const line = logged.join('\n')
+          assert.match(
+            line,
+            /SessionEnd: the daemon scrubbed 3 secret\(s\) from the handoff note \(jwt, provider_token\)/
+          )
+          assert.doesNotMatch(line, /Please fix the parser|Fixed; tests pass/)
+        }
+      )
+    } finally {
+      console.error = realError
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a reply without redactions reports none', () => {
+    assert.equal(handoffRedactions('ok'), undefined)
+    assert.equal(handoffRedactions('{"redactions":[]}'), undefined)
+    assert.deepEqual(handoffRedactions('{"redactions":[{}]}'), {
+      count: 1,
+      types: ['unknown']
+    })
+  })
+
+  it('handoff: daemon down writes nothing and no file', async () => {
+    const root = project({
+      namespace: 'ss-ns',
+      task_id: 't-d',
+      status: 'in_progress',
+      session_id: 'h-3'
+    })
+    try {
+      await withSessionDaemon(
+        root,
+        { fail: ['neurostrata_task_update', 'neurostrata_append_log'] },
+        async () => {
+          const outcome = await writeSessionHandoff({
+            hook_event_name: 'SessionEnd',
+            session_id: 'h-3',
+            cwd: root,
+            transcript_path: transcript(root)
+          })
+          assert.equal(outcome.action, 'daemon_error')
+          assert.ok(!existsSync(join(root, '.NeuroStrata', 'handoff')))
+        }
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a finished task in the file is not shown; its rules still are', async () => {
+    for (const status of ['done', 'open', 'blocked', undefined]) {
+      const root = project({ namespace: 'ss-ns', task_id: 't-old', status, ...RULES })
+      try {
+        const ev = { sessionID: 'fin-1' }
+        await sessionContextHandler(ev, {
+          projectRoot: root,
+          namespace: 'ss-ns',
+          intentDetection: { enabled: false, injectReminder: false }
+        })
+        assert.doesNotMatch(ev.additionalContext, /t-old/, String(status))
+        assert.match(ev.additionalContext, /g1: Golden one./)
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+        resetClientForTesting()
+      }
+    }
+  })
+
+  it('handoff summary reads Codex rollout records too', () => {
+    const lines = [
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: '<environment_context>x</environment_context>'
+            }
+          ]
+        }
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Rename the flag.' }]
+        }
+      },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Renamed.' }]
+        }
+      }
+    ].map((r) => JSON.stringify(r))
+    const s = buildHandoffSummary(lines, {
+      hook_event_name: 'PreCompact',
+      session_id: 'cx-9'
+    })
+    assert.match(s, /1\. Rename the flag\./)
+    assert.doesNotMatch(s, /environment_context/)
+    assert.match(s, /Last reply: Renamed\./)
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────────
+// Copilot CLI preToolUse (camelCase payload, top-level reply). GitHub Docs,
+// Copilot CLI hooks configuration reference: input `toolName` + `toolArgs`
+// (a JSON string in the debugging example), output `permissionDecision`,
+// `permissionDecisionReason` (required on deny), `modifiedArgs`.
+// ──────────────────────────────────────────────────────────────────────
+
+describe('Copilot preToolUse', () => {
+  const copilotEvent = (toolName, toolArgs) => ({
+    sessionId: 'cp-1',
+    timestamp: 1704614400000,
+    cwd: process.cwd(),
+    toolName,
+    toolArgs
+  })
+  const withDaemon = async (opts, fn) => {
+    const { server, url, counters } = await createMockDaemonServer(opts)
+    process.env.NEUROSTRATA_HOOK_EVENT = 'preToolUse'
+    try {
+      resetClientForTesting()
+      await initialize({
+        config: {
+          namespace: 'cp-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: true,
+          requestTimeoutMs: 2000
+        },
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+      await fn(counters)
+    } finally {
+      delete process.env.NEUROSTRATA_HOOK_EVENT
+      server.close()
+      resetModuleState()
+    }
+  }
+
+  it('a guard rejection is a top-level deny with a reason; the JSON-string args reach the guard', async () => {
+    await withDaemon({ guardReject: true }, async (counters) => {
+      const out = await handleHookEvent(
+        copilotEvent('bash', JSON.stringify({ command: 'rm -rf build' }))
+      )
+      assert.equal(out.hookSpecificOutput, undefined)
+      assert.equal(out.permissionDecision, 'deny')
+      assert.match(out.permissionDecisionReason, /claim a task first/)
+      assert.equal(counters.guardValidate, 1)
+      assert.match(counters.guardArgs[0].payload, /rm -rf build/)
+    })
+  })
+
+  it('an allowed edit answers empty (Copilot keeps its own permission flow) and recalls the file', async () => {
+    await withDaemon({}, async (counters) => {
+      const out = await handleHookEvent(
+        copilotEvent('edit', {
+          path: 'src/copilot.rs',
+          old_str: 'a',
+          new_str: 'b'
+        })
+      )
+      assert.deepEqual(out, {})
+      assert.equal(counters.guardValidate, 1)
+      assert.ok(
+        counters.memoriesForFilePaths.includes('src/copilot.rs'),
+        JSON.stringify(counters.memoriesForFilePaths)
+      )
+    })
+  })
+
+  it('maps the reply shapes: deny with recall, changed input as modifiedArgs, unchanged input as nothing', () => {
+    const deny = copilotPreToolUseReply(
+      {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: 'no task',
+          additionalContext: 'rule text'
+        }
+      },
+      {}
+    )
+    assert.deepEqual(deny, {
+      permissionDecision: 'deny',
+      permissionDecisionReason: 'no task\n\nrule text'
+    })
+    assert.equal(
+      copilotPreToolUseReply(
+        { hookSpecificOutput: { permissionDecision: 'deny' } },
+        {}
+      ).permissionDecisionReason,
+      'Denied by NeuroStrata.'
+    )
+    const changed = copilotPreToolUseReply(
+      {
+        hookSpecificOutput: {
+          permissionDecision: 'allow',
+          updatedInput: { id: 't1', worktree: '/w' }
+        }
+      },
+      { id: 't1' }
+    )
+    assert.deepEqual(changed, { modifiedArgs: { id: 't1', worktree: '/w' } })
+    assert.deepEqual(
+      copilotPreToolUseReply(
+        {
+          hookSpecificOutput: {
+            permissionDecision: 'allow',
+            updatedInput: { id: 't1' }
+          }
+        },
+        { id: 't1' }
+      ),
+      {}
+    )
+    // Arguments that were not an object are never replaced.
+    assert.deepEqual(
+      copilotPreToolUseReply(
+        { hookSpecificOutput: { permissionDecision: 'allow', updatedInput: {} } },
+        'not json'
+      ),
+      {}
+    )
+  })
+
+  it('Claude- and Codex-shaped PreToolUse replies are unchanged', async () => {
+    await withDaemon({ guardReject: true }, async () => {
+      delete process.env.NEUROSTRATA_HOOK_EVENT
+      const out = await handleHookEvent({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'write',
+        tool_input: { file_path: 'src/foo.ts', content: 'x' }
+      })
+      assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
+      assert.equal(out.permissionDecision, undefined)
+    })
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────────
+// Claims carry the harness's own session id, so a session can tell its own
+// task (local/plugin-install a614375c, aa13fe8b).
+// ──────────────────────────────────────────────────────────────────────
+
+describe("task claims carry the harness's session id; OpenCode shows only its own task", () => {
+  const withMock = async (fn) => {
+    const { server, url } = await createMockDaemonServer()
+    const sessionHooks = new Map()
+    const toolHooks = new Map()
+    try {
+      resetClientForTesting()
+      await initialize({
+        config: {
+          namespace: 'own-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: false,
+          requestTimeoutMs: 2000
+        },
+        session: { hook: (name, cb) => sessionHooks.set(name, cb) },
+        tool: { hook: async (name, cb) => toolHooks.set(name, cb) },
+        hooks: {}
+      })
+      await fn({ sessionHooks, toolHooks })
+    } finally {
+      server.close()
+      resetModuleState()
+    }
+  }
+
+  it('stamps task_claim and task_update under any MCP prefix, nothing else', () => {
+    for (const name of [
+      'neurostrata_task_claim',
+      'mcp__neurostrata__neurostrata_task_claim',
+      'neurostrata_neurostrata_task_update'
+    ]) {
+      const args = { id: 't', session_id: 'made-up-label' }
+      assert.equal(stampHarnessSessionId(name, args, 'real-id'), true, name)
+      assert.equal(args.session_id, 'real-id')
+    }
+    const other = { id: 't', session_id: 'label' }
+    assert.equal(
+      stampHarnessSessionId('neurostrata_task_complete', other, 'real-id'),
+      false
+    )
+    assert.equal(other.session_id, 'label')
+  })
+
+  it("Claude PreToolUse returns task_claim with the hook's session id", async () => {
+    await withMock(async () => {
+      const out = await handleHookEvent({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'mcp__neurostrata__neurostrata_task_claim',
+        tool_input: { id: 'task-sid', namespace: 'own-ns', session_id: 'made-up-label' },
+        session_id: '3fb312aa-claude-session'
+      })
+      assert.equal(
+        out.hookSpecificOutput.updatedInput.session_id,
+        '3fb312aa-claude-session'
+      )
+    })
+  })
+
+  it("OpenCode execute.before writes the session's id into the claim's args", async () => {
+    await withMock(async ({ toolHooks }) => {
+      const args = { id: 'task-oc', namespace: 'own-ns', session_id: 'label' }
+      await toolHooks.get('execute.before')({
+        tool: 'neurostrata_neurostrata_task_claim',
+        sessionID: 'ses_oc_mine',
+        args
+      })
+      assert.equal(args.session_id, 'ses_oc_mine')
+    })
+  })
+
+  it('OpenCode: the claiming session sees its task on every request and after compaction; a new session does not', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ns-oc-own-'))
+    mkdirSync(join(root, '.git'))
+    mkdirSync(join(root, '.NeuroStrata'))
+    writeFileSync(
+      join(root, '.NeuroStrata', 'active_session.json'),
+      JSON.stringify({
+        namespace: 'own-ns',
+        task_id: 'task-oc',
+        status: 'in_progress',
+        session_id: 'ses_oc_mine',
+        golden_rules: ['[rule] g1: Golden one.'],
+        subagent_prompt_injection:
+          '### Task block\n- Namespace: `own-ns` | Task ID: `task-oc` | Goal: Ship it'
+      })
+    )
+    const { server, url } = await createMockDaemonServer()
+    const sessionHooks = new Map()
+    try {
+      resetClientForTesting()
+      await initialize({
+        config: {
+          namespace: 'own-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: false,
+          requestTimeoutMs: 2000
+        },
+        projectDir: root,
+        session: { hook: (name, cb) => sessionHooks.set(name, cb) },
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+      const request = async (sessionID) => {
+        const ev = { sessionID, system: [] }
+        await sessionHooks.get('context')(ev)
+        return ev.system.map((s) => s.text).join('\n')
+      }
+      for (const label of ['first request', 'next request']) {
+        const mine = await request('ses_oc_mine')
+        assert.match(mine, /Active Task: `?task-oc/, label)
+        assert.match(mine, /Goal: Ship it/, label)
+      }
+      await sessionHooks.get('compaction')({ sessionID: 'ses_oc_mine' })
+      assert.match(await request('ses_oc_mine'), /Goal: Ship it/, 'after compaction')
+      const fresh = await request('ses_oc_new')
+      assert.doesNotMatch(fresh, /task-oc|Goal:/)
+      assert.match(fresh, /g1: Golden one\./)
+    } finally {
+      server.close()
+      resetModuleState()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('no-wait cold start: session start never waits, the first tool round loads the snapshot', () => {
+  const PENDING_LINE =
+    'The NeuroStrata daemon was not answering at session start, so this text is from the last saved session file; the fresh snapshot comes with your first tool call. Do not call neurostrata_get_snapshot.'
+  const STARTING_USER =
+    'NeuroStrata: the daemon is still starting; session rules load on the first tool call.'
+  const FAILED_USER =
+    'NeuroStrata: the daemon is not running or not listening (connection refused), so this session works from the rules saved at the last session start. Check the daemon with "neurostrata-mcp status"; if none is running, start it with "neurostrata-mcp daemon".'
+  const FAILED_AGENT =
+    'NeuroStrata: the daemon is not running or not listening (connection refused); your session-start text is from the last saved session file. The plugin retries on later tool calls; do not call neurostrata_get_snapshot.'
+  const RAN_NOW = /^neurostrata_get_snapshot ran now \(\d{4}-\d{2}-\d{2} \d{2}:\d{2}\); the daemon was not answering at session start\./
+  const CACHED = {
+    namespace: 'cs-ns',
+    sections: ['handoff', 'golden_rules', 'rules', 'also_on_record'],
+    max_bytes: 8000,
+    golden_rules: ['[rule] g1: Golden one.'],
+    namespace_rules: ['[rule] n1: Namespace one, old wording.']
+  }
+  const FRESH = {
+    ...CACHED,
+    namespace_rules: [
+      '[rule] n1: Namespace one, new wording.',
+      '[rule] n2: Namespace two, added.'
+    ],
+    left_out_rule_ids: ['lo1'],
+    left_out_first_sentences: ['[rule] lo1: Left out one…']
+  }
+  const recallFor = (content) =>
+    JSON.stringify({
+      hits: [
+        {
+          id: 'fr-1',
+          memory_type: 'rule',
+          valid_from: '2026-01-01T00:00:00Z',
+          content
+        }
+      ]
+    })
+
+  function coldProject(file = CACHED) {
+    const root = mkdtempSync(join(tmpdir(), 'ns-cold-'))
+    mkdirSync(join(root, '.NeuroStrata'), { recursive: true })
+    if (file)
+      writeFileSync(
+        join(root, '.NeuroStrata', 'active_session.json'),
+        JSON.stringify(file)
+      )
+    return root
+  }
+
+  async function freePort() {
+    const s = http.createServer()
+    await new Promise((r) => s.listen(0, '127.0.0.1', r))
+    const port = s.address().port
+    await new Promise((r) => s.close(r))
+    return port
+  }
+
+  // A fake daemon on a fixed port that is down (connection refused) until
+  // `up()`; on get_snapshot it writes `fileOnSnapshot` as the daemon does.
+  async function withColdDaemon(root, opts, fn) {
+    const port = await freePort()
+    const calls = []
+    let server = null
+    const handler = (req, res) => {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        const msg = JSON.parse(body)
+        const name = msg.params?.name
+        const args = msg.params?.arguments ?? {}
+        calls.push({ name, args })
+        if (name === 'neurostrata_get_snapshot' && opts.hang) return
+        // No kept-alive socket: after `down()` the next call is refused, as
+        // at a cold start, not reset.
+        res.writeHead(200, { 'content-type': 'application/json', connection: 'close' })
+        if (name === 'neurostrata_get_snapshot' && opts.fileOnSnapshot)
+          writeFileSync(
+            join(root, '.NeuroStrata', 'active_session.json'),
+            JSON.stringify(opts.fileOnSnapshot)
+          )
+        if (name === 'neurostrata_get_snapshot' && opts.rawOnSnapshot !== undefined)
+          writeFileSync(join(root, '.NeuroStrata', 'active_session.json'), opts.rawOnSnapshot)
+        const text =
+          name === 'neurostrata_get_memory' && opts.memories?.[args.id]
+            ? `--- Memory ID: ${args.id} ---\nType: rule\nContent: ${opts.memories[args.id]}\nFile Location: x.rs`
+            : name === 'neurostrata_memories_for_file' && opts.recall
+              ? opts.recall
+              : 'ok'
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { content: [{ type: 'text', text }] }
+          })
+        )
+      })
+    }
+    const up = () =>
+      new Promise((r) => {
+        server = http.createServer(handler)
+        server.listen(port, '127.0.0.1', r)
+      })
+    const down = () =>
+      new Promise((r) => {
+        if (!server) return r()
+        server.closeAllConnections?.()
+        server.close(() => r())
+        server = null
+      })
+    const progress = []
+    setHookProgressWriterForTesting(async (line) => {
+      progress.push(JSON.parse(line))
+    })
+    const sessionHooks = new Map()
+    const toolHooks = new Map()
+    // OpenCode's session.synthetic calls, and its event stream: `emit` puts
+    // one event on the stream the plugin reads and lets it run.
+    const synthetics = []
+    const subscribed = []
+    const queued = []
+    let wake = () => {}
+    const emit = async (ev) => {
+      queued.push(ev)
+      wake()
+      for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r))
+    }
+    const subscribe = (options) => {
+      subscribed.push(options)
+      return (async function* () {
+        while (!options?.signal?.aborted) {
+          if (queued.length) {
+            yield queued.shift()
+            continue
+          }
+          await new Promise((r) => {
+            wake = r
+            options?.signal?.addEventListener('abort', r, { once: true })
+          })
+        }
+      })()
+    }
+    const realFetch = globalThis.fetch
+    // Bun's fetch (OpenCode's runtime) puts the refused code on the error.
+    if (opts.bunRefused)
+      globalThis.fetch = async (...a) => {
+        if (!server)
+          throw Object.assign(new Error('Unable to connect. Is the computer able to access the url?'), { code: 'ConnectionRefused' })
+        return realFetch(...a)
+      }
+    try {
+      resetClientForTesting()
+      const cleanup = await initialize({
+        config: {
+          namespace: 'cs-ns',
+          endpoint: `http://127.0.0.1:${port}/mcp`,
+          bearerToken: 'tok',
+          strictMode: opts.strictMode ?? false,
+          requestTimeoutMs: opts.requestTimeoutMs ?? 2000
+        },
+        projectDir: root,
+        session: {
+          hook: (name, cb) => sessionHooks.set(name, cb),
+          synthetic: async (input) => {
+            synthetics.push(input)
+            return { id: `msg_${synthetics.length}`, type: 'synthetic' }
+          }
+        },
+        tool: { hook: async (name, cb) => toolHooks.set(name, cb) },
+        event: { subscribe },
+        hooks: {}
+      })
+      const snapshots = () =>
+        calls.filter((c) => c.name === 'neurostrata_get_snapshot').length
+      return await fn({ calls, up, down, progress, snapshots, sessionHooks, toolHooks, synthetics, emit, subscribed, cleanup })
+    } finally {
+      globalThis.fetch = realFetch
+      await down()
+      setHookProgressWriterForTesting()
+      resetModuleState()
+    }
+  }
+
+  const epochsPath = (root) => join(root, '.NeuroStrata', 'session_epochs.json')
+  const savedPending = (root, sid) =>
+    JSON.parse(readFileSync(epochsPath(root), 'utf8'))[sid]?.snapshot_pending
+  const patchPending = (root, sid, patch) => {
+    const all = JSON.parse(readFileSync(epochsPath(root), 'utf8'))
+    Object.assign(all[sid].snapshot_pending, patch)
+    writeFileSync(epochsPath(root), JSON.stringify(all))
+  }
+  const start = (root, session_id, source = 'startup') =>
+    handleHookEvent({ hook_event_name: 'SessionStart', session_id, source, cwd: root })
+  // Each hook event is a new process: the epoch state comes from the file.
+  const read = (root, session_id, file = 'src/a.rs') => {
+    resetAllSessionEpochs()
+    return handleHookEvent({
+      hook_event_name: 'PreToolUse',
+      session_id,
+      cwd: root,
+      tool_name: 'Read',
+      tool_input: { file_path: join(root, file) }
+    })
+  }
+  const ctxOfStart = (out) => out.hookSpecificOutput?.additionalContext ?? ''
+  const ctxOfTool = (out) => out.hookSpecificOutput?.additionalContext ?? ''
+
+  it('a refused snapshot: the saved file goes in at once, the user gets one line, the wait is saved', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, {}, async ({ progress }) => {
+        const t0 = Date.now()
+        const out = await start(root, 'cold-1')
+        const ms = Date.now() - t0
+        assert.ok(ms < 1500, `session start does not wait (${ms} ms)`)
+        const text = ctxOfStart(out)
+        assert.ok(text.startsWith(`${PENDING_LINE}\n`), text.slice(0, 300))
+        assert.match(text, /n1: Namespace one, old wording\./)
+        assert.equal(out.systemMessage, STARTING_USER)
+        // Claude Code and Codex: systemMessage and hookSpecificOutput only.
+        assert.deepEqual(Object.keys(out).sort(), ['hookSpecificOutput', 'systemMessage'])
+        const p = savedPending(root, 'cold-1')
+        assert.equal(typeof p.since_ms, 'number')
+        assert.ok(Math.abs(p.since_ms - t0) < 2000)
+        assert.deepEqual(p.sections, ['handoff', 'golden_rules', 'rules', 'also_on_record'])
+        assert.equal(p.source, 'startup')
+        // Copilot: the same text in its own shape, the user line as a
+        // progress line (Copilot has no systemMessage).
+        process.env.NEUROSTRATA_HOOK_EVENT = 'sessionStart'
+        try {
+          const cp = await handleHookEvent({ sessionId: 'cold-cp', timestamp: 1, cwd: root, source: 'new' })
+          assert.ok(cp.additionalContext.startsWith(PENDING_LINE), cp.additionalContext.slice(0, 200))
+          assert.deepEqual(Object.keys(cp), ['additionalContext'])
+          assert.deepEqual(progress, [{ type: 'progress', message: STARTING_USER }])
+        } finally {
+          delete process.env.NEUROSTRATA_HOOK_EVENT
+        }
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('the first tool round loads the snapshot: new session-start text once, then file recall, then left-out parts, under 9,500 bytes', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(
+        root,
+        { fileOnSnapshot: FRESH, recall: recallFor('File rule for a.rs.'), memories: { lo1: 'Left out one, whole.' } },
+        async ({ up, snapshots }) => {
+          await start(root, 'cold-2')
+          assert.ok(savedPending(root, 'cold-2'))
+          await up()
+          const out = await read(root, 'cold-2')
+          const text = ctxOfTool(out)
+          assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
+          assert.ok(utf8Bytes(text) <= SESSION_START_MAX_BYTES, `${utf8Bytes(text)} bytes`)
+          assert.match(text, RAN_NOW)
+          const changed = text.indexOf('n1: Namespace one, new wording.')
+          const added = text.indexOf('n2: Namespace two, added.')
+          const recall = text.indexOf('File rule for a.rs.')
+          const leftOut = text.indexOf('Left out one, whole.')
+          assert.ok(changed > 0 && added > 0, text)
+          assert.ok(recall > Math.max(changed, added), 'file recall after the session-start text')
+          assert.ok(leftOut > recall, 'left-out parts last')
+          // Shown from the saved file at session start and unchanged.
+          assert.doesNotMatch(text, /g1: Golden one\./)
+          // A success tells the user nothing new: systemMessage is the recall.
+          assert.doesNotMatch(out.systemMessage ?? '', /NeuroStrata: the daemon/)
+          assert.equal(savedPending(root, 'cold-2'), undefined, 'the wait ended')
+          const again = ctxOfTool(await read(root, 'cold-2', 'src/b.rs'))
+          assert.doesNotMatch(again, /ran now|Namespace one|Namespace two|Left out one/)
+          assert.equal(snapshots(), 1)
+        }
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('inside 10 s of a refused start, a tool round retries until the daemon answers; past the mark it gives up', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: FRESH }, async ({ up, down, snapshots }) => {
+        await start(root, 'wait-1')
+        patchPending(root, 'wait-1', { since_ms: Date.now() - SNAPSHOT_WAIT_MS + 3000 })
+        setTimeout(() => void up(), 600)
+        let t0 = Date.now()
+        const ok = ctxOfTool(await read(root, 'wait-1'))
+        assert.ok(Date.now() - t0 >= 500, `waited for the daemon (${Date.now() - t0} ms)`)
+        assert.match(ok, RAN_NOW)
+        assert.match(ok, /n2: Namespace two, added\./)
+        assert.equal(snapshots(), 1)
+        await down()
+        await start(root, 'wait-2')
+        patchPending(root, 'wait-2', { since_ms: Date.now() - SNAPSHOT_WAIT_MS + 700 })
+        t0 = Date.now()
+        const out = await read(root, 'wait-2')
+        const ms = Date.now() - t0
+        assert.ok(ms >= 550 && ms < 3000, `waited to the 10 s mark only (${ms} ms)`)
+        assert.ok(ctxOfTool(out).startsWith(FAILED_AGENT), ctxOfTool(out).slice(0, 300))
+        assert.equal(out.systemMessage, FAILED_USER)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('with the daemon down the guard denies the call; the denial still tells the user once', async () => {
+    const root = coldProject()
+    const bash = (session_id) => {
+      resetAllSessionEpochs()
+      return handleHookEvent({ hook_event_name: 'PreToolUse', session_id, cwd: root, tool_name: 'Bash', tool_input: { command: 'cargo build' } })
+    }
+    try {
+      await withColdDaemon(root, { strictMode: true }, async () => {
+        await start(root, 'deny-1')
+        patchPending(root, 'deny-1', { since_ms: Date.now() - SNAPSHOT_WAIT_MS - 1 })
+        const first = await bash('deny-1')
+        assert.equal(first.hookSpecificOutput.permissionDecision, 'deny')
+        assert.equal(first.systemMessage, FAILED_USER)
+        assert.ok(ctxOfTool(first).startsWith(FAILED_AGENT))
+        const second = await bash('deny-1')
+        assert.equal(second.hookSpecificOutput.permissionDecision, 'deny')
+        assert.equal(second.systemMessage, undefined)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a failed retry tells the user once; later rounds retry silently after the pause', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: FRESH }, async ({ up, snapshots }) => {
+        await start(root, 'fail-1')
+        patchPending(root, 'fail-1', { since_ms: Date.now() - SNAPSHOT_WAIT_MS - 1 })
+        const t0 = Date.now()
+        const first = await read(root, 'fail-1')
+        assert.ok(Date.now() - t0 < 1500, 'past the mark: no wait')
+        assert.ok(ctxOfTool(first).startsWith(FAILED_AGENT))
+        assert.equal(first.systemMessage, FAILED_USER)
+        assert.equal(savedPending(root, 'fail-1').told, true)
+        await up()
+        const second = await read(root, 'fail-1')
+        assert.equal(second.systemMessage, undefined, 'told once')
+        assert.doesNotMatch(ctxOfTool(second), /NeuroStrata: the daemon|ran now/)
+        assert.equal(snapshots(), 0, 'no retry inside the pause')
+        patchPending(root, 'fail-1', { failed_at: Date.now() - 61_000 })
+        const third = await read(root, 'fail-1')
+        assert.match(ctxOfTool(third), RAN_NOW)
+        assert.equal(third.systemMessage, undefined)
+        assert.equal(snapshots(), 1)
+        assert.equal(savedPending(root, 'fail-1'), undefined)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('what does not fit waits: file recall and the rest of the session-start text come on the next call, unmarked until then', async () => {
+    const rule = (i) => `[rule] big${i}: Rule ${i} ${'w'.repeat(180)}.`
+    const root = coldProject()
+    try {
+      // About 8.8 KB of new rules: they fit whole, the 1 KB recall does not.
+      const fits = { ...CACHED, namespace_rules: Array.from({ length: 42 }, (_, i) => rule(i)) }
+      await withColdDaemon(root, { fileOnSnapshot: fits, recall: recallFor(`Big file rule ${'r'.repeat(1000)}`) }, async ({ up }) => {
+        await start(root, 'fit-1')
+        await up()
+        const first = ctxOfTool(await read(root, 'fit-1'))
+        assert.ok(utf8Bytes(first) <= SESSION_START_MAX_BYTES, `${utf8Bytes(first)} bytes`)
+        assert.match(first, /big41: Rule 41/)
+        assert.doesNotMatch(first, /Big file rule/, 'recall waits')
+        const second = ctxOfTool(await read(root, 'fit-1'))
+        assert.match(second, /Big file rule/, 'the same file again: recall comes now')
+        assert.doesNotMatch(second, /big\d+: Rule/)
+      })
+      // About 10.5 KB of new rules: the rest comes on the next call, once.
+      // (The session starts from the old file again, not from `fits`.)
+      writeFileSync(join(root, '.NeuroStrata', 'active_session.json'), JSON.stringify(CACHED))
+      const over = { ...CACHED, namespace_rules: Array.from({ length: 52 }, (_, i) => rule(i)) }
+      await withColdDaemon(root, { fileOnSnapshot: over }, async ({ up, snapshots }) => {
+        await start(root, 'fit-2')
+        await up()
+        const seen = []
+        for (let call = 0; call < 3; call++) {
+          const text = ctxOfTool(await read(root, 'fit-2', `src/f${call}.rs`))
+          assert.ok(utf8Bytes(text) <= SESSION_START_MAX_BYTES)
+          seen.push(...[...text.matchAll(/big(\d+): Rule/g)].map((m) => m[1]))
+        }
+        assert.equal(new Set(seen).size, 52, 'every rule delivered')
+        assert.equal(seen.length, 52, 'none twice')
+        assert.equal(snapshots(), 1)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('Copilot: postToolUse loads the snapshot and delivers the session-start text and the left-out parts; preToolUse stays as it was', async () => {
+    const root = coldProject()
+    const copilot = async (event, payload) => {
+      resetAllSessionEpochs()
+      process.env.NEUROSTRATA_HOOK_EVENT = event
+      try {
+        return await handleHookEvent({ timestamp: 1, cwd: root, ...payload })
+      } finally {
+        delete process.env.NEUROSTRATA_HOOK_EVENT
+      }
+    }
+    const tool = { toolName: 'view', toolArgs: JSON.stringify({ path: 'src/a.rs' }) }
+    const result = { toolResult: { resultType: 'success', textResultForLlm: 'file text' } }
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: FRESH, memories: { lo1: 'Left out one, whole.' } }, async ({ up, progress, snapshots }) => {
+        // A failed retry: the agent line in additionalContext, the user line
+        // as a progress line, once.
+        await copilot('sessionStart', { sessionId: 'cp-fail', source: 'new' })
+        patchPending(root, 'cp-fail', { since_ms: Date.now() - SNAPSHOT_WAIT_MS - 1 })
+        progress.length = 0
+        const failed = await copilot('postToolUse', { sessionId: 'cp-fail', ...tool, ...result })
+        assert.ok(failed.additionalContext.startsWith(FAILED_AGENT))
+        assert.deepEqual(progress, [{ type: 'progress', message: FAILED_USER }])
+        assert.deepEqual(await copilot('postToolUse', { sessionId: 'cp-fail', ...tool, ...result }), {})
+        assert.equal(progress.length, 1)
+
+        await copilot('sessionStart', { sessionId: 'cp-cold', source: 'new' })
+        await up()
+        const pre = await copilot('preToolUse', { sessionId: 'cp-cold', ...tool })
+        assert.equal(pre.additionalContext, undefined)
+        assert.equal(snapshots(), 0, 'preToolUse does not load it')
+        const post = await copilot('postToolUse', { sessionId: 'cp-cold', ...tool, ...result })
+        assert.deepEqual(Object.keys(post), ['additionalContext'])
+        assert.ok(utf8Bytes(post.additionalContext) <= SESSION_START_MAX_BYTES)
+        assert.match(post.additionalContext, RAN_NOW)
+        assert.ok(
+          post.additionalContext.indexOf('n2: Namespace two, added.') <
+            post.additionalContext.indexOf('Left out one, whole.')
+        )
+        assert.deepEqual(await copilot('postToolUse', { sessionId: 'cp-cold', ...tool, ...result }), {})
+        assert.equal(snapshots(), 1)
+        // Claude Code and Codex deliver on PreToolUse.
+        assert.deepEqual(await handlePostToolUseEvent({ session_id: 'cp-cold', cwd: root }, 'claude'), {})
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('OpenCode: a refused session start (Bun error) loads the snapshot on the next request when it comes before a tool call, left-out rules reach the next tool result once per epoch, user lines go inline on the next tool round or when the turn ends', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: FRESH, memories: { lo1: 'Left out one, whole.' }, recall: recallFor('File rule WHISKEY.'), bunRefused: true }, async ({ up, down, snapshots, sessionHooks, toolHooks, synthetics, emit, calls }) => {
+        const request = async (sessionID) => {
+          const ev = { sessionID, system: [], messages: [] }
+          await sessionHooks.get('context')(ev)
+          return ev.system.map((s) => s.text).join('\n')
+        }
+        // OpenCode 2.0.32 reads back only `tool`/`input` from execute.before
+        // and `result` from execute.after: only the result reaches the model.
+        const tool = async (sessionID, id, name, input) => {
+          const before = { tool: name, sessionID, id, input }
+          await toolHooks.get('execute.before')(before)
+          const after = { tool: name, sessionID, id, input: before.input, status: 'completed', result: { output: 'out\n', content: [{ type: 'text', text: 'out\n' }] } }
+          await toolHooks.get('execute.after')(after)
+          return after.result.content.map((p) => p.text).join('\n')
+        }
+        const shell = (sid, id) => tool(sid, id, 'shell', { command: 'echo hi' })
+        const read = (sid, id) => tool(sid, id, 'read', { filePath: join(root, 'src/a.rs') })
+        const first = await request('oc-cold')
+        assert.ok(first.startsWith(`${PENDING_LINE}\n`), first.slice(0, 200))
+        assert.match(first, /n1: Namespace one, old wording\./)
+        // Owed, not sent from the context hook: a synthetic admitted during a
+        // turn's last step would make OpenCode run another step for it.
+        assert.deepEqual(synthetics, [])
+        const inline = (message) => ({ sessionID: 'oc-cold', description: message, text: openCodeUserLineNote(message), resume: false, delivery: 'steer' })
+        await up()
+        const second = await request('oc-cold')
+        assert.equal(snapshots(), 1, 'loaded on the next request')
+        assert.match(second, /^neurostrata_get_snapshot already ran for this session at /)
+        assert.match(second, /n1: Namespace one, new wording\./)
+        assert.match(await request('oc-cold'), /^neurostrata_get_snapshot already ran/)
+        assert.equal(snapshots(), 1)
+        // A read with file recall: the recall, then what session start left out.
+        const withRecall = await read('oc-cold', 'c2')
+        assert.deepEqual(synthetics, [inline(STARTING_USER)], 'sent on the first tool round, once')
+        assert.ok(withRecall.indexOf('File rule WHISKEY.') >= 0, withRecall)
+        assert.ok(withRecall.indexOf('File rule WHISKEY.') < withRecall.indexOf('Left out one, whole.'), withRecall)
+        assert.ok(utf8Bytes(withRecall) <= SESSION_START_MAX_BYTES + 10)
+        assert.doesNotMatch(withRecall, /Namespace one|Namespace two/)
+        assert.doesNotMatch(await shell('oc-cold', 'c3'), /Left out one/, 'once per epoch')
+        await emit({ type: 'session.execution.succeeded', data: { sessionID: 'oc-cold' } })
+        assert.equal(synthetics.length, 1, 'the user line is shown once')
+        // Compaction: the handoff note from the summarized messages, a new
+        // epoch, and the left-out rules again on the next shell result.
+        await sessionHooks.get('compaction')({
+          sessionID: 'oc-cold',
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: 'Fix the PAPA bug' }] },
+            { role: 'assistant', content: [{ type: 'text', text: 'Fixed it.' }] }
+          ]
+        })
+        const note = calls.find((c) => c.name === 'neurostrata_append_log')
+        assert.ok(note, 'handoff written at compaction')
+        assert.match(note.args.content, /^Handoff: Session oc-cold stopped \(PreCompact\/auto\)\.\nLast prompts \(oldest first\):\n1\. Fix the PAPA bug\nLast reply: Fixed it\.$/)
+        await request('oc-cold')
+        assert.match(await shell('oc-cold', 'c4'), /Left out one, whole\./, 'a new epoch delivers again')
+        // Past the mark: the failure line for the agent, the user's line once.
+        await down()
+        writeFileSync(
+          epochsPath(root),
+          JSON.stringify({ 'oc-late': { epoch: 0, baselineInjectedEpoch: -1, injectedKeys: [], snapshot_pending: { epoch: 0, since_ms: Date.now() - SNAPSHOT_WAIT_MS - 1 } } })
+        )
+        const late = await request('oc-late')
+        assert.ok(late.startsWith(`${FAILED_AGENT}\n`), late.slice(0, 600))
+        const told = synthetics.length
+        await emit({ type: 'session.execution.succeeded', data: { sessionID: 'other' } })
+        assert.equal(synthetics.length, told, 'a turn end of another session sends nothing')
+        // A reply with no tool call: the line goes out when the turn ends.
+        await emit({ type: 'session.execution.succeeded', data: { sessionID: 'oc-late' } })
+        assert.deepEqual(synthetics.slice(told), [{ ...inline(FAILED_USER), sessionID: 'oc-late' }])
+        assert.ok((await request('oc-late')).startsWith(`${FAILED_AGENT}\n`))
+        await emit({ type: 'session.execution.failed', data: { sessionID: 'oc-late' } })
+        assert.equal(synthetics.length, told + 1, 'the user is told once')
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  // OpenCode's tool round as 2.0.32 runs it: execute.before, then
+  // execute.after, whose `result` is what the model reads.
+  const openCodeShell = (toolHooks) => async (sessionID, id) => {
+    const before = { tool: 'shell', sessionID, id, input: { command: 'echo hi' } }
+    await toolHooks.get('execute.before')(before)
+    const after = { tool: 'shell', sessionID, id, input: before.input, status: 'completed', result: { output: 'hi\n', content: [{ type: 'text', text: 'hi\n' }] } }
+    await toolHooks.get('execute.after')(after)
+    return after.result.content.map((p) => p.text).join('\n')
+  }
+  const openCodeRequest = (sessionHooks) => async (sessionID) => {
+    const ev = { sessionID, system: [], messages: [] }
+    await sessionHooks.get('context')(ev)
+    return ev.system.map((s) => s.text).join('\n')
+  }
+  const LEFT_OUT_WHOLE = /Left out one, whole\./g
+
+  it('OpenCode: the first tool round after a refused session start loads the snapshot and its result carries the left-out rules; the next request has the fresh text, nothing twice', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: FRESH, memories: { lo1: 'Left out one, whole.' }, bunRefused: true }, async ({ up, snapshots, sessionHooks, toolHooks }) => {
+        const request = openCodeRequest(sessionHooks)
+        const shell = openCodeShell(toolHooks)
+        assert.ok((await request('oc-tool')).startsWith(`${PENDING_LINE}\n`))
+        await up()
+        const result = await shell('oc-tool', 'c1')
+        assert.equal(snapshots(), 1, 'the tool round loads the snapshot')
+        assert.equal(result.match(LEFT_OUT_WHOLE)?.length, 1, result)
+        assert.doesNotMatch(result, /Namespace one|Namespace two|ran now/, 'the session-start text goes into system')
+        const next = await request('oc-tool')
+        assert.match(next, /^neurostrata_get_snapshot already ran for this session at /)
+        assert.match(next, /n1: Namespace one, new wording\./)
+        assert.match(next, /n2: Namespace two, added\./)
+        assert.doesNotMatch(next, LEFT_OUT_WHOLE)
+        assert.equal(snapshots(), 1, 'the request calls nothing more')
+        assert.equal(savedPending(root, 'oc-tool'), undefined, 'the wait ended')
+        const saved = JSON.parse(readFileSync(epochsPath(root), 'utf8'))['oc-tool']
+        assert.equal(saved.baselineInjectedEpoch, saved.epoch)
+        assert.ok(saved.injectedKeys.includes('whole:lo1'), JSON.stringify(saved))
+        assert.doesNotMatch(await shell('oc-tool', 'c2'), LEFT_OUT_WHOLE, 'once per epoch')
+        assert.match(await request('oc-tool'), /n2: Namespace two, added\./)
+        assert.equal(snapshots(), 1)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('OpenCode: parallel tool rounds while the daemon starts, no saved session file: one waits and loads the snapshot, the left-out rules come once', async () => {
+    const root = coldProject(null)
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: FRESH, memories: { lo1: 'Left out one, whole.' }, bunRefused: true }, async ({ up, snapshots, sessionHooks, toolHooks }) => {
+        const request = openCodeRequest(sessionHooks)
+        const shell = openCodeShell(toolHooks)
+        assert.match(await request('oc-par'), /no session file is saved yet/)
+        const upLater = new Promise((r) => setTimeout(r, 400)).then(up)
+        const t0 = Date.now()
+        const results = await Promise.all(['p1', 'p2', 'p3'].map((id) => shell('oc-par', id)))
+        const ms = Date.now() - t0
+        await upLater
+        assert.ok(ms >= 300, `waited for the daemon (${ms} ms)`)
+        assert.equal(snapshots(), 1)
+        assert.equal(results.join('\n').match(LEFT_OUT_WHOLE)?.length, 1, results.join('\n---\n'))
+        const next = await request('oc-par')
+        assert.match(next, /^neurostrata_get_snapshot already ran/)
+        assert.match(next, /n2: Namespace two, added\./)
+        assert.equal(snapshots(), 1)
+        assert.doesNotMatch(await shell('oc-par', 'p4'), LEFT_OUT_WHOLE)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('OpenCode: session end writes the handoff from the last request messages, once; the event stream is read with a signal', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, {}, async ({ up, sessionHooks, calls, cleanup, subscribed }) => {
+        await up()
+        assert.equal(subscribed.length, 1)
+        assert.ok(subscribed[0]?.signal instanceof AbortSignal, 'subscribe({ signal }), not a callback')
+        await sessionHooks.get('context')({ sessionID: 'oc-end', system: [], messages: [{ role: 'user', content: 'Ship it' }] })
+        assert.equal(typeof cleanup, 'function', 'setup returns a cleanup')
+        await cleanup()
+        await cleanup()
+        const notes = calls.filter((c) => c.name === 'neurostrata_append_log')
+        assert.equal(notes.length, 1)
+        assert.match(notes[0].args.content, /^Handoff: Session oc-end stopped \(SessionEnd\/exit\)\.\nLast prompts \(oldest first\):\n1\. Ship it$/)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('OpenCode: a timed-out session start is retried once on the next request, then pauses 60 s', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, { hang: true, requestTimeoutMs: 300 }, async ({ up, snapshots, sessionHooks }) => {
+        await up()
+        const request = async () => {
+          const ev = { sessionID: 'oc-slow', system: [] }
+          await sessionHooks.get('context')(ev)
+          return ev.system.map((s) => s.text).join('\n')
+        }
+        assert.ok((await request()).startsWith(PENDING_LINE))
+        await request()
+        await request()
+        assert.equal(snapshots(), 2)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a fresh claim by another hook: this round neither calls get_snapshot nor sends the text; a stale claim is taken over', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: FRESH }, async ({ up, snapshots }) => {
+        await start(root, 'claim-1')
+        await up()
+        patchPending(root, 'claim-1', { claim: { by: 'other-hook', at: Date.now() } })
+        const lost = ctxOfTool(await read(root, 'claim-1'))
+        assert.doesNotMatch(lost, /ran now|Namespace two/)
+        assert.equal(snapshots(), 0, 'the claim holder calls, not this hook')
+        assert.equal(savedPending(root, 'claim-1').claim.by, 'other-hook')
+        patchPending(root, 'claim-1', { claim: { by: 'dead-hook', at: Date.now() - 120_000 } })
+        const taken = ctxOfTool(await read(root, 'claim-1'))
+        assert.match(taken, RAN_NOW)
+        assert.equal(snapshots(), 1)
+        assert.equal(savedPending(root, 'claim-1'), undefined)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a subagent call is a tool round too: it loads the snapshot and carries the text, updatedInput intact', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: FRESH }, async ({ up, snapshots }) => {
+        await start(root, 'sub-1')
+        await up()
+        resetAllSessionEpochs()
+        const out = await handleHookEvent({
+          hook_event_name: 'PreToolUse',
+          session_id: 'sub-1',
+          cwd: root,
+          tool_name: 'Task',
+          tool_input: { description: 'look around', prompt: 'Find the parser.', subagent_type: 'Explore' }
+        })
+        assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
+        assert.match(out.hookSpecificOutput.updatedInput.prompt, /Find the parser\./)
+        assert.match(ctxOfTool(out), RAN_NOW)
+        assert.match(ctxOfTool(out), /n2: Namespace two, added\./)
+        assert.equal(snapshots(), 1)
+        assert.doesNotMatch(ctxOfTool(await read(root, 'sub-1')), /ran now|Namespace two/)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a session file that cannot be read after the snapshot is a failed retry: told once, retried, the wait kept', async () => {
+    const root = coldProject()
+    try {
+      await withColdDaemon(root, { rawOnSnapshot: '{ not json' }, async ({ up }) => {
+        await start(root, 'bad-1')
+        await up()
+        const out = await read(root, 'bad-1')
+        assert.doesNotMatch(ctxOfTool(out), RAN_NOW)
+        assert.match(ctxOfTool(out), /^NeuroStrata: the snapshot call failed \(the session file could not be read after the snapshot\)/)
+        assert.match(out.systemMessage, /^NeuroStrata: the snapshot call failed/)
+        const p = savedPending(root, 'bad-1')
+        assert.ok(p && p.failed_at && p.ran_at === undefined, JSON.stringify(p))
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a session-start part larger than any reply does not hold the wait open: the next round is quiet', async () => {
+    const root = coldProject()
+    const huge = { ...CACHED, namespace_rules: [...CACHED.namespace_rules, `[rule] huge: ${'h'.repeat(12_000)}`] }
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: huge }, async ({ up, snapshots }) => {
+        await start(root, 'huge-1')
+        await up()
+        const first = ctxOfTool(await read(root, 'huge-1'))
+        assert.match(first, RAN_NOW)
+        assert.ok(utf8Bytes(first) <= SESSION_START_MAX_BYTES)
+        assert.match(first, /1 more NeuroStrata rule not shown here/)
+        assert.equal(savedPending(root, 'huge-1'), undefined, 'the wait ended')
+        assert.doesNotMatch(ctxOfTool(await read(root, 'huge-1', 'src/b.rs')), /ran now/)
+        assert.equal(snapshots(), 1)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('the closing lines about what the daemon left out are not repeated when only what changed is sent', async () => {
+    const notes = { golden_rules_left_out: 2, namespace_rules_left_out: 4, also_on_record_left_out: 1 }
+    const root = coldProject({ ...CACHED, ...notes })
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: { ...FRESH, ...notes } }, async ({ up }) => {
+        const started = ctxOfStart(await start(root, 'note-1'))
+        assert.match(started, /2 Golden Rules left out to fit/)
+        assert.match(started, /1 more rule of this namespace not shown here/)
+        await up()
+        const delta = ctxOfTool(await read(root, 'note-1'))
+        assert.match(delta, /n2: Namespace two, added\./)
+        assert.doesNotMatch(delta, /Golden Rules left out to fit|shown only by first sentence|more rule of this namespace not shown/)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a rewritten session file with more left-out rules lists only the new ones, each rule once per epoch', async () => {
+    const ids = (n) => Array.from({ length: n }, (_, i) => `lr${i}`)
+    const file = (n) => ({
+      ...CACHED,
+      left_out_rule_ids: ids(n),
+      left_out_first_sentences: ids(n).map((id) => `[rule] ${id}: Rule ${id} first sentence…`)
+    })
+    const memories = Object.fromEntries(ids(12).map((id) => [id, `Rule ${id} whole.`]))
+    const root = coldProject(file(10))
+    try {
+      await withColdDaemon(root, { fileOnSnapshot: file(10), memories }, async ({ up }) => {
+        await up()
+        await start(root, 'list-1')
+        const first = ctxOfTool(await read(root, 'list-1'))
+        assert.match(first, /\[rule\] lr9: Rule lr9 first sentence/)
+        // A claim or task update rewrites the file: two more rules left out.
+        writeFileSync(join(root, '.NeuroStrata', 'active_session.json'), JSON.stringify(file(12)))
+        const second = ctxOfTool(await read(root, 'list-1', 'src/b.rs'))
+        assert.match(second, /\[rule\] lr10: Rule lr10 first sentence/)
+        assert.match(second, /\[rule\] lr11: Rule lr11 first sentence/)
+        assert.doesNotMatch(second, /lr[5-9]: Rule/, 'listed already')
+        assert.doesNotMatch(second, /Rule lr\d+ whole\./, 'sent whole already')
+        assert.doesNotMatch(ctxOfTool(await read(root, 'list-1', 'src/c.rs')), /More rules left out/)
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
     }
   })
 })

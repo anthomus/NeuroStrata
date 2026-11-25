@@ -675,6 +675,40 @@ pub trait VectorStore: Send + Sync + AsAny {
         self.list(namespace, None, None).await
     }
 
+    /// Rows whose stored metadata text contains `needle`: a superset of the
+    /// rows that hold that value, for callers that check each row themselves.
+    /// Stores that can narrow in the engine override this; the default lists
+    /// the whole namespace.
+    async fn list_metadata_containing(
+        &self,
+        namespace: &str,
+        _needle: &str,
+    ) -> Result<Vec<SearchResult>> {
+        self.list(namespace, None, None).await
+    }
+
+    /// `list` without the rows of the given memory types, in the same order.
+    /// Stores that can narrow in the engine override this; the default lists
+    /// the whole namespace and filters here.
+    async fn list_excluding_types(
+        &self,
+        namespace: &str,
+        exclude: &[&str],
+    ) -> Result<Vec<SearchResult>> {
+        let mut rows = self.list(namespace, None, None).await?;
+        rows.retain(|r| !exclude.contains(&r.payload.memory_type.as_str()));
+        Ok(rows)
+    }
+
+    /// Ingested rows whose id does not carry the namespace (written before ids
+    /// were qualified, see `parser::ingest::is_qualified`). A migrated
+    /// namespace has none. The default lists the ingested rows and filters.
+    async fn list_unqualified_ingested(&self, namespace: &str) -> Result<Vec<SearchResult>> {
+        let mut rows = self.list(namespace, Some("auto-ingestor"), None).await?;
+        rows.retain(|r| !crate::parser::ingest::is_qualified(namespace, &r.id));
+        Ok(rows)
+    }
+
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
 

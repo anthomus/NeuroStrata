@@ -8307,10 +8307,31 @@ impl LadybugStore {
         memory_type: Option<&str>,
         metadata_contains: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
+        // Optional filters, pushed into Cypher (R15).
+        let mut conditions = Vec::new();
+        if let Some(uid) = user_id {
+            conditions.push(format!("m.user_id = '{}'", escape_ladybug_string(uid)));
+        }
+        if let Some(mt) = memory_type {
+            conditions.push(format!("m.memory_type = '{}'", escape_ladybug_string(mt)));
+        }
+        if let Some(needle) = metadata_contains {
+            conditions.push(format!(
+                "m.metadata CONTAINS '{}'",
+                escape_ladybug_string(needle)
+            ));
+        }
+        self.list_rows_where(namespace, conditions).await
+    }
+
+    /// `list_rows` with Cypher conditions on `m` that the caller built and
+    /// escaped, joined with AND to the namespace filter.
+    async fn list_rows_where(
+        &self,
+        namespace: &str,
+        extra_conditions: Vec<String>,
+    ) -> Result<Vec<SearchResult>> {
         let namespace = namespace.to_string();
-        let user_id = user_id.map(|v| v.to_string());
-        let memory_type = memory_type.map(|v| v.to_string());
-        let metadata_contains = metadata_contains.map(|v| v.to_string());
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
 
@@ -8322,17 +8343,8 @@ impl LadybugStore {
 
             let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
 
-            // Build WHERE clause with optional filters (R15: push into Cypher).
             let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
-            if let Some(ref uid) = user_id {
-                conditions.push(format!("m.user_id = '{}'", escape_ladybug_string(uid)));
-            }
-            if let Some(ref mt) = memory_type {
-                conditions.push(format!("m.memory_type = '{}'", escape_ladybug_string(mt)));
-            }
-            if let Some(ref needle) = metadata_contains {
-                conditions.push(format!("m.metadata CONTAINS '{}'", escape_ladybug_string(needle)));
-            }
+            conditions.extend(extra_conditions);
             let where_clause = conditions.join(" AND ");
 
             let query = format!("MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", where_clause);
@@ -12850,6 +12862,47 @@ impl VectorStore for LadybugStore {
         self.list_rows(namespace, None, None, Some("pinned")).await
     }
 
+    async fn list_metadata_containing(
+        &self,
+        namespace: &str,
+        needle: &str,
+    ) -> Result<Vec<SearchResult>> {
+        self.list_rows(namespace, None, None, Some(needle)).await
+    }
+
+    async fn list_excluding_types(
+        &self,
+        namespace: &str,
+        exclude: &[&str],
+    ) -> Result<Vec<SearchResult>> {
+        let mut conditions = Vec::new();
+        if !exclude.is_empty() {
+            let types = exclude
+                .iter()
+                .map(|t| format!("'{}'", escape_ladybug_string(t)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // A NULL type would make the NOT itself NULL and drop the row,
+            // where the in-memory default keeps it.
+            conditions.push(format!(
+                "(m.memory_type IS NULL OR NOT (m.memory_type IN [{types}]))"
+            ));
+        }
+        self.list_rows_where(namespace, conditions).await
+    }
+
+    async fn list_unqualified_ingested(&self, namespace: &str) -> Result<Vec<SearchResult>> {
+        let prefix = crate::parser::ingest::qualified_id(namespace, "");
+        let conditions = vec![
+            "m.user_id = 'auto-ingestor'".to_string(),
+            format!(
+                "NOT (m.id STARTS WITH '{}')",
+                escape_ladybug_string(&prefix)
+            ),
+        ];
+        self.list_rows_where(namespace, conditions).await
+    }
+
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
         let namespace = namespace.to_string();
         let id = id.to_string();
@@ -17047,6 +17100,79 @@ eurostrata\src\daemon.rs",
                 junk
             );
         }
+    }
+
+    /// The snapshot's two narrow reads must return exactly what the trait's
+    /// in-memory defaults would compute from a full listing: the exclusion
+    /// drops only the named types, and the unqualified-ingested read keeps
+    /// only ingested rows whose id does not name the namespace.
+    #[tokio::test]
+    async fn list_excluding_types_and_list_unqualified_ingested_match_a_full_listing() {
+        use std::collections::BTreeSet;
+        let store = retired_test_store().await;
+        for (id, memory_type, user_id) in [
+            ("a-rule", "rule", "agent"),
+            ("probe::src/a.rs", "file", "auto-ingestor"),
+            ("probe::src/a.rs::f", "code_ast", "auto-ingestor"),
+            ("src/legacy.rs", "file", "auto-ingestor"),
+            ("legacy-dir", "directory", "auto-ingestor"),
+            ("a-guard-event", "guard_event", "agent"),
+        ] {
+            store
+                .upsert(
+                    "probe",
+                    id,
+                    vec![0.1; 4],
+                    retired_test_payload(memory_type, user_id, json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        let ids = |rows: &[SearchResult]| -> BTreeSet<String> {
+            rows.iter().map(|r| r.id.clone()).collect()
+        };
+        let all = store.list("probe", None, None).await.unwrap();
+
+        let exclude = ["code_ast", "file", "guard_event"];
+        let narrowed = store.list_excluding_types("probe", &exclude).await.unwrap();
+        let expected: Vec<SearchResult> = all
+            .iter()
+            .filter(|r| !exclude.contains(&r.payload.memory_type.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(ids(&narrowed), ids(&expected));
+        assert_eq!(
+            ids(&narrowed),
+            BTreeSet::from(["a-rule".to_string(), "legacy-dir".to_string()])
+        );
+        assert_eq!(
+            ids(&store.list_excluding_types("probe", &[]).await.unwrap()),
+            ids(&all),
+            "excluding nothing is the same as list"
+        );
+        assert_eq!(
+            ids(&store
+                .list_excluding_types("probe", &["it's"])
+                .await
+                .unwrap()),
+            ids(&all),
+            "a quote in a type name is escaped, not an error"
+        );
+
+        let stale = store.list_unqualified_ingested("probe").await.unwrap();
+        let expected_stale: Vec<SearchResult> = all
+            .iter()
+            .filter(|r| {
+                r.payload.user_id == "auto-ingestor"
+                    && !crate::parser::ingest::is_qualified("probe", &r.id)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(ids(&stale), ids(&expected_stale));
+        assert_eq!(
+            ids(&stale),
+            BTreeSet::from(["legacy-dir".to_string(), "src/legacy.rs".to_string()])
+        );
     }
 
     async fn retired_test_store() -> LadybugStore {

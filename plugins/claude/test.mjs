@@ -677,8 +677,11 @@ test("hook runner replies in the shape of the failing event (#400)", () => {
     // lacks its handler or the hook fails on the broken config (Claude's
     // SessionStart always goes to the plugin).
     for (const name of ["SessionStart", "SessionEnd", "PreCompact", "PostToolUse"]) {
-      const quiet = runFailingRunner({ hook_event_name: name, cwd: repo, session_id: "failing" }, repo);
-      assert.equal(quiet.status, 0, name);
+      const quiet = runFailingRunner(
+        { hook_event_name: name, cwd: repo, session_id: "failing", source: "startup" },
+        repo
+      );
+      assert.equal(quiet.status, 0, `${name} must exit 0; stderr=${quiet.stderr.slice(0, 200)}`);
       assert.deepEqual(JSON.parse(quiet.stdout), {}, name);
     }
   } finally {
@@ -702,6 +705,136 @@ test("cli hook ignores an invalid NEUROSTRATA_NAMESPACE (#400)", () => {
     const ns = namespaceIn(runClaudeHook(stopEvent(repo), repo, env));
     assert.notEqual(ns, "$NS; rm -rf /");
   } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// ── Session start through the hook runner (daemon unreachable: the file is used as it stands)
+test("Claude Code SessionStart through cli-hook.mjs injects the session file; resume skips what was shown", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const runner = fileURLToPath(new URL("./cli-hook.mjs", import.meta.url));
+  const base = mkdtempSync(join(tmpdir(), "ns-ss-claude-runner-"));
+  try {
+    mkdirSync(join(base, ".NeuroStrata"), { recursive: true });
+    writeFileSync(
+      join(base, ".NeuroStrata", "neurostrata-plugin.json"),
+      JSON.stringify({ namespace: "rt-ns", endpoint: "http://127.0.0.1:1/mcp", requestTimeoutMs: 1000 }),
+    );
+    writeFileSync(
+      join(base, ".NeuroStrata", "active_session.json"),
+      JSON.stringify({ namespace: "rt-ns", golden_rules: ["[rule] rg1: Runner rule."] }),
+    );
+    const env = { ...process.env, NEUROSTRATA_NAMESPACE: "rt-ns" };
+    delete env.CLAUDE_PROJECT_DIR;
+    const run = (source) => {
+      const out = spawnSync(process.execPath, [runner], {
+        input: JSON.stringify({ hook_event_name: "SessionStart", cwd: base, session_id: "rt-1", source, model: "m", permission_mode: "default", transcript_path: null }),
+        cwd: base,
+        env,
+        encoding: "utf8",
+        timeout: 30000,
+      });
+      assert.equal(out.status, 0, out.stderr.slice(0, 300));
+      return JSON.parse(out.stdout).hookSpecificOutput.additionalContext ?? "";
+    };
+    for (const source of ["startup", "clear", "compact"]) assert.match(run(source), /rg1: Runner rule./, source);
+    assert.doesNotMatch(run("resume"), /rg1: Runner rule./);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// ── Parallel tool calls after a cold start: one hook loads and sends the snapshot
+test("parallel PreToolUse runners after a cold start: one get_snapshot, the session-start text and each left-out rule sent once", async () => {
+  const { spawn } = await import("node:child_process");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const runner = fileURLToPath(new URL("./cli-hook.mjs", import.meta.url));
+  const base = mkdtempSync(join(tmpdir(), "ns-par-claude-runner-"));
+  // A port nothing listens on yet: the daemon is "still starting".
+  const probe = http.createServer();
+  await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+  const port = probe.address().port;
+  await new Promise((r) => probe.close(r));
+  const ids = ["lo0", "lo1", "lo2", "lo3"];
+  const fresh = {
+    namespace: "rt-ns",
+    sections: ["handoff", "golden_rules", "rules", "also_on_record"],
+    max_bytes: 8000,
+    golden_rules: ["[rule] rg1: Runner rule."],
+    namespace_rules: ["[rule] rn2: Added since the saved file."],
+    left_out_rule_ids: ids,
+    left_out_first_sentences: ids.map((id) => `[rule] ${id}: ${id} first sentence…`),
+  };
+  let snapshots = 0;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const msg = JSON.parse(body || "{}");
+      const name = msg.params?.name;
+      const args = msg.params?.arguments ?? {};
+      if (name === "neurostrata_get_snapshot") {
+        snapshots++;
+        writeFileSync(join(base, ".NeuroStrata", "active_session.json"), JSON.stringify(fresh));
+      }
+      const text =
+        name === "neurostrata_get_memory"
+          ? `--- Memory ID: ${args.id} ---\nType: rule\nContent: Whole ${args.id}.`
+          : "ok";
+      // Slow enough that the parallel hooks overlap.
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json", connection: "close" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text }], tools: [] } }));
+      }, name === "neurostrata_get_snapshot" ? 300 : 20);
+    });
+  });
+  const env = { ...process.env, NEUROSTRATA_NAMESPACE: "rt-ns", CLAUDE_PROJECT_DIR: base };
+  // The fake daemon answers in this process: the runners must run async.
+  const run = (event) =>
+    new Promise((resolve) => {
+      const child = spawn(process.execPath, [runner], { cwd: base, env });
+      let out = "";
+      child.stdout.on("data", (d) => (out += d));
+      child.on("close", () => resolve(JSON.parse(out || "{}")));
+      child.stdin.end(JSON.stringify({ cwd: base, session_id: "par-1", ...event }));
+    });
+  try {
+    mkdirSync(join(base, ".git"));
+    mkdirSync(join(base, ".NeuroStrata"), { recursive: true });
+    writeFileSync(
+      join(base, ".NeuroStrata", "neurostrata-plugin.json"),
+      JSON.stringify({ namespace: "rt-ns", endpoint: `http://127.0.0.1:${port}/mcp`, bearerToken: "t", strictMode: false, requestTimeoutMs: 5000 }),
+    );
+    writeFileSync(
+      join(base, ".NeuroStrata", "active_session.json"),
+      JSON.stringify({ ...fresh, namespace_rules: [], left_out_rule_ids: [], left_out_first_sentences: [] }),
+    );
+    const start = await run({ hook_event_name: "SessionStart", source: "startup" });
+    assert.match(start.systemMessage, /daemon is still starting/);
+    await new Promise((r) => server.listen(port, "127.0.0.1", r));
+    const replies = await Promise.all(
+      [0, 1, 2, 3, 4, 5].map((i) =>
+        run({ hook_event_name: "PreToolUse", tool_name: "Read", tool_input: { file_path: join(base, `src/f${i}.rs`) } }),
+      ),
+    );
+    const texts = replies.map((r) => r.hookSpecificOutput?.additionalContext ?? "");
+    assert.ok(replies.every((r) => r.hookSpecificOutput?.permissionDecision === "allow"));
+    assert.equal(snapshots, 1, "one hook calls get_snapshot");
+    assert.equal(texts.filter((t) => /neurostrata_get_snapshot ran now/.test(t)).length, 1, texts.join("\n----\n"));
+    assert.equal(texts.filter((t) => /rn2: Added since the saved file\./.test(t)).length, 1);
+    for (const id of ids) {
+      const sent = texts.filter((t) => new RegExp(`\\[rule\\] ${id}: `).test(t)).length;
+      assert.ok(sent <= 1, `${id} sent ${sent} times`);
+    }
+  } finally {
+    server.close();
     rmSync(base, { recursive: true, force: true });
   }
 });

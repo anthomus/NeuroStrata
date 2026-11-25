@@ -492,10 +492,49 @@ test("hook runner replies in the shape of the failing event (#400)", async () =>
     // lacks its handler or the hook failed; Codex rejects a decision on
     // SessionStart and PreCompact.
     for (const name of ["SessionStart", "SessionEnd", "PreCompact", "PostToolUse"]) {
-      const quiet = run({ hook_event_name: name, cwd: base, session_id: "failing" });
-      assert.equal(quiet.status, 0, name);
+      const quiet = run({ hook_event_name: name, cwd: base, session_id: "failing", source: "startup" });
+      assert.equal(quiet.status, 0, `${name} must exit 0; stderr=${quiet.stderr.slice(0, 200)}`);
       assert.deepEqual(JSON.parse(quiet.stdout), {}, name);
     }
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// ── Session start through the hook runner (daemon unreachable: the file is used as it stands)
+test("Codex SessionStart through cli-hook.mjs injects the session file; resume skips what was shown", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const runner = fileURLToPath(new URL("./cli-hook.mjs", import.meta.url));
+  const base = mkdtempSync(join(tmpdir(), "ns-ss-codex-runner-"));
+  try {
+    mkdirSync(join(base, ".NeuroStrata"), { recursive: true });
+    writeFileSync(
+      join(base, ".NeuroStrata", "neurostrata-plugin.json"),
+      JSON.stringify({ namespace: "rt-ns", endpoint: "http://127.0.0.1:1/mcp", requestTimeoutMs: 1000 }),
+    );
+    writeFileSync(
+      join(base, ".NeuroStrata", "active_session.json"),
+      JSON.stringify({ namespace: "rt-ns", golden_rules: ["[rule] rg1: Runner rule."] }),
+    );
+    const env = { ...process.env, NEUROSTRATA_NAMESPACE: "rt-ns" };
+    delete env.CLAUDE_PROJECT_DIR;
+    const run = (source) => {
+      const out = spawnSync(process.execPath, [runner], {
+        input: JSON.stringify({ hook_event_name: "SessionStart", cwd: base, session_id: "rt-1", source, model: "m", permission_mode: "default", transcript_path: null }),
+        cwd: base,
+        env,
+        encoding: "utf8",
+        timeout: 30000,
+      });
+      assert.equal(out.status, 0, out.stderr.slice(0, 300));
+      return JSON.parse(out.stdout).hookSpecificOutput.additionalContext ?? "";
+    };
+    for (const source of ["startup", "clear", "compact", "fork"]) assert.match(run(source), /rg1: Runner rule./, source);
+    assert.doesNotMatch(run("resume"), /rg1: Runner rule./);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }

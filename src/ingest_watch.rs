@@ -2282,6 +2282,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loop_c_daemon_writes_under_neurostrata_dir_do_not_mark_root_dirty() {
+        // The daemon writes its session ledger into the project root after
+        // every tool call; those writes must not schedule a re-ingest.
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(RecordingTrigger::default()));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let ledger = canonical.join(".NeuroStrata").join("session_queries.json");
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        std::fs::write(&ledger, "{}").unwrap();
+        let t0 = tokio::time::Instant::now();
+        service
+            .ingest_event(source_event(&canonical, ledger, WatchEventKind::Modify), t0)
+            .unwrap();
+        let status = service.status(None);
+        assert_eq!(status.roots[0].pending_paths_count, 0);
+        assert!(!status.roots[0].dirty);
+        assert!(service.due_keys(t0 + QUIET_PERIOD).is_empty());
+    }
+
+    #[tokio::test]
     async fn loop_c_mixed_rename_filters_each_effect_path_individually() {
         let dir = tempfile::tempdir().unwrap();
         let (service, canonical) = service_with(&dir, Arc::new(RecordingTrigger::default()));

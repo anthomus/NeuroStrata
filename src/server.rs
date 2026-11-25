@@ -273,6 +273,8 @@ async fn _with_watch(
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain slug(s) to surface in the domain strap, regardless of access_count." },
                                 "project_root": { "type": "string", "description": "Optional absolute path to the project root. Used for git-hook hygiene and cached in the registry row." },
                                 "include_archived": { "type": "boolean", "description": "Include archived/tombstoned rows in the snapshot (audit escape hatch)." },
+                                "max_bytes": { "type": "integer", "minimum": 0, "description": "Optional byte budget (UTF-8 bytes, as context_plan's max_bytes) for the session-start content of .NeuroStrata/active_session.json. Fills the sections in their order (see 'sections'), each part whole or left out, never cut. Golden Rules take at most half of it, reserved before the other sections are fitted: past that share the most relevant stay whole, the rest are listed by first sentence, and golden_rules_over_share is set with a notice. The reply shows the same lines; the file records max_bytes, what was left out and truncated_by_budget. Absent: the default sizes (12,000 + 6,000 characters of rules)." },
+                                "sections": { "type": "array", "items": { "type": "string", "enum": ["handoff", "task_line", "golden_rules", "task_block", "rules", "also_on_record"] }, "description": "Optional ordered list of the session-start sections to fill: handoff (the task's latest Handoff note), task_line (task id, status and Goal), golden_rules, task_block (the task block saved at claim), rules (the namespace's rules, whole; ranked by the relevance the task's claim computed when a task is active, else newest first), also_on_record (the rules left out, by first sentence; must come after rules). Only these are filled, in this order. Absent: handoff, task_line, task_block, golden_rules, rules, also_on_record." },
                                 "query": { "type": "string", "description": "Optional query string. When provided, procedures whose trigger matches the query are surfaced." },
                                 "task_id": { "type": "string", "description": "Optional task id. When provided, procedures whose trigger matches the task are surfaced." }
                             },
@@ -5786,12 +5788,716 @@ fn add_memory_hint_path(arguments: &Value, location: &str) -> Option<std::path::
         })
 }
 
+/// Memory types the snapshot's main read leaves in the store: the ingested
+/// code graph and doc sections, and guard audit events. On an ingested
+/// project they are most of the namespace.
+const SNAPSHOT_SKIPPED_TYPES: &[&str] =
+    &["code_ast", "symbol", "file", "doc_section", "guard_event"];
+
+const SNAPSHOT_LIST_ERROR: &str = "Failed to list memories or namespace does not exist.";
+
+/// The snapshot's row filters: archived rows (unless asked for), conflicting
+/// mesh rows and the registry row are left out.
+pub(crate) fn snapshot_row_visible(r: &SearchResult, include_archived: bool) -> bool {
+    (include_archived || !crate::handlers::archive_memory::is_archived(&r.payload))
+        && !crate::synaptic_mesh::conflict::is_conflicting(&r.payload)
+        && !crate::registry::is_registry_row(&r.payload.metadata)
+}
+
+/// Whether a row's `valid_to` has not passed (absent or null: open-ended).
+fn snapshot_row_unexpired(r: &SearchResult, now: i64) -> bool {
+    match r.payload.metadata.get("valid_to") {
+        None => true,
+        Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
+    }
+}
+
+/// The snapshot's row order: highest `access_count` first.
+fn snapshot_access_count_desc(a: &SearchResult, b: &SearchResult) -> std::cmp::Ordering {
+    let count = |r: &SearchResult| {
+        r.payload
+            .metadata
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    };
+    count(b).cmp(&count(a))
+}
+
+/// Upper bound, in characters, on the heading and rule lines of the
+/// snapshot's rules block. Rules go in whole or not at all: a rule cut short
+/// can drop the clause an agent needed, so the block fills with whole rules
+/// and leaves out the ones that do not fit.
+const SNAPSHOT_RULES_MAX_CHARS: usize = 12_000;
+
+/// A rule's whole text on one line: every run of whitespace, newlines
+/// included, becomes one space, so each rule stays one
+/// "  - [rule] `id`: text" line, the shape the plugin parses. Nothing is cut.
+fn snapshot_rule_one_line(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Upper bound, in characters, on the heading and lines of the snapshot's
+/// "Also on record" list.
+const SNAPSHOT_ALSO_ON_RECORD_MAX_CHARS: usize = 6_000;
+/// Where a rule's first sentence is cut at a word when no sentence ends
+/// before it.
+const SNAPSHOT_FIRST_SENTENCE_MAX_CHARS: usize = 150;
+
+/// The namespace's live `rule` rows the snapshot lists: not superseded and not
+/// in `skip_ids` (the Golden Rules), pinned first, then newest
+/// (`valid_from`), then by id. With `relevance` (ids ranked by the task's
+/// hybrid search, best first) the ranked rules come first, in that rank.
+fn snapshot_rules_in_order<'a>(
+    rows: &'a [SearchResult],
+    skip_ids: &std::collections::HashSet<&str>,
+    relevance: Option<&[String]>,
+) -> Vec<&'a SearchResult> {
+    let mut rules: Vec<&SearchResult> = rows
+        .iter()
+        .filter(|r| r.payload.memory_type == "rule")
+        .filter(|r| !skip_ids.contains(r.id.as_str()))
+        .filter(|r| r.payload.metadata.get("superseded_by").is_none())
+        .collect();
+    let valid_from = |r: &SearchResult| {
+        r.payload
+            .metadata
+            .get("valid_from")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    };
+    rules.sort_by(|a, b| {
+        let a_pin = crate::task::is_pinned_memory(&a.payload.metadata);
+        let b_pin = crate::task::is_pinned_memory(&b.payload.metadata);
+        b_pin
+            .cmp(&a_pin)
+            .then_with(|| valid_from(b).cmp(&valid_from(a)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    if let Some(ranked) = relevance {
+        // A stable sort keeps the order above among unranked rules.
+        rules.sort_by_key(|r| relevance_rank(ranked, &r.id));
+    }
+    rules
+}
+
+/// Where `id` stands in a relevance ranking; unranked ids sort last.
+fn relevance_rank(ranked: &[String], id: &str) -> usize {
+    ranked.iter().position(|r| r == id).unwrap_or(usize::MAX)
+}
+
+/// A rule's first sentence on one line: the text up to the first `.`, `!` or
+/// `?` followed by whitespace or the end, when that comes within
+/// `max_chars`; otherwise the text cut at a word to at most `max_chars`
+/// characters, with "…" marking the cut.
+fn snapshot_rule_first_sentence(content: &str, max_chars: usize) -> String {
+    let one_line = snapshot_rule_one_line(content);
+    let chars: Vec<char> = one_line.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if i >= max_chars {
+            break;
+        }
+        if matches!(c, '.' | '!' | '?') && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) {
+            return chars[..=i].iter().collect();
+        }
+    }
+    if chars.len() <= max_chars {
+        return one_line;
+    }
+    let cut: String = chars[..max_chars].iter().collect();
+    let cut = match cut.rfind(' ') {
+        Some(space) if space > 0 => &cut[..space],
+        _ => cut.as_str(),
+    };
+    format!("{}…", cut.trim_end())
+}
+
+/// A list of rules picked once for the session-start surfaces and rendered
+/// twice: as a snapshot block and as lines of `.NeuroStrata/active_session.json`.
+/// `shown` holds each listed rule's id and text on one line, in order.
+struct RuleListing {
+    heading: String,
+    shown: Vec<(String, String)>,
+    total: usize,
+    /// The size of the heading and lines, as the limit measured it; 0 when
+    /// no rule is listed.
+    used: usize,
+}
+
+/// How much a rule listing may take. The default sizes count characters and
+/// let the rules block's first rule in even when it alone is longer; a
+/// caller's `max_bytes` counts UTF-8 bytes, as `context_plan`, `locate` and
+/// `object_view` do, and lets nothing past it.
+#[derive(Debug, Clone, Copy)]
+struct ListingLimit {
+    max: usize,
+    in_bytes: bool,
+    first_always_in: bool,
+}
+
+impl ListingLimit {
+    fn chars(max: usize, first_always_in: bool) -> Self {
+        ListingLimit {
+            max,
+            in_bytes: false,
+            first_always_in,
+        }
+    }
+
+    fn bytes(max: usize) -> Self {
+        ListingLimit {
+            max,
+            in_bytes: true,
+            first_always_in: false,
+        }
+    }
+
+    fn measure(&self, text: &str) -> usize {
+        if self.in_bytes {
+            text.len()
+        } else {
+            text.chars().count()
+        }
+    }
+}
+
+impl RuleListing {
+    fn ids(&self) -> Vec<String> {
+        self.shown.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    fn left_out(&self) -> usize {
+        self.total - self.shown.len()
+    }
+
+    /// The snapshot block: the heading, one "  - [rule] `id`: text" line per
+    /// rule, and a closing line counting the rules left out. Empty when there
+    /// is no rule.
+    fn render_block(&self) -> String {
+        if self.total == 0 {
+            return String::new();
+        }
+        let mut out = self.heading.clone();
+        for (id, text) in &self.shown {
+            out.push_str(&snapshot_rule_line(id, text));
+        }
+        if self.left_out() > 0 {
+            out.push_str(&format!(
+                "\n  ({} more: neurostrata_search_memory with memory_types [\"rule\"] finds them)",
+                self.left_out()
+            ));
+        }
+        out
+    }
+
+    /// The same rules as session file lines, in the Golden Rules line shape
+    /// `[rule] id: text`.
+    fn file_lines(&self) -> Vec<String> {
+        self.shown
+            .iter()
+            .map(|(id, text)| format!("[rule] {id}: {text}"))
+            .collect()
+    }
+}
+
+fn snapshot_rule_line(id: &str, text: &str) -> String {
+    format!("\n  - [rule] `{id}`: {text}")
+}
+
+/// Adds `candidates` (id, text) in order while the heading and lines stay
+/// within `limit`. With `first_always_in`, the first one goes in even when
+/// it alone is longer. A candidate that does not fit is skipped, never cut.
+fn fill_rule_listing(
+    heading: String,
+    candidates: Vec<(String, String)>,
+    limit: ListingLimit,
+) -> RuleListing {
+    let total = candidates.len();
+    let mut used = limit.measure(&heading);
+    let mut shown = Vec::new();
+    for (id, text) in candidates {
+        let line = limit.measure(&snapshot_rule_line(&id, &text));
+        let first = shown.is_empty() && limit.first_always_in;
+        if !first && used + line > limit.max {
+            continue;
+        }
+        used += line;
+        shown.push((id, text));
+    }
+    if shown.is_empty() {
+        used = 0;
+    }
+    RuleListing {
+        heading,
+        shown,
+        total,
+        used,
+    }
+}
+
+/// The rules block's pick: the namespace's `rule` rows, pinned first and then
+/// newest (`valid_from`), or by relevance to the session's task when
+/// `relevance` ranks them, each as its id and its whole text on one line.
+/// Rows already shown as Golden Rules and superseded rows are left out. Whole
+/// rules are added in that order while the heading and lines stay within
+/// `limit` (at the default size the first rule always goes in whole, even
+/// when it alone is longer). A rule that does not fit is left out, never cut.
+/// The heading says which order it is; "pinned first" only when pinned rules
+/// are listed, and how many.
+fn select_snapshot_rules(
+    rows: &[SearchResult],
+    skip_ids: &std::collections::HashSet<&str>,
+    limit: ListingLimit,
+    relevance: Option<&[String]>,
+) -> RuleListing {
+    let rules = snapshot_rules_in_order(rows, skip_ids, relevance);
+    let total = rules.len();
+    let pinned_heading = |pinned: usize| {
+        format!("### Rules of this namespace ({pinned} pinned first, then newest; {total} in all):")
+    };
+    let candidates = rules
+        .iter()
+        .map(|r| {
+            let content =
+                crate::rdf::provenance::decorate_content(&r.payload.content, &r.payload.metadata);
+            (r.id.clone(), snapshot_rule_one_line(&content))
+        })
+        .collect();
+    if relevance.is_some() {
+        let heading = format!(
+            "### Rules of this namespace (most relevant to this task first; {total} in all):"
+        );
+        return fill_rule_listing(heading, candidates, limit);
+    }
+    // Measured with the longest heading; the heading is then set from the
+    // rules listed, and is never longer than the one measured.
+    let mut listing = fill_rule_listing(pinned_heading(total), candidates, limit);
+    // "Pinned first" only when pinned rules are listed: in a project namespace
+    // a pinned rule is a Golden Rule and is not repeated here.
+    let listed: std::collections::HashSet<&str> =
+        listing.shown.iter().map(|(id, _)| id.as_str()).collect();
+    let pinned = rules
+        .iter()
+        .filter(|r| listed.contains(r.id.as_str()))
+        .filter(|r| crate::task::is_pinned_memory(&r.payload.metadata))
+        .count();
+    listing.heading = if pinned > 0 {
+        pinned_heading(pinned)
+    } else {
+        format!("### Rules of this namespace (newest first; {total} in all):")
+    };
+    listing
+}
+
+/// The "Also on record" pick: every rule the rules block left out
+/// (`listed_ids` are the ones it shows whole), in the block's order, each as
+/// its id and first sentence. Lines are added while the heading and lines stay
+/// within `limit`.
+fn select_snapshot_also_on_record(
+    rows: &[SearchResult],
+    skip_ids: &std::collections::HashSet<&str>,
+    listed_ids: &[String],
+    limit: ListingLimit,
+    relevance: Option<&[String]>,
+) -> RuleListing {
+    let listed: std::collections::HashSet<&str> = listed_ids.iter().map(String::as_str).collect();
+    let candidates: Vec<(String, String)> = snapshot_rules_in_order(rows, skip_ids, relevance)
+        .into_iter()
+        .filter(|r| !listed.contains(r.id.as_str()))
+        .map(|r| {
+            let content =
+                crate::rdf::provenance::decorate_content(&r.payload.content, &r.payload.metadata);
+            (
+                r.id.clone(),
+                snapshot_rule_first_sentence(&content, SNAPSHOT_FIRST_SENTENCE_MAX_CHARS),
+            )
+        })
+        .collect();
+    let total = candidates.len();
+    let heading = format!(
+        "### Also on record (first sentence only; neurostrata_get_memory(id) gives the whole rule; {total} in all):"
+    );
+    fill_rule_listing(heading, candidates, limit)
+}
+
+/// The snapshot's "Also on record" list (see `select_snapshot_also_on_record`),
+/// with a last line counting any left out. Empty when the block shows every
+/// rule.
+#[cfg(test)]
+fn format_snapshot_also_on_record(
+    rows: &[SearchResult],
+    skip_ids: &std::collections::HashSet<&str>,
+    listed_ids: &[String],
+    max_chars: usize,
+) -> String {
+    select_snapshot_also_on_record(
+        rows,
+        skip_ids,
+        listed_ids,
+        ListingLimit::chars(max_chars, false),
+        None,
+    )
+    .render_block()
+}
+
+/// The snapshot's rules block (see `select_snapshot_rules`), in the same line
+/// shape as the Golden Rules block, with a last line counting the rules left
+/// out. Returns the block (empty when there is no rule to show) and the ids it
+/// lists.
+#[cfg(test)]
+fn format_snapshot_rules_block(
+    rows: &[SearchResult],
+    skip_ids: &std::collections::HashSet<&str>,
+    max_chars: usize,
+) -> (String, Vec<String>) {
+    let listing = select_snapshot_rules(rows, skip_ids, ListingLimit::chars(max_chars, true), None);
+    (listing.render_block(), listing.ids())
+}
+
+/// The Golden Rules a budget keeps: whole, by first sentence (type, id,
+/// first sentence), or left out; `over_share` when the whole set is over
+/// its share of the budget; `used` the bytes the kept lines take.
+#[derive(Default)]
+struct GoldenFit {
+    whole: Vec<SearchResult>,
+    first_sentence: Vec<(String, String, String)>,
+    left_out_ids: Vec<String>,
+    over_share: bool,
+    used: usize,
+}
+
+/// Fits the Golden Rules into `limit` bytes (at most their `share` of the
+/// budget). When every rule fits whole, all go in whole. Otherwise every rule
+/// is listed by first sentence while those fit, in relevance order
+/// (`relevance`, else the Golden Rules' own order), and then the most
+/// relevant are shown whole while the limit allows; the rest stay by first
+/// sentence or, past the limit, are left out. Nothing is cut.
+fn fit_golden_rules(
+    golden: &[SearchResult],
+    limit: usize,
+    share: usize,
+    relevance: Option<&[String]>,
+) -> GoldenFit {
+    let whole_cost = |r: &SearchResult| crate::task::golden_rule_file_line(r, true).len() + 1;
+    let total: usize = golden.iter().map(whole_cost).sum();
+    let over_share = total > share;
+    if total <= limit {
+        return GoldenFit {
+            whole: golden.to_vec(),
+            over_share,
+            used: total,
+            ..GoldenFit::default()
+        };
+    }
+    let mut ranked: Vec<&SearchResult> = golden.iter().collect();
+    if let Some(order) = relevance {
+        ranked.sort_by_key(|r| relevance_rank(order, &r.id));
+    }
+    let first_sentence = |r: &SearchResult| {
+        snapshot_rule_first_sentence(&r.payload.content, SNAPSHOT_FIRST_SENTENCE_MAX_CHARS)
+    };
+    let first_cost = |r: &SearchResult| {
+        format!(
+            "[{}] {}: {}",
+            r.payload.memory_type,
+            r.id,
+            first_sentence(r)
+        )
+        .len()
+            + 1
+    };
+    let mut used = 0;
+    let mut left_out_ids = Vec::new();
+    let mut listed: Vec<(&SearchResult, bool)> = Vec::new();
+    for r in ranked {
+        if used + first_cost(r) <= limit {
+            used += first_cost(r);
+            listed.push((r, false));
+        } else {
+            left_out_ids.push(r.id.clone());
+        }
+    }
+    for (r, whole) in listed.iter_mut() {
+        let extra = whole_cost(r).saturating_sub(first_cost(r));
+        if used + extra <= limit {
+            used += extra;
+            *whole = true;
+        }
+    }
+    GoldenFit {
+        whole: listed
+            .iter()
+            .filter(|(_, whole)| *whole)
+            .map(|(r, _)| (*r).clone())
+            .collect(),
+        first_sentence: listed
+            .iter()
+            .filter(|(_, whole)| !*whole)
+            .map(|(r, _)| {
+                (
+                    r.payload.memory_type.clone(),
+                    r.id.clone(),
+                    first_sentence(r),
+                )
+            })
+            .collect(),
+        left_out_ids,
+        over_share,
+        used,
+    }
+}
+
+/// The session-start content, picked once for the snapshot reply and
+/// `.NeuroStrata/active_session.json`: the Golden Rules kept whole and by
+/// first sentence, the rules block and the "Also on record" list (None when
+/// not requested) and the session file's rule fields.
+struct SessionStartPick {
+    golden: Vec<SearchResult>,
+    golden_first_sentence: Vec<(String, String, String)>,
+    rules: Option<RuleListing>,
+    also: Option<RuleListing>,
+    fields: crate::task::SessionRules,
+}
+
+/// Picks the session-start content. `rows` are the namespace's visible,
+/// unexpired rows; `golden_rules` the Golden Rules (never repeated as
+/// namespace rules); `task` the sizes of the session's task context;
+/// `relevance` the rows ranked by relevance to the task, best first (None
+/// without a task: rules stay newest first).
+///
+/// `sections` names the parts to fill, in order (None: handoff, task line,
+/// task block, Golden Rules, rules, "Also on record"). A part not named is
+/// not filled and not counted as left out.
+///
+/// Without `max_bytes` the default sizes apply: every Golden Rule, rules up to
+/// `SNAPSHOT_RULES_MAX_CHARS` (the first always in) and "Also on record" up to
+/// `SNAPSHOT_ALSO_ON_RECORD_MAX_CHARS`.
+///
+/// With `max_bytes` (the caller's budget, named and counted in UTF-8 bytes as
+/// `context_plan`'s) the sections are filled in their order, whole lines
+/// only: a part or line that does not fit is left out, never cut, and the
+/// next one is tried; the left-out counts report the truncation. Golden Rules
+/// take at most half the budget (see `fit_golden_rules`), and that share is
+/// reserved before anything else is fitted, so a long handoff note cannot
+/// crowd them out; they keep their place in the output order.
+fn pick_session_start(
+    rows: &[SearchResult],
+    golden_rules: &[SearchResult],
+    task: crate::task::SessionTaskParts,
+    relevance: Option<&[String]>,
+    max_bytes: Option<usize>,
+    sections: Option<&[crate::task::SessionSection]>,
+) -> SessionStartPick {
+    use crate::task::SessionSection;
+    let skip_ids: std::collections::HashSet<&str> =
+        golden_rules.iter().map(|r| r.id.as_str()).collect();
+    let order: &[SessionSection] = sections.unwrap_or(&SessionSection::DEFAULT_ORDER);
+    let mut task_fit = crate::task::SessionTaskFit::default();
+    let mut golden = GoldenFit::default();
+    let mut rules: Option<RuleListing> = None;
+    let mut also: Option<RuleListing> = None;
+    let mut left = max_bytes;
+    // The Golden Rules' share is set aside first (whole, most relevant
+    // first, within half the budget); the other sections fit in what is
+    // left, in the caller's order.
+    let golden_named = order.contains(&SessionSection::GoldenRules);
+    if let (true, Some(budget)) = (golden_named, max_bytes) {
+        golden = fit_golden_rules(golden_rules, budget / 2, budget / 2, relevance);
+        left = Some(budget.saturating_sub(golden.used));
+    }
+    for &section in order {
+        match section {
+            SessionSection::Handoff | SessionSection::TaskLine | SessionSection::TaskBlock => {
+                let (bytes, left_out) = match section {
+                    SessionSection::Handoff => (task.handoff, &mut task_fit.handoff_left_out),
+                    SessionSection::TaskLine => (task.line, &mut task_fit.line_left_out),
+                    _ => (task.block, &mut task_fit.block_left_out),
+                };
+                if let Some(room) = left.as_mut() {
+                    if bytes <= *room {
+                        *room -= bytes;
+                    } else {
+                        *left_out = true;
+                    }
+                }
+            }
+            SessionSection::GoldenRules => {
+                // Under a budget they were fitted above, from their share.
+                if max_bytes.is_none() {
+                    golden = GoldenFit {
+                        whole: golden_rules.to_vec(),
+                        ..GoldenFit::default()
+                    };
+                }
+            }
+            SessionSection::Rules => {
+                let limit = match left {
+                    Some(room) => ListingLimit::bytes(room),
+                    None => ListingLimit::chars(SNAPSHOT_RULES_MAX_CHARS, true),
+                };
+                let listing = select_snapshot_rules(rows, &skip_ids, limit, relevance);
+                if let Some(room) = left.as_mut() {
+                    *room = room.saturating_sub(listing.used);
+                }
+                rules = Some(listing);
+            }
+            SessionSection::AlsoOnRecord => {
+                let limit = match left {
+                    Some(room) => ListingLimit::bytes(room),
+                    None => ListingLimit::chars(SNAPSHOT_ALSO_ON_RECORD_MAX_CHARS, false),
+                };
+                let listed = rules.as_ref().map(RuleListing::ids).unwrap_or_default();
+                let listing =
+                    select_snapshot_also_on_record(rows, &skip_ids, &listed, limit, relevance);
+                if let Some(room) = left.as_mut() {
+                    *room = room.saturating_sub(listing.used);
+                }
+                also = Some(listing);
+            }
+        }
+    }
+    // Every rule left out entirely (not whole, not by first sentence), so a
+    // reader can fetch it later: Golden Rules past the limit, then the
+    // namespace's rules neither section shows (only when one of them was
+    // named), most relevant first.
+    let mut left_out_rule_ids = golden.left_out_ids.clone();
+    if rules.is_some() || also.is_some() {
+        let shown: std::collections::HashSet<&str> = rules
+            .iter()
+            .chain(also.iter())
+            .flat_map(|listing| listing.shown.iter().map(|(id, _)| id.as_str()))
+            .collect();
+        left_out_rule_ids.extend(
+            snapshot_rules_in_order(rows, &skip_ids, relevance)
+                .into_iter()
+                .filter(|r| !shown.contains(r.id.as_str()))
+                .map(|r| r.id.clone()),
+        );
+    }
+    if let Some(ranked) = relevance {
+        left_out_rule_ids.sort_by_key(|id| relevance_rank(ranked, id));
+    }
+    // The same rules by first sentence, in the same order and the "Also on
+    // record" line shape, from the rows already in hand. Outside the fit:
+    // the file only.
+    let left_out_first_sentences: Vec<String> = left_out_rule_ids
+        .iter()
+        .filter_map(|id| golden_rules.iter().chain(rows.iter()).find(|r| &r.id == id))
+        .map(|r| {
+            let content =
+                crate::rdf::provenance::decorate_content(&r.payload.content, &r.payload.metadata);
+            format!(
+                "[{}] {}: {}",
+                r.payload.memory_type,
+                r.id,
+                snapshot_rule_first_sentence(&content, SNAPSHOT_FIRST_SENTENCE_MAX_CHARS)
+            )
+        })
+        .collect();
+    let fields = crate::task::SessionRules {
+        namespace_rules: rules
+            .as_ref()
+            .map(RuleListing::file_lines)
+            .unwrap_or_default(),
+        namespace_rules_left_out: rules.as_ref().map_or(0, RuleListing::left_out),
+        also_on_record: also
+            .as_ref()
+            .map(RuleListing::file_lines)
+            .unwrap_or_default(),
+        also_on_record_left_out: also.as_ref().map_or(0, RuleListing::left_out),
+        left_out_rule_ids,
+        left_out_first_sentences,
+        max_bytes,
+        sections: sections.map(<[SessionSection]>::to_vec),
+        golden_rules_left_out: golden.left_out_ids.len(),
+        golden_rules_first_sentence: golden
+            .first_sentence
+            .iter()
+            .map(|(memory_type, id, text)| format!("[{memory_type}] {id}: {text}"))
+            .collect(),
+        golden_rules_over_share: golden.over_share,
+        task: task_fit,
+    };
+    SessionStartPick {
+        golden: golden.whole,
+        golden_first_sentence: golden.first_sentence,
+        rules,
+        also,
+        fields,
+    }
+}
+
+/// The snapshot's Golden Rules section for a pick: the rules kept whole (cut
+/// to 280 characters without a budget, as before), then the ones listed by
+/// first sentence, the over-share notice, and a count of any left out.
+fn render_golden_section(pick: &SessionStartPick) -> String {
+    let fields = &pick.fields;
+    let mut out =
+        crate::task::format_golden_rules_section(&pick.golden, fields.max_bytes.is_some());
+    let mut push_line = |line: String| {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&line);
+    };
+    if !pick.golden_first_sentence.is_empty() {
+        push_line(
+            "  Also pinned (first sentence only; neurostrata_get_memory(id) gives the whole rule):"
+                .to_string(),
+        );
+        for (memory_type, id, text) in &pick.golden_first_sentence {
+            push_line(format!("  - [{memory_type}] `{id}`: {text}"));
+        }
+    }
+    if fields.golden_rules_over_share {
+        push_line(format!("  {}", crate::task::GOLDEN_RULES_OVER_SHARE_NOTICE));
+    }
+    if fields.golden_rules_left_out > 0 {
+        push_line(format!(
+            "  ({} Golden Rules left out by max_bytes: neurostrata_get_snapshot without max_bytes shows them)",
+            fields.golden_rules_left_out
+        ));
+    }
+    out
+}
+
+/// The session file's content for a task tool (claim, update) that has no
+/// snapshot rows at hand: reads the rows the snapshot reads, with its filters
+/// (archived rows left out), ranks them by relevance to `active_task`, and
+/// picks with the snapshot's code in the default section order, fitted to
+/// `max_bytes` when the file has one. Returns the Golden Rules kept whole and
+/// the rule fields; None when the read fails.
+pub(crate) async fn session_rules_from_store(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    golden_rules: &[SearchResult],
+    active_task: (&str, &crate::traits::MemoryPayload),
+    max_bytes: Option<usize>,
+) -> Option<(Vec<SearchResult>, crate::task::SessionRules)> {
+    let now = chrono::Utc::now().timestamp();
+    let mut rows = store
+        .list_excluding_types(namespace, SNAPSHOT_SKIPPED_TYPES)
+        .await
+        .ok()?;
+    rows.retain(|r| snapshot_row_visible(r, false) && snapshot_row_unexpired(r, now));
+    // The ranking the task's claim saved: no search here.
+    let relevance = crate::task::task_relevant_rule_ids(active_task.1);
+    let pick = pick_session_start(
+        &rows,
+        golden_rules,
+        crate::task::session_task_parts(Some(active_task)),
+        relevance.as_deref(),
+        max_bytes,
+        None,
+    );
+    Some((pick.golden, pick.fields))
+}
+
 /// What to tell an agent when this namespace still holds ids written before
 /// they carried a namespace, or None when there is nothing to say.
 ///
 /// It rides on get_snapshot because that is the one call an agent is required
-/// to make at the start of a task, and because the snapshot has already fetched
-/// the list this counts from. `doctor` reports the same condition, but doctor
+/// to make at the start of a task. `doctor` reports the same condition, but doctor
 /// only runs with the daemon stopped, so an agent in a session would otherwise
 /// never learn of it -- and an agent is the only party present to raise it.
 ///
@@ -6241,6 +6947,9 @@ async fn handle_get_snapshot(
         .get("namespace")
         .and_then(|n| n.as_str())
         .ok_or_else(|| "Missing 'namespace' parameter.".to_string())?;
+    // The session-start sections the caller wants, in its order; checked
+    // before anything is read.
+    let sections = crate::task::parse_session_sections(arguments.get("sections"))?;
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
@@ -6303,12 +7012,14 @@ async fn handle_get_snapshot(
         crate::registry::cache_project_root_unless_marked(&store, None, namespace, pr).await;
     }
 
-    // Fetch all memories first so hook hygiene can infer a git root when none
-    // was explicitly provided or cached.
+    // Fetch the memories first so hook hygiene can infer a git root when none
+    // was explicitly provided or cached. The types in SNAPSHOT_SKIPPED_TYPES
+    // stay in the store; the parts below that look at every row read their
+    // own rows.
     let mut all_memories = store
-        .list(namespace, None, None)
+        .list_excluding_types(namespace, SNAPSHOT_SKIPPED_TYPES)
         .await
-        .map_err(|_| "Failed to list memories or namespace does not exist.".to_string())?;
+        .map_err(|_| SNAPSHOT_LIST_ERROR.to_string())?;
 
     // Hook hygiene: auto-heal missing/stale pre-push hook (best-effort).
     // When no project_root is available, infer one from directory memories
@@ -6356,9 +7067,26 @@ async fn handle_get_snapshot(
     // The registry row is metadata, not knowledge: never serve it.
     all_memories.retain(|r| !crate::registry::is_registry_row(&r.payload.metadata));
 
-    // Counted from the list the snapshot already had to fetch, so this
-    // costs nothing beyond the scan.
-    let migration = unmigrated_ids_notice(namespace, &all_memories);
+    // Unqualified ids get their own narrow read, which is empty on a migrated
+    // namespace. Only when it finds one are all ingested rows read, so the
+    // notice's "{stale} of {total}" stays exact.
+    let unqualified = store
+        .list_unqualified_ingested(namespace)
+        .await
+        .map_err(|_| SNAPSHOT_LIST_ERROR.to_string())?;
+    let migration = if unqualified
+        .iter()
+        .any(|r| snapshot_row_visible(r, include_archived))
+    {
+        let mut ingested = store
+            .list(namespace, Some("auto-ingestor"), None)
+            .await
+            .map_err(|_| SNAPSHOT_LIST_ERROR.to_string())?;
+        ingested.retain(|r| snapshot_row_visible(r, include_archived));
+        unmigrated_ids_notice(namespace, &ingested)
+    } else {
+        None
+    };
     // Computed before the top-5 cut below: tasks are never the highest-access
     // rows, and section 6.1 requires the Zero-Action Start header on every
     // snapshot regardless of what the body holds.
@@ -6386,13 +7114,17 @@ async fn handle_get_snapshot(
     } else {
         crate::tools::procedure::procedures_due_strap(&all_memories, now)
     };
-    all_memories.retain(|r| match r.payload.metadata.get("valid_to") {
-        None => true,
-        Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
-    });
+    all_memories.retain(|r| snapshot_row_unexpired(r, now));
     // Capability C: advisory freshness SLA scan over ALL active visible rows,
-    // computed before the top-5 truncation. Never blocks anything.
-    let stale_memory_rows = crate::task::gate::stale_memory_violations(&all_memories, now);
+    // computed before the top-5 truncation. Never blocks anything. Only rows
+    // that mention stale_after can be flagged, so those are read, of any type.
+    let mut stale_input = store
+        .list_metadata_containing(namespace, "stale_after")
+        .await
+        .map_err(|_| SNAPSHOT_LIST_ERROR.to_string())?;
+    stale_input
+        .retain(|r| snapshot_row_visible(r, include_archived) && snapshot_row_unexpired(r, now));
+    let stale_memory_rows = crate::task::gate::stale_memory_violations(&stale_input, now);
     let stale_section = if stale_memory_rows.is_empty() {
         String::new()
     } else {
@@ -6406,30 +7138,122 @@ async fn handle_get_snapshot(
     };
     // Computed off the pre-truncation list too: global and pinned Golden Rules
     // must surface regardless of whether they made the top-5 by access_count.
+    // A pinned row of any type qualifies, and in global so does any rule row,
+    // so these rows come from their own read, filtered like the main one.
+    let mut golden_input = if namespace == "global" {
+        store.list(namespace, None, None).await
+    } else {
+        store.list_pinned(namespace).await
+    }
+    .map_err(|_| SNAPSHOT_LIST_ERROR.to_string())?;
+    golden_input
+        .retain(|r| snapshot_row_visible(r, include_archived) && snapshot_row_unexpired(r, now));
     let golden_rules =
-        crate::task::collect_golden_rules(&store, namespace, Some(&all_memories)).await;
-    let golden_section = crate::task::format_golden_rules_section(&golden_rules);
+        crate::task::collect_golden_rules(&store, namespace, Some(&golden_input)).await;
+    // The caller's budget for the session-start content, in UTF-8 bytes as
+    // context_plan's `max_bytes`. Absent: the default sizes.
+    let max_bytes = arguments
+        .get("max_bytes")
+        .and_then(|v| v.as_u64())
+        .map(|b| b as usize);
+    // This worktree's own in-progress task, as `task::active_task_for_root`
+    // picks it: never one claimed in another worktree, or its Breath note
+    // would land in this session. An archived task is never active.
+    let is_active = |m: &SearchResult| {
+        m.payload.memory_type == "task"
+            && !crate::handlers::archive_memory::is_archived(&m.payload)
+            && m.payload
+                .metadata
+                .get("task")
+                .and_then(|t| t.get("status"))
+                .and_then(|v| v.as_str())
+                == Some("in_progress")
+    };
+    let active_task = inferred_root.as_ref().and_then(|root_str| {
+        crate::task::active_task_for_root(&all_memories, root_str, is_active)
+            .map(|m| (m.id.as_str(), &m.payload))
+    });
+    // The Golden Rules, the namespace's rules whole and labeled, and the ones
+    // that did not fit whole, by first sentence, so none goes unseen. Golden
+    // Rules are not repeated as namespace rules. With an active task the
+    // rules are ranked by the relevance its claim saved. With
+    // `max_bytes` (and `sections`) the reply and the session file get the
+    // same fitted pick; `max_bytes` bounds the session file's content, and
+    // the reply shows the same lines.
+    let golden_ids: std::collections::HashSet<&str> =
+        golden_rules.iter().map(|r| r.id.as_str()).collect();
+    // The rule ranking the task's claim saved on its row: session start runs
+    // no search of its own (a search here cost seconds on a large store).
+    let relevance =
+        active_task.and_then(|(_, payload)| crate::task::task_relevant_rule_ids(payload));
+    let task_parts = crate::task::session_task_parts(active_task);
+    let reply_pick = pick_session_start(
+        &all_memories,
+        &golden_rules,
+        task_parts,
+        relevance.as_deref(),
+        max_bytes,
+        sections.as_deref(),
+    );
+    let golden_section = render_golden_section(&reply_pick);
+    let rules_section = reply_pick
+        .rules
+        .as_ref()
+        .map(RuleListing::render_block)
+        .unwrap_or_default();
+    let rules_section_ids = reply_pick
+        .rules
+        .as_ref()
+        .map(RuleListing::ids)
+        .unwrap_or_default();
+    let also_on_record_section = reply_pick
+        .also
+        .as_ref()
+        .map(RuleListing::render_block)
+        .unwrap_or_default();
+    // Named sections without the rules and "Also on record": the reply has
+    // no rules body.
+    let rules_requested = sections.as_ref().is_none_or(|s| {
+        s.contains(&crate::task::SessionSection::Rules)
+            || s.contains(&crate::task::SessionSection::AlsoOnRecord)
+    });
     if let Some(root_str) = &inferred_root {
-        let is_active = |m: &SearchResult| {
-            m.payload.memory_type == "task"
-                && m.payload
-                    .metadata
-                    .get("task")
-                    .and_then(|t| t.get("status"))
-                    .and_then(|v| v.as_str())
-                    == Some("in_progress")
+        let root = std::path::Path::new(root_str);
+        // The session file is fitted to the caller's budget, else to the one
+        // it was last fitted to, so it never claims a budget it exceeds. It is
+        // startup guidance for later sessions: an audit snapshot
+        // (`include_archived`) may show archived rows in its reply, but the
+        // file gets the pick from live rows only, as claim and update write it
+        // (Golden Rules are live rows already: collect_golden_rules skips
+        // archived ones).
+        let file_max_bytes = max_bytes.or_else(|| crate::task::session_file_max_bytes(root));
+        let file_pick = if include_archived || file_max_bytes != max_bytes {
+            let live: Vec<SearchResult> = all_memories
+                .iter()
+                .filter(|r| !crate::handlers::archive_memory::is_archived(&r.payload))
+                .cloned()
+                .collect();
+            pick_session_start(
+                &live,
+                &golden_rules,
+                task_parts,
+                relevance.as_deref(),
+                file_max_bytes,
+                sections.as_deref(),
+            )
+        } else {
+            reply_pick
         };
-        let active_task = crate::task::active_task_for_root(&all_memories, root_str, is_active)
-            .map(|m| m.id.clone());
         // Serialized with claims and with the cleanup after a task ends; a
         // task is named only if its row is still in progress at write time.
         crate::task::refresh_active_session_file(
             &store,
-            std::path::Path::new(root_str),
+            root,
             namespace,
-            &golden_rules,
+            &file_pick.golden,
             None,
-            active_task.as_deref(),
+            active_task.map(|(id, _)| id),
+            Some(&file_pick.fields),
         )
         .await;
     }
@@ -6470,24 +7294,7 @@ async fn handle_get_snapshot(
         }
         r
     };
-    all_memories.sort_by(|a, b| {
-        let a_count = a
-            .payload
-            .metadata
-            .get("access_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let b_count = b
-            .payload
-            .metadata
-            .get("access_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        b_count.cmp(&a_count)
-    });
-
-    // The top-5 ids are captured BEFORE the strap so a row appears once.
-    let top5_ids: Vec<String> = all_memories.iter().take(5).map(|r| r.id.clone()).collect();
+    all_memories.sort_by(snapshot_access_count_desc);
 
     // Domain strap mode.
     let domain_arg = arguments.get("domain");
@@ -6510,10 +7317,11 @@ async fn handle_get_snapshot(
         _ => ("explicit", Vec::new()),
     };
 
-    // Build strap candidates off the pre-truncation list.
+    // Build strap candidates off the pre-truncation list. A rule the rules
+    // block lists is not repeated in the strap.
     let mut candidates: Vec<&crate::traits::SearchResult> = all_memories
         .iter()
-        .filter(|r| !top5_ids.contains(&r.id))
+        .filter(|r| !rules_section_ids.contains(&r.id))
         .filter(|r| {
             !matches!(
                 r.payload.memory_type.as_str(),
@@ -6694,13 +7502,23 @@ async fn handle_get_snapshot(
     let mut doctor_report: Option<String> = None;
     let mut hygiene_ok = true;
     if trigger {
-        let known =
-            crate::store::ladybug::KnownIds::new(all_memories.iter().map(|m| m.id.as_str()));
+        // The doctor checks every row, so it reads the whole namespace, with
+        // the main read's filters and order. It runs on a version change, every
+        // 20th session or weekly, not on every snapshot.
+        let mut doctor_rows = store
+            .list(namespace, None, None)
+            .await
+            .map_err(|_| SNAPSHOT_LIST_ERROR.to_string())?;
+        doctor_rows.retain(|r| {
+            snapshot_row_visible(r, include_archived) && snapshot_row_unexpired(r, now)
+        });
+        doctor_rows.sort_by(snapshot_access_count_desc);
+        let known = crate::store::ladybug::KnownIds::new(doctor_rows.iter().map(|m| m.id.as_str()));
         let mut unqualified_ingested = 0usize;
         let mut resolvable = 0usize;
         let mut missing = 0usize;
         let mut missing_samples: Vec<String> = Vec::new();
-        for m in &all_memories {
+        for m in &doctor_rows {
             if m.payload.user_id == "auto-ingestor"
                 && !crate::parser::ingest::is_qualified(namespace, &m.id)
             {
@@ -6816,11 +7634,11 @@ async fn handle_get_snapshot(
             }
         }
         // Check if ingested symbol nodes predate the AST call-graph schema.
-        let symbol_count = all_memories
+        let symbol_count = doctor_rows
             .iter()
             .filter(|m| m.payload.user_id == "auto-ingestor" && m.payload.memory_type == "symbol")
             .count();
-        let symbols_with_calls = all_memories
+        let symbols_with_calls = doctor_rows
             .iter()
             .filter(|m| {
                 m.payload.user_id == "auto-ingestor"
@@ -6870,28 +7688,29 @@ async fn handle_get_snapshot(
     // Remove community summaries from all_memories so they don't compete for top-5.
     all_memories.retain(|r| r.payload.memory_type != "community_summary");
 
-    all_memories.truncate(5);
+    let has_memories = !all_memories.is_empty();
 
-    let body = if all_memories.is_empty() {
-        format!("No active memories found for namespace: {}", namespace)
+    // The rules block replaces the five rows with the highest access_count,
+    // which were sent whole as JSON with their metadata and were most of the
+    // reply. A rule's own text (decorated like other recall surfaces) is
+    // what an agent needs at session start.
+    let body = if !rules_requested {
+        String::new()
+    } else if !rules_section.is_empty() || !also_on_record_section.is_empty() {
+        [rules_section, also_on_record_section]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else if has_memories && golden_ids.is_empty() {
+        "### Rules of this namespace (0): none".to_string()
+    } else if has_memories {
+        "### Rules of this namespace (0): none besides the Golden Rules above".to_string()
     } else {
-        // Capability C: snapshot rows carry the same structured presentation
-        // and prepended banner as search/file/related rows.
-        let mut rows: Vec<serde_json::Value> = all_memories
-            .iter()
-            .filter_map(|r| serde_json::to_value(r).ok())
-            .collect();
-        for (row, source) in rows.iter_mut().zip(all_memories.iter()) {
-            if let Some(payload) = row.get_mut("payload") {
-                crate::rdf::provenance::attach_presentation(
-                    payload,
-                    &source.payload.metadata,
-                    "content",
-                );
-            }
-        }
-        serde_json::to_string_pretty(&rows)
-            .map_err(|e| format!("Internal serialization error: {}", e))?
+        format!(
+            "No active knowledge rows (rules, facts, decisions, tasks) found for namespace: {}",
+            namespace
+        )
     };
     // Communities (N) section (§5.6): render when communities exist.
     let communities_section = if communities_rows.is_empty() {
@@ -6967,8 +7786,8 @@ async fn handle_get_snapshot(
                 std::collections::HashMap::new();
             for m in &members {
                 if let Some(mid) = m.as_str() {
-                    // Search all_memories (untruncated, pre-truncate list would have included community summaries but they're removed now)
-                    // communities_rows already contains them; find member memory types
+                    // all_memories holds the namespace's knowledge rows (not
+                    // the code graph or doc sections), untruncated.
                     if let Some(mem_row) = all_memories.iter().find(|r| r.id == mid) {
                         if let Some(mt) = mem_row.payload.metadata.get("domain") {
                             if let Some(d) = mt.as_str() {
@@ -7129,7 +7948,9 @@ async fn handle_get_snapshot(
         parts.push(pending_task_candidates);
     }
     parts.push(domain_strap.to_string());
-    parts.push(body.to_string());
+    if !body.is_empty() {
+        parts.push(body);
+    }
     let snapshot = parts.join("\n");
     let snapshot = match migration {
         Some(notice) => format!("{}\n\n{}", snapshot, notice),
@@ -23335,6 +24156,86 @@ mod tests {
         );
     }
 
+    /// The snapshot's main read leaves the ingested code graph and guard
+    /// events in the store. The parts that look at every row must still see
+    /// them: Golden Rules, stale rows, the migration notice and the doctor.
+    #[tokio::test]
+    async fn the_snapshot_still_sees_skipped_types_where_every_row_counts() {
+        let (store, _rule_id) = store_with_one_rule("probe").await;
+        let code_id = crate::parser::ingest::qualified_id("probe", "src/a.rs::hot");
+        let pinned_id = crate::parser::ingest::qualified_id("probe", "docs/a.md#pinned");
+        let row = |memory_type: &str, user_id: &str, metadata: Value| MemoryPayload {
+            content: format!("a {memory_type} row"),
+            user_id: user_id.to_string(),
+            memory_type: memory_type.to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        };
+        let governs = serde_json::json!({ "governs": [code_id.clone()] });
+        for (id, payload) in [
+            (
+                code_id.clone(),
+                row(
+                    "code_ast",
+                    "auto-ingestor",
+                    serde_json::json!({ "access_count": 100 }),
+                ),
+            ),
+            (
+                "src/legacy.rs".to_string(),
+                row("file", "auto-ingestor", serde_json::json!({})),
+            ),
+            (
+                pinned_id.clone(),
+                row(
+                    "doc_section",
+                    "auto-ingestor",
+                    serde_json::json!({ "pinned": true }),
+                ),
+            ),
+            (
+                "old-guard-event".to_string(),
+                row(
+                    "guard_event",
+                    "guard",
+                    serde_json::json!({ "stale_after": "2000-01-01T00:00:00Z" }),
+                ),
+            ),
+            ("governing-rule".to_string(), row("rule", "tester", governs)),
+        ] {
+            store
+                .upsert("probe", &id, vec![0.1; 4], payload)
+                .await
+                .expect("seed");
+        }
+
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+        let mut missing = Vec::new();
+        if !text.contains(&format!("`{pinned_id}`")) {
+            missing.push("a pinned doc_section is a Golden Rule");
+        }
+        if !text.contains("old-guard-event [stale_memories]") {
+            missing.push("a guard_event past stale_after is flagged");
+        }
+        if !text.contains("1 of 3 ingested ids") {
+            missing.push("the migration notice counts every ingested row");
+        }
+        if text.contains("declared targets matching nothing") {
+            missing.push("the doctor resolves an edge into a code_ast row");
+        }
+        if !text.contains("DOCTOR REPORT") {
+            missing.push("the doctor ran (it reports the unqualified id)");
+        }
+        if text.contains("a code_ast row") {
+            missing.push("behavior change: a code_ast row is not in the top 5");
+        }
+        assert!(missing.is_empty(), "{missing:?}\n{text}");
+    }
+
     // ---- archived filter across the read surfaces -----------------------
     //
     // `archive_memory` writes the tombstone; the read surfaces must now hide
@@ -24173,11 +25074,57 @@ mod tests {
         assert_eq!(after["task_id"], serde_json::json!(id), "the new claim stays: {after}");
         assert_eq!(after["session_id"], serde_json::json!("ses_b"), "{after}");
 
+        // The snapshot keeps only a task claimed in its own worktree (the
+        // claim above stamped the test process's checkout), so the new claim
+        // is made in this one.
+        let (task_vec, mut task_row) = store.get("probe", &id).await.unwrap().unwrap();
+        task_row.metadata["task"]["worktree"] =
+            serde_json::json!(crate::task::resolve_session_root_dir(&proj_root).to_string_lossy());
+        store
+            .upsert("probe", &id, task_vec, task_row)
+            .await
+            .unwrap();
         // A snapshot that saw no task in progress before the claim landed.
-        crate::task::refresh_active_session_file(&store, &proj_root, "probe", &[], None, None).await;
+        crate::task::refresh_active_session_file(
+            &store,
+            &proj_root,
+            "probe",
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await;
         let after = read_session();
         assert_eq!(after["task_id"], serde_json::json!(id), "the snapshot keeps it too: {after}");
         assert_eq!(after["status"], serde_json::json!("in_progress"), "{after}");
+
+        // A task the file names but claimed in another worktree is dropped.
+        let elsewhere =
+            std::env::temp_dir().join(format!("ns-session-other-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(elsewhere.join(".git")).unwrap();
+        let (task_vec, mut task_row) = store.get("probe", &id).await.unwrap().unwrap();
+        task_row.metadata["task"]["worktree"] = serde_json::json!(elsewhere.to_string_lossy());
+        store
+            .upsert("probe", &id, task_vec, task_row)
+            .await
+            .unwrap();
+        crate::task::refresh_active_session_file(
+            &store,
+            &proj_root,
+            "probe",
+            &[],
+            None,
+            None,
+            None,
+        )
+        .await;
+        let after = read_session();
+        assert!(
+            after.get("task_id").is_none(),
+            "another worktree's task stays: {after}"
+        );
+        let _ = std::fs::remove_dir_all(&elsewhere);
         let _ = std::fs::remove_dir_all(&proj_root);
     }
 
@@ -24221,7 +25168,7 @@ mod tests {
         assert!(read_session().get("task_id").is_none(), "cleanup: {}", read_session());
 
         std::fs::write(&session_file, stale.to_string()).unwrap();
-        crate::task::refresh_active_session_file(&store, &old_root, "probe", &[], None, None).await;
+        crate::task::refresh_active_session_file(&store, &old_root, "probe", &[], None, None, None).await;
         assert!(read_session().get("task_id").is_none(), "snapshot: {}", read_session());
         let _ = std::fs::remove_dir_all(&old_root);
     }
@@ -24757,6 +25704,1070 @@ mod tests {
         // At most 2 from the one domain.
         let domain_count = text.matches("\"domain\": \"auth\"").count();
         assert!(domain_count <= 2, "at most 2 from one domain: {text}");
+    }
+
+    // ── Snapshot rules block ─────────────────────────────────────────
+
+    fn rules_block_row(
+        id: &str,
+        memory_type: &str,
+        content: &str,
+        metadata: Value,
+    ) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            score: 1.0,
+            payload: MemoryPayload {
+                metadata,
+                memory_type: memory_type.to_string(),
+                ..payload(content)
+            },
+            evidence: None,
+        }
+    }
+
+    /// The shape the Claude plugin parses Golden Rules lines with; the rules
+    /// block uses the same shape.
+    fn is_rule_line(line: &str) -> bool {
+        let Some(rest) = line.trim_start().strip_prefix("- [") else {
+            return false;
+        };
+        let Some((_kind, rest)) = rest.split_once("] `") else {
+            return false;
+        };
+        rest.split_once("`: ").is_some()
+    }
+
+    #[test]
+    fn the_rules_block_lists_pinned_rules_first_then_the_newest() {
+        let rows = vec![
+            rules_block_row(
+                "old",
+                "rule",
+                "old rule",
+                serde_json::json!({ "valid_from": 100 }),
+            ),
+            rules_block_row(
+                "new",
+                "rule",
+                "new rule",
+                serde_json::json!({ "valid_from": 300 }),
+            ),
+            rules_block_row(
+                "pinned-old",
+                "rule",
+                "pinned rule",
+                serde_json::json!({ "valid_from": 50, "pinned": true }),
+            ),
+            rules_block_row(
+                "mid",
+                "rule",
+                "mid rule",
+                serde_json::json!({ "valid_from": 200 }),
+            ),
+            rules_block_row(
+                "a-fact",
+                "fact",
+                "a fact",
+                serde_json::json!({ "valid_from": 999 }),
+            ),
+            rules_block_row(
+                "replaced",
+                "rule",
+                "replaced rule",
+                serde_json::json!({ "valid_from": 999, "superseded_by": "new" }),
+            ),
+            rules_block_row(
+                "golden",
+                "rule",
+                "golden rule",
+                serde_json::json!({ "valid_from": 999 }),
+            ),
+        ];
+        let skip: std::collections::HashSet<&str> = ["golden"].into_iter().collect();
+        let (block, ids) = format_snapshot_rules_block(&rows, &skip, SNAPSHOT_RULES_MAX_CHARS);
+        assert_eq!(ids, vec!["pinned-old", "new", "mid", "old"], "{block}");
+        assert!(
+            block.starts_with(
+                "### Rules of this namespace (1 pinned first, then newest; 4 in all):"
+            ),
+            "{block}"
+        );
+        assert!(block.contains("\n  - [rule] `new`: new rule"), "{block}");
+        assert!(!block.contains("more:"), "every rule fits: {block}");
+    }
+
+    /// The text of each listed rule, as its line shows it.
+    fn listed_texts(block: &str, count: usize) -> Vec<&str> {
+        block
+            .lines()
+            .skip(1)
+            .take(count)
+            .map(|line| {
+                assert!(is_rule_line(line), "plugin line shape: {line}");
+                line.split_once("`: ").unwrap().1
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_rules_block_fills_with_whole_rules_and_counts_the_ones_left_out() {
+        // Each rule is about 2,000 characters over several lines and
+        // paragraphs; five fit in the cap, never a part of a sixth.
+        let long = |i: usize| {
+            format!(
+                "Rule {i} first paragraph.\n{}\n\nSecond paragraph {i}, the clause an agent needs.",
+                "word ".repeat(390)
+            )
+        };
+        let mut rows: Vec<SearchResult> = (0..100)
+            .map(|i| {
+                rules_block_row(
+                    &format!("rule-{i:03}"),
+                    "rule",
+                    &long(i),
+                    serde_json::json!({ "valid_from": 1000 + i, "access_count": 1000 - i, "edge_sources": ["x"] }),
+                )
+            })
+            .collect();
+        // An older short rule still fits after the long ones stop fitting.
+        rows.push(rules_block_row(
+            "short-old",
+            "rule",
+            "Keep commits small.",
+            serde_json::json!({ "valid_from": 1 }),
+        ));
+        let (block, ids) = format_snapshot_rules_block(
+            &rows,
+            &std::collections::HashSet::new(),
+            SNAPSHOT_RULES_MAX_CHARS,
+        );
+        assert_eq!(ids[0], "rule-099", "newest first");
+        assert!(ids.len() > 1 && ids.len() < 101, "{}", ids.len());
+        assert_eq!(ids.last().map(String::as_str), Some("short-old"), "{ids:?}");
+        let closing = format!(
+            "\n  ({} more: neurostrata_search_memory with memory_types [\"rule\"] finds them)",
+            101 - ids.len()
+        );
+        assert!(block.ends_with(&closing), "{block}");
+        let listed = &block[..block.len() - closing.len()];
+        assert!(
+            listed.chars().count() <= SNAPSHOT_RULES_MAX_CHARS,
+            "{} characters",
+            listed.chars().count()
+        );
+        for (text, id) in listed_texts(&block, ids.len()).into_iter().zip(&ids) {
+            let row = rows.iter().find(|r| &r.id == id).unwrap();
+            assert_eq!(
+                text,
+                snapshot_rule_one_line(&row.payload.content),
+                "the rule is whole"
+            );
+        }
+        assert!(
+            block.contains("the clause an agent needs."),
+            "a rule's later paragraphs are kept: {block}"
+        );
+        assert!(
+            !block.contains('{')
+                && !block.contains("access_count")
+                && !block.contains("edge_sources"),
+            "no metadata JSON: {block}"
+        );
+    }
+
+    #[test]
+    fn the_first_rule_goes_in_whole_even_when_it_alone_is_over_the_cap() {
+        let huge = "clause ".repeat(3000);
+        let rows = vec![
+            rules_block_row(
+                "huge",
+                "rule",
+                &huge,
+                serde_json::json!({ "valid_from": 2 }),
+            ),
+            rules_block_row(
+                "small",
+                "rule",
+                "small rule",
+                serde_json::json!({ "valid_from": 1 }),
+            ),
+        ];
+        let (block, ids) = format_snapshot_rules_block(
+            &rows,
+            &std::collections::HashSet::new(),
+            SNAPSHOT_RULES_MAX_CHARS,
+        );
+        assert_eq!(ids, vec!["huge"], "{block}");
+        assert_eq!(
+            listed_texts(&block, 1)[0],
+            huge.trim_end(),
+            "whole, not cut"
+        );
+        assert!(
+            block.ends_with(
+                "\n  (1 more: neurostrata_search_memory with memory_types [\"rule\"] finds them)"
+            ),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn a_rule_is_shown_whole_on_one_line() {
+        assert_eq!(
+            snapshot_rule_one_line("\n\nRULE: one\nline two.\r\n\r\nSecond  paragraph.\n"),
+            "RULE: one line two. Second paragraph."
+        );
+        let long = "abcdefgh ".repeat(200);
+        assert_eq!(snapshot_rule_one_line(&long), long.trim_end());
+    }
+
+    #[test]
+    fn a_rule_on_record_is_its_first_sentence() {
+        assert_eq!(
+            snapshot_rule_first_sentence("Keep commits small.\nThey review faster. More.", 150),
+            "Keep commits small."
+        );
+        assert_eq!(
+            snapshot_rule_first_sentence("Use src/paths.rs for paths! Never ad hoc.", 150),
+            "Use src/paths.rs for paths!"
+        );
+        assert_eq!(
+            snapshot_rule_first_sentence("No sentence end", 150),
+            "No sentence end"
+        );
+        let long = "word ".repeat(60);
+        let cut = snapshot_rule_first_sentence(&long, 150);
+        assert!(cut.ends_with('…') && cut.chars().count() <= 151, "{cut}");
+        assert!(!cut.contains("  ") && !cut.ends_with(" …"), "{cut}");
+    }
+
+    #[test]
+    fn rules_left_out_of_the_block_are_on_record_once_by_first_sentence() {
+        let long = |i: usize| {
+            format!(
+                "Rule {i} says one thing first. {}",
+                "Then it explains at length. ".repeat(80)
+            )
+        };
+        let mut rows: Vec<SearchResult> = (0..40)
+            .map(|i| {
+                rules_block_row(
+                    &format!("rule-{i:03}"),
+                    "rule",
+                    &long(i),
+                    serde_json::json!({ "valid_from": 1000 + i }),
+                )
+            })
+            .collect();
+        rows.push(rules_block_row(
+            "golden",
+            "rule",
+            "Golden first. More.",
+            serde_json::json!({ "valid_from": 5000 }),
+        ));
+        rows.push(rules_block_row(
+            "replaced",
+            "rule",
+            "Replaced first. More.",
+            serde_json::json!({ "valid_from": 5000, "superseded_by": "rule-001" }),
+        ));
+        let skip: std::collections::HashSet<&str> = ["golden"].into_iter().collect();
+        let (block, ids) = format_snapshot_rules_block(&rows, &skip, SNAPSHOT_RULES_MAX_CHARS);
+        assert!(ids.len() < 40, "{}", ids.len());
+        let also =
+            format_snapshot_also_on_record(&rows, &skip, &ids, SNAPSHOT_ALSO_ON_RECORD_MAX_CHARS);
+        let left_out = 40 - ids.len();
+        assert!(
+            also.starts_with(&format!(
+                "### Also on record (first sentence only; neurostrata_get_memory(id) gives the whole rule; {left_out} in all):"
+            )),
+            "{also}"
+        );
+        let also_ids: Vec<&str> = also
+            .lines()
+            .filter(|l| is_rule_line(l))
+            .map(|l| l.split('`').nth(1).unwrap())
+            .collect();
+        assert_eq!(also_ids.len(), left_out, "every left-out rule fits: {also}");
+        for id in &also_ids {
+            assert!(
+                !ids.iter().any(|listed| listed == id),
+                "not duplicated: {id}"
+            );
+            assert!(
+                !block.contains(&format!("`{id}`")),
+                "not in the block: {id}"
+            );
+            let i: usize = id.trim_start_matches("rule-").parse().unwrap();
+            assert!(
+                also.contains(&format!(
+                    "  - [rule] `{id}`: Rule {i} says one thing first.\n"
+                )) || also.ends_with(&format!(
+                    "  - [rule] `{id}`: Rule {i} says one thing first."
+                )),
+                "first sentence only: {also}"
+            );
+        }
+        assert!(
+            also_ids.windows(2).all(|w| w[0] > w[1]),
+            "newest first: {also_ids:?}"
+        );
+        assert!(
+            !also.contains("`golden`") && !also.contains("`replaced`"),
+            "{also}"
+        );
+        assert!(!also.contains("more:"), "{also}");
+        // Nothing left out of the block: nothing on record.
+        let (_, all_ids) = format_snapshot_rules_block(&rows[..2], &skip, SNAPSHOT_RULES_MAX_CHARS);
+        assert_eq!(
+            format_snapshot_also_on_record(&rows[..2], &skip, &all_ids, 6_000),
+            ""
+        );
+    }
+
+    #[test]
+    fn the_also_on_record_list_stays_within_its_cap() {
+        let rows: Vec<SearchResult> = (0..400)
+            .map(|i| {
+                rules_block_row(
+                    &format!("rule-{i:03}"),
+                    "rule",
+                    &format!("Rule {i} is a sentence of some length to fill the list. More."),
+                    serde_json::json!({ "valid_from": i }),
+                )
+            })
+            .collect();
+        let none = std::collections::HashSet::new();
+        let also =
+            format_snapshot_also_on_record(&rows, &none, &[], SNAPSHOT_ALSO_ON_RECORD_MAX_CHARS);
+        let shown = also.lines().filter(|l| is_rule_line(l)).count();
+        assert!(shown > 0 && shown < 400, "{shown}");
+        let closing = format!(
+            "\n  ({} more: neurostrata_search_memory with memory_types [\"rule\"] finds them)",
+            400 - shown
+        );
+        assert!(also.ends_with(&closing), "{also}");
+        assert!(
+            also[..also.len() - closing.len()].chars().count() <= SNAPSHOT_ALSO_ON_RECORD_MAX_CHARS,
+            "{} characters",
+            also.chars().count()
+        );
+    }
+
+    /// A namespace with many knowledge rows: the reply carries the rules as a
+    /// labeled block of whole rules, never whole rows as JSON.
+    #[tokio::test]
+    async fn the_snapshot_of_a_large_namespace_sends_whole_rules_in_a_bounded_block() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let body = "This rule text is long enough to matter. ".repeat(60);
+        for i in 0..300 {
+            let (memory_type, id) = if i % 3 == 0 {
+                ("rule", format!("rule-{i:03}"))
+            } else {
+                ("fact", format!("fact-{i:03}"))
+            };
+            let mut p = payload(&format!("{id}: {body}"));
+            p.memory_type = memory_type.to_string();
+            p.metadata = serde_json::json!({
+                "valid_from": i,
+                "access_count": 500 - i,
+                "edge_sources": ["a", "b", "c"],
+            });
+            store
+                .upsert("probe", &id, vec![0.1, 0.2, 0.3, 0.4], p)
+                .await
+                .expect("seed");
+        }
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+
+        let start = text
+            .find("### Rules of this namespace (newest first; 100 in all):")
+            .unwrap_or_else(|| panic!("labeled rules block: {text}"));
+        let also_start = text
+            .find("\n\n### Also on record (first sentence only; neurostrata_get_memory(id) gives the whole rule; ")
+            .unwrap_or_else(|| panic!("the rules left out are on record: {text}"));
+        let block = &text[start..also_start];
+        let also = &text[also_start + 2..];
+        let lines: Vec<&str> = block.lines().collect();
+        assert!(
+            lines[1].contains("`rule-297`"),
+            "newest rule first: {}",
+            lines[1]
+        );
+        let rule_lines: Vec<&str> = lines.iter().copied().filter(|l| is_rule_line(l)).collect();
+        for line in &rule_lines {
+            assert!(
+                line.ends_with(body.trim_end()),
+                "each rule is whole: {line}"
+            );
+        }
+        let also_lines: Vec<&str> = also.lines().filter(|l| is_rule_line(l)).collect();
+        let still_left_out: usize = also
+            .lines()
+            .last()
+            .and_then(|l| l.trim_start().strip_prefix('('))
+            .and_then(|l| l.split_once(" more:"))
+            .map_or(0, |(n, _)| n.parse().unwrap());
+        assert_eq!(
+            rule_lines.len() + also_lines.len() + still_left_out,
+            100,
+            "every rule is whole in the block, on record, or counted: {text}"
+        );
+        eprintln!(
+            "SNAPSHOT_REPLY_CHARS large-namespace fixture: reply {} chars, rules block {} chars ({} of 100 rules whole), also on record {} chars ({} rules)",
+            text.chars().count(),
+            block.chars().count(),
+            rule_lines.len(),
+            also.chars().count(),
+            also_lines.len()
+        );
+        assert!(
+            block.chars().count() <= SNAPSHOT_RULES_MAX_CHARS + 120,
+            "{} characters",
+            block.chars().count()
+        );
+        assert!(
+            also.chars().count() <= SNAPSHOT_ALSO_ON_RECORD_MAX_CHARS + 120,
+            "{} characters",
+            also.chars().count()
+        );
+        assert!(
+            !text.contains("\"payload\""),
+            "no whole rows as JSON: {text}"
+        );
+        assert!(!text.contains("edge_sources"), "no row metadata: {text}");
+    }
+
+    /// Without pinned rules the heading does not claim any come first.
+    #[test]
+    fn the_rules_heading_says_pinned_first_only_when_rules_are_pinned() {
+        let none: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let rows = vec![
+            rules_block_row(
+                "a",
+                "rule",
+                "a rule",
+                serde_json::json!({ "valid_from": 1 }),
+            ),
+            rules_block_row(
+                "b",
+                "rule",
+                "b rule",
+                serde_json::json!({ "valid_from": 2 }),
+            ),
+        ];
+        let (block, _) = format_snapshot_rules_block(&rows, &none, SNAPSHOT_RULES_MAX_CHARS);
+        assert!(
+            block.starts_with("### Rules of this namespace (newest first; 2 in all):"),
+            "{block}"
+        );
+        assert!(!block.contains("pinned"), "{block}");
+    }
+
+    /// get_snapshot writes the rules block's pick into the session file: the
+    /// same rules, whole, in the Golden Rules line shape, the count left out,
+    /// and the left-out rules by first sentence. Keys the plugins own stay.
+    #[tokio::test]
+    async fn the_snapshot_writes_its_rules_into_the_session_file_and_keeps_plugin_keys() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let long =
+            |lead: &str| format!("{lead} first sentence. {}", "More words here. ".repeat(400));
+        for (id, content, valid_from) in [
+            ("rule-a", long("Alpha"), 3),
+            ("rule-b", long("Beta"), 2),
+            ("rule-c", "Gamma short rule.\nSecond line.".to_string(), 1),
+        ] {
+            let mut p = payload(&content);
+            p.metadata = serde_json::json!({ "valid_from": valid_from });
+            store
+                .upsert("probe", id, vec![0.1, 0.2, 0.3, 0.4], p)
+                .await
+                .expect("seed");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let proj_root = tmp.path().join("repo");
+        std::fs::create_dir_all(proj_root.join(".NeuroStrata")).unwrap();
+        let session_file = proj_root.join(".NeuroStrata").join("active_session.json");
+        std::fs::write(
+            &session_file,
+            r#"{"claude_session_dirs":{"s":"/x"},"conceptual_bridges":[1],"namespace_rules":["stale"]}"#,
+        )
+        .unwrap();
+
+        let text = handle_get_snapshot(
+            serde_json::json!({
+                "namespace": "probe",
+                "project_root": proj_root.to_string_lossy(),
+            }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+        assert!(
+            text.contains("\n  - [rule] `rule-a`: Alpha first sentence."),
+            "{text}"
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&session_file).unwrap()).unwrap();
+        let rules: Vec<&str> = body["namespace_rules"]
+            .as_array()
+            .expect("namespace_rules")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(rules.len(), 2, "{body}");
+        assert_eq!(
+            rules[0],
+            format!("[rule] rule-a: {}", long("Alpha").trim_end())
+        );
+        assert_eq!(rules[1], "[rule] rule-c: Gamma short rule. Second line.");
+        assert!(
+            rules.iter().map(|l| l.chars().count()).sum::<usize>() <= SNAPSHOT_RULES_MAX_CHARS,
+            "within the rules cap"
+        );
+        assert_eq!(body["namespace_rules_left_out"], serde_json::json!(1));
+        assert_eq!(
+            body["also_on_record"],
+            serde_json::json!(["[rule] rule-b: Beta first sentence."])
+        );
+        assert_eq!(body["task_handoff"], serde_json::Value::Null);
+        assert_eq!(
+            body["claude_session_dirs"],
+            serde_json::json!({ "s": "/x" })
+        );
+        assert_eq!(body["conceptual_bridges"], serde_json::json!([1]));
+    }
+
+    /// Task context whose handoff note takes `bytes` (no task line or block).
+    fn task_of(bytes: usize) -> crate::task::SessionTaskParts {
+        crate::task::SessionTaskParts {
+            handoff: bytes,
+            ..Default::default()
+        }
+    }
+
+    /// The UTF-8 bytes a pick takes, measured as the fit measures it.
+    fn pick_bytes(pick: &SessionStartPick, task_bytes: usize) -> usize {
+        task_bytes
+            + pick
+                .golden
+                .iter()
+                .map(|r| crate::task::golden_rule_file_line(r, true).len() + 1)
+                .sum::<usize>()
+            + pick
+                .fields
+                .golden_rules_first_sentence
+                .iter()
+                .map(|l| l.len() + 1)
+                .sum::<usize>()
+            + pick.rules.as_ref().map_or(0, |r| r.used)
+            + pick.also.as_ref().map_or(0, |r| r.used)
+    }
+
+    fn three_rules() -> Vec<SearchResult> {
+        vec![
+            rules_block_row(
+                "r1",
+                "rule",
+                &format!("Ré one. {}", "x".repeat(300)),
+                serde_json::json!({ "valid_from": 3 }),
+            ),
+            rules_block_row(
+                "r2",
+                "rule",
+                &format!("Rule two. {}", "y ".repeat(1000)),
+                serde_json::json!({ "valid_from": 2 }),
+            ),
+            rules_block_row(
+                "r3",
+                "rule",
+                "Rule three short.",
+                serde_json::json!({ "valid_from": 1 }),
+            ),
+        ]
+    }
+
+    fn one_golden() -> Vec<SearchResult> {
+        vec![rules_block_row(
+            "g1",
+            "rule",
+            &"G".repeat(100),
+            serde_json::json!({ "pinned": true }),
+        )]
+    }
+
+    /// With `max_bytes` the pick stays within the budget, fills in the
+    /// default order (task, Golden Rules, whole rules, "Also on record") and
+    /// never cuts a rule: one that does not fit whole moves to "Also on
+    /// record".
+    #[test]
+    fn max_bytes_fits_in_priority_order_with_whole_lines() {
+        let golden = one_golden();
+        let rows = three_rules();
+        let task_bytes = 500;
+        let budget = task_bytes + 112 + 1_000;
+        let pick = pick_session_start(
+            &rows,
+            &golden,
+            task_of(task_bytes),
+            None,
+            Some(budget),
+            None,
+        );
+        assert!(pick_bytes(&pick, task_bytes) <= budget);
+        assert_eq!(pick.golden.len(), 1);
+        assert_eq!(pick.fields.golden_rules_left_out, 0);
+        assert!(!pick.fields.golden_rules_over_share);
+        let rules = pick.rules.as_ref().unwrap();
+        assert_eq!(rules.ids(), vec!["r1", "r3"], "r2 does not fit whole");
+        assert_eq!(
+            pick.fields.namespace_rules[0],
+            format!("[rule] r1: Ré one. {}", "x".repeat(300)),
+            "listed whole"
+        );
+        assert_eq!(pick.fields.namespace_rules_left_out, 1);
+        assert_eq!(pick.fields.also_on_record, vec!["[rule] r2: Rule two."]);
+        assert!(
+            pick.fields.left_out_rule_ids.is_empty(),
+            "r2 is on record by first sentence"
+        );
+        assert_eq!(pick.fields.max_bytes, Some(budget));
+        assert_eq!(pick.fields.sections, None);
+
+        // A task that fills the budget leaves nothing for rules.
+        let pick = pick_session_start(
+            &rows,
+            &golden,
+            task_of(task_bytes),
+            None,
+            Some(task_bytes + 112 + 50),
+            None,
+        );
+        assert!(!pick.fields.task.handoff_left_out);
+        assert_eq!(pick.golden.len(), 1, "the Golden Rule's share is reserved");
+        assert!(pick.fields.namespace_rules.is_empty());
+        assert_eq!(pick.fields.namespace_rules_left_out, 3);
+        assert!(pick.fields.also_on_record.is_empty());
+        assert_eq!(pick.fields.also_on_record_left_out, 3);
+        assert_eq!(
+            pick.fields.left_out_rule_ids,
+            vec!["r1", "r2", "r3"],
+            "every rule left out entirely, newest first"
+        );
+
+        // Golden Rules come before namespace rules.
+        let pick = pick_session_start(&rows, &golden, task_of(0), None, Some(224), None);
+        assert_eq!(pick.golden.len(), 1);
+        assert!(pick_bytes(&pick, 0) <= 224);
+    }
+
+    /// The Golden Rules' share is reserved before the other sections: a
+    /// handoff note that fills the rest of the budget, or would overflow it,
+    /// never pushes a pinned rule out while the pinned set fits its share.
+    #[test]
+    fn a_large_handoff_note_leaves_the_golden_rules_whole() {
+        let golden: Vec<SearchResult> = ["g1", "g2", "g3"]
+            .iter()
+            .map(|id| {
+                rules_block_row(
+                    id,
+                    "rule",
+                    &"P".repeat(100),
+                    serde_json::json!({ "pinned": true }),
+                )
+            })
+            .collect();
+        let rows = three_rules();
+        // 3 x 112 bytes = 336, within the 500-byte share of 1,000.
+        for handoff in [1_000 - 336, 1_000, 5_000] {
+            let pick =
+                pick_session_start(&rows, &golden, task_of(handoff), None, Some(1_000), None);
+            assert_eq!(pick.golden.len(), 3, "handoff {handoff}");
+            assert_eq!(pick.fields.golden_rules_left_out, 0);
+            assert!(pick.fields.golden_rules_first_sentence.is_empty());
+            assert!(!pick.fields.golden_rules_over_share);
+            assert_eq!(pick.fields.task.handoff_left_out, handoff > 1_000 - 336);
+        }
+    }
+
+    /// Without `max_bytes` the pick is the default one: every Golden Rule and
+    /// the rules block at its default size.
+    #[test]
+    fn no_max_bytes_keeps_the_default_pick() {
+        let golden = one_golden();
+        let rows: Vec<SearchResult> = (0..50)
+            .map(|i| {
+                rules_block_row(
+                    &format!("r{i:02}"),
+                    "rule",
+                    &format!("Rule {i}. {}", "z".repeat(400)),
+                    serde_json::json!({ "valid_from": i }),
+                )
+            })
+            .collect();
+        let skip: std::collections::HashSet<&str> = ["g1"].into_iter().collect();
+        let pick = pick_session_start(&rows, &golden, task_of(10_000), None, None, None);
+        let (block, ids) = format_snapshot_rules_block(&rows, &skip, SNAPSHOT_RULES_MAX_CHARS);
+        assert_eq!(pick.golden.len(), 1);
+        let rules = pick.rules.as_ref().unwrap();
+        assert_eq!(rules.render_block(), block);
+        assert_eq!(rules.ids(), ids);
+        assert_eq!(pick.fields.max_bytes, None);
+        assert_eq!(pick.fields.golden_rules_left_out, 0);
+    }
+
+    /// Named sections are filled exactly as listed and in that order: a
+    /// section listed first takes the budget, one listed later gets what is
+    /// left, and a section not listed is neither filled nor counted as left
+    /// out.
+    #[test]
+    fn sections_fill_exactly_the_named_parts_in_their_order() {
+        use crate::task::SessionSection as S;
+        let golden = one_golden();
+        let rows = three_rules();
+        let task = crate::task::SessionTaskParts {
+            handoff: 300,
+            line: 60,
+            block: 900,
+        };
+        // Rules first: they take the room the handoff note would have had.
+        let sections = [S::Rules, S::Handoff];
+        let pick = pick_session_start(&rows, &golden, task, None, Some(440), Some(&sections));
+        assert_eq!(pick.rules.as_ref().unwrap().ids(), vec!["r1", "r3"]);
+        assert!(pick.fields.task.handoff_left_out);
+        assert!(pick.golden.is_empty(), "golden_rules was not named");
+        assert_eq!(pick.fields.golden_rules_left_out, 0);
+        assert!(pick.also.is_none(), "also_on_record was not named");
+        assert_eq!(pick.fields.also_on_record_left_out, 0);
+        assert!(!pick.fields.task.line_left_out && !pick.fields.task.block_left_out);
+        assert_eq!(pick.fields.sections, Some(sections.to_vec()));
+
+        // The other way round: the handoff note goes in, the rules get the rest.
+        let sections = [S::Handoff, S::Rules];
+        let pick = pick_session_start(&rows, &golden, task, None, Some(440), Some(&sections));
+        assert!(!pick.fields.task.handoff_left_out);
+        assert_eq!(pick.rules.as_ref().unwrap().ids(), vec!["r3"]);
+
+        // Golden Rules are reserved before anything else, even listed last,
+        // and keep their place in the output order.
+        let sections = [S::Rules, S::GoldenRules];
+        let pick = pick_session_start(&rows, &golden, task, None, Some(440), Some(&sections));
+        assert_eq!(pick.golden.len(), 1);
+        assert_eq!(pick.rules.as_ref().unwrap().ids(), vec!["r3"]);
+        assert!(pick_bytes(&pick, 0) <= 440);
+
+        // Task parts fill in their listed order, each whole or left out.
+        let sections = [S::TaskLine, S::Handoff, S::TaskBlock];
+        let pick = pick_session_start(&rows, &golden, task, None, Some(400), Some(&sections));
+        assert!(!pick.fields.task.line_left_out);
+        assert!(!pick.fields.task.handoff_left_out);
+        assert!(pick.fields.task.block_left_out);
+        assert!(pick.rules.is_none() && pick.golden.is_empty());
+        assert_eq!(
+            pick.fields.golden_rules_left_out, 0,
+            "not named, not left out"
+        );
+    }
+
+    /// `sections` names are checked: an unknown name and also_on_record
+    /// before rules are errors; a repeated name counts once.
+    #[test]
+    fn sections_argument_is_checked() {
+        use crate::task::{parse_session_sections, SessionSection as S};
+        assert_eq!(parse_session_sections(None), Ok(None));
+        assert_eq!(
+            parse_session_sections(Some(&serde_json::json!(["rules", "handoff", "rules"]))),
+            Ok(Some(vec![S::Rules, S::Handoff]))
+        );
+        let err = parse_session_sections(Some(&serde_json::json!(["rulez"]))).unwrap_err();
+        assert!(
+            err.contains("unknown section") && err.contains("also_on_record"),
+            "{err}"
+        );
+        let err = parse_session_sections(Some(&serde_json::json!(["also_on_record", "rules"])))
+            .unwrap_err();
+        assert!(err.contains("must come after 'rules'"), "{err}");
+        assert!(parse_session_sections(Some(&serde_json::json!("rules"))).is_err());
+    }
+
+    /// Golden Rules take at most half the budget. Past it the most relevant
+    /// stay whole, the rest are listed by first sentence with their ids, and
+    /// the pick says the pinned set is over its share, in the file fields and
+    /// in the reply's Golden Rules section.
+    #[test]
+    fn golden_rules_over_their_share_keep_the_most_relevant_whole() {
+        let golden: Vec<SearchResult> = ["g1", "g2", "g3"]
+            .iter()
+            .map(|id| {
+                rules_block_row(
+                    id,
+                    "rule",
+                    &format!("Pinned {id} first. {}", "w".repeat(250)),
+                    serde_json::json!({ "pinned": true }),
+                )
+            })
+            .collect();
+        let rows = three_rules();
+        let relevance = vec!["g3".to_string(), "r3".to_string()];
+        let pick = pick_session_start(
+            &rows,
+            &golden,
+            task_of(0),
+            Some(&relevance),
+            Some(1_000),
+            None,
+        );
+        assert!(pick.fields.golden_rules_over_share);
+        assert_eq!(pick.golden.len(), 1);
+        assert_eq!(pick.golden[0].id, "g3", "the most relevant stays whole");
+        assert_eq!(
+            pick.fields.golden_rules_first_sentence,
+            vec!["[rule] g1: Pinned g1 first.", "[rule] g2: Pinned g2 first."]
+        );
+        assert_eq!(pick.fields.golden_rules_left_out, 0);
+        let golden_bytes = pick_bytes(&pick, 0)
+            - pick.rules.as_ref().map_or(0, |r| r.used)
+            - pick.also.as_ref().map_or(0, |r| r.used);
+        assert!(golden_bytes <= 500, "{golden_bytes}");
+        let section = render_golden_section(&pick);
+        assert!(section.contains("`g3`: Pinned g3 first. www"), "{section}");
+        assert!(
+            section.contains("- [rule] `g1`: Pinned g1 first."),
+            "{section}"
+        );
+        assert!(
+            section.contains(crate::task::GOLDEN_RULES_OVER_SHARE_NOTICE),
+            "{section}"
+        );
+
+        // Within the share every Golden Rule is whole and nothing is flagged.
+        let pick = pick_session_start(&rows, &golden, task_of(0), None, Some(4_000), None);
+        assert_eq!(pick.golden.len(), 3);
+        assert!(!pick.fields.golden_rules_over_share);
+        assert!(pick.fields.golden_rules_first_sentence.is_empty());
+        assert!(!render_golden_section(&pick).contains("exceed their share"));
+
+        // A budget too small for every first sentence: the rules left out
+        // entirely are named by id, most relevant first (the ranked rule r3,
+        // then the rest in their own order).
+        let pick = pick_session_start(
+            &rows,
+            &golden,
+            task_of(0),
+            Some(&relevance),
+            Some(100),
+            None,
+        );
+        assert!(pick.golden.is_empty());
+        assert_eq!(
+            pick.fields.golden_rules_first_sentence,
+            vec!["[rule] g3: Pinned g3 first."]
+        );
+        assert_eq!(pick.fields.golden_rules_left_out, 2);
+        assert_eq!(
+            pick.fields.left_out_rule_ids,
+            vec!["r3", "g1", "g2", "r1", "r2"]
+        );
+        // The same rules by first sentence, same order, outside the fit.
+        assert_eq!(
+            pick.fields.left_out_first_sentences,
+            vec![
+                "[rule] r3: Rule three short.",
+                "[rule] g1: Pinned g1 first.",
+                "[rule] g2: Pinned g2 first.",
+                "[rule] r1: Ré one.",
+                "[rule] r2: Rule two.",
+            ]
+        );
+    }
+
+    /// With a relevance ranking the rules come in its order (unranked ones
+    /// after, newest first) and the heading says so; without one they are
+    /// newest first.
+    #[test]
+    fn rules_follow_the_relevance_ranking_when_there_is_one() {
+        let rows = three_rules();
+        let golden = one_golden();
+        let relevance = vec!["r3".to_string(), "r1".to_string()];
+        let pick = pick_session_start(&rows, &golden, task_of(0), Some(&relevance), None, None);
+        let rules = pick.rules.as_ref().unwrap();
+        assert_eq!(rules.ids(), vec!["r3", "r1", "r2"]);
+        assert!(
+            rules.render_block().starts_with(
+                "### Rules of this namespace (most relevant to this task first; 3 in all):"
+            ),
+            "{}",
+            rules.render_block()
+        );
+        let pick = pick_session_start(&rows, &golden, task_of(0), None, None, None);
+        assert_eq!(pick.rules.as_ref().unwrap().ids(), vec!["r1", "r2", "r3"]);
+    }
+
+    /// A snapshot with an active task in this worktree ranks the rules by the
+    /// ranking its claim saved on the task row (no search of its own), and
+    /// writes the named sections and the task's Goal into the session file.
+    #[tokio::test]
+    async fn the_snapshot_ranks_rules_by_the_task_and_records_its_sections() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj_root = tmp.path().join("repo");
+        std::fs::create_dir_all(proj_root.join(".NeuroStrata")).unwrap();
+        let root = proj_root.to_string_lossy().to_string();
+        // The task's saved ranking puts the older rule first.
+        for (id, content, valid_from) in [
+            ("rule-old", "Old rule about podman.", 1),
+            ("rule-new", "New rule about docs.", 2),
+        ] {
+            let mut p = payload(content);
+            p.metadata = serde_json::json!({ "valid_from": valid_from });
+            store
+                .upsert("probe", id, vec![0.1, 0.2, 0.3, 0.4], p)
+                .await
+                .expect("seed");
+        }
+        let snapshot = |args: serde_json::Value| {
+            let store = store.clone();
+            async move { handle_get_snapshot(args, store).await }
+        };
+        let text = snapshot(serde_json::json!({ "namespace": "probe", "project_root": root }))
+            .await
+            .expect("snapshot");
+        assert!(
+            text.find("`rule-new`") < text.find("`rule-old`"),
+            "newest first without a task: {text}"
+        );
+
+        let mut task = payload("Ship the podman fix");
+        task.memory_type = "task".to_string();
+        task.metadata = serde_json::json!({ "task": {
+            "status": "in_progress",
+            "worktree": root,
+            "relevant_rule_ids": ["rule-old"],
+            "history": [{ "at": "2026-11-24T10:00:00Z", "note": "Handoff: rerun the podman tests" }]
+        }});
+        store
+            .upsert("probe", "task-1", vec![0.1, 0.2, 0.3, 0.4], task)
+            .await
+            .expect("seed task");
+        let text = snapshot(serde_json::json!({
+            "namespace": "probe",
+            "project_root": root,
+            "max_bytes": 4_000,
+            "sections": ["handoff", "task_line", "golden_rules", "rules"]
+        }))
+        .await
+        .expect("snapshot");
+        assert!(
+            text.contains("(most relevant to this task first; 2 in all)"),
+            "{text}"
+        );
+        assert!(
+            text.find("`rule-old`") < text.find("`rule-new`"),
+            "ranked by the ranking the task's claim saved: {text}"
+        );
+        assert!(!text.contains("### Also on record"), "not named: {text}");
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(proj_root.join(".NeuroStrata/active_session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["sections"],
+            serde_json::json!(["handoff", "task_line", "golden_rules", "rules"])
+        );
+        assert_eq!(body["task_goal"], serde_json::json!("Ship the podman fix"));
+        assert_eq!(
+            body["task_handoff"]["note"],
+            serde_json::json!("rerun the podman tests")
+        );
+        assert_eq!(body["also_on_record"], serde_json::json!([]));
+        assert_eq!(body["left_out_rule_ids"], serde_json::json!([]));
+        assert!(body.get("subagent_prompt_injection").is_none(), "{body}");
+
+        let err = snapshot(serde_json::json!({ "namespace": "probe", "sections": ["nope"] }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown section"), "{err}");
+    }
+
+    /// A snapshot with `max_bytes` writes the fit and its budget into the
+    /// session file; a later snapshot without the argument keeps the reply at
+    /// the default size but fits the file to the budget it holds. An
+    /// `include_archived` snapshot shows an archived rule in its reply and
+    /// never writes it into the file.
+    #[tokio::test]
+    async fn the_session_file_keeps_its_budget_and_never_carries_archived_rules() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        for (id, content, valid_from, archived, pinned) in [
+            (
+                "rule-a",
+                format!("Alpha. {}", "a".repeat(600)),
+                3,
+                false,
+                false,
+            ),
+            (
+                "rule-b",
+                format!("Beta. {}", "b".repeat(600)),
+                2,
+                false,
+                false,
+            ),
+            ("rule-z", "Zeta archived rule.".to_string(), 4, true, false),
+            ("rule-p", "Pinned archived rule.".to_string(), 5, true, true),
+        ] {
+            let mut p = payload(&content);
+            p.metadata = serde_json::json!({ "valid_from": valid_from, "archived": archived, "pinned": pinned });
+            store
+                .upsert("probe", id, vec![0.1, 0.2, 0.3, 0.4], p)
+                .await
+                .expect("seed");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let proj_root = tmp.path().join("repo");
+        std::fs::create_dir_all(proj_root.join(".NeuroStrata")).unwrap();
+        let session_file = proj_root.join(".NeuroStrata").join("active_session.json");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&session_file).unwrap()).unwrap()
+        };
+        let snapshot = |args: serde_json::Value| {
+            let store = store.clone();
+            async move { handle_get_snapshot(args, store).await.expect("snapshot") }
+        };
+        let root = proj_root.to_string_lossy().to_string();
+
+        let text = snapshot(serde_json::json!({
+            "namespace": "probe", "project_root": root, "max_bytes": 800
+        }))
+        .await;
+        assert!(text.contains("`rule-a`"), "{text}");
+        assert!(!text.contains("\n  - [rule] `rule-b`"), "{text}");
+        let body = read();
+        assert_eq!(body["max_bytes"], serde_json::json!(800));
+        assert_eq!(body["truncated_by_budget"], serde_json::json!(true));
+        assert_eq!(body["namespace_rules"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["namespace_rules_left_out"], serde_json::json!(1));
+
+        let text = snapshot(serde_json::json!({
+            "namespace": "probe", "project_root": root, "include_archived": true
+        }))
+        .await;
+        assert!(
+            text.contains("`rule-z`"),
+            "the audit reply shows it: {text}"
+        );
+        assert!(
+            text.contains("\n  - [rule] `rule-b`"),
+            "default size: {text}"
+        );
+        let body = read();
+        assert!(!body.to_string().contains("rule-z"), "{body}");
+        assert!(!body.to_string().contains("rule-p"), "{body}");
+        assert_eq!(body["max_bytes"], serde_json::json!(800), "{body}");
+        assert_eq!(body["namespace_rules"].as_array().map(Vec::len), Some(1));
     }
 
     #[tokio::test]

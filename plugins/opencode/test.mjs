@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plugin, {
@@ -22,6 +22,7 @@ import plugin, {
   SUBAGENT_CONTEXT_MARKER,
   buildSubagentContextHeader,
   injectSubagentPrompt,
+  openCodeUserLineNote,
 } from "./dist/index.js";
 
 test("Plugin.define exports V2 setup and registers execute.before hook", async () => {
@@ -668,4 +669,101 @@ test("hook runner replies in the shape of the failing event (#400)", async () =>
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("OpenCode V2 context hook pushes the session-start text into system on every request", async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "ns-oc2-system-"));
+  const nsDir = join(tmpDir, ".NeuroStrata");
+  mkdirSync(nsDir, { recursive: true });
+  writeFileSync(
+    join(nsDir, "neurostrata-plugin.json"),
+    JSON.stringify({ namespace: "oc-ns", endpoint: "http://127.0.0.1:1/mcp", requestTimeoutMs: 1000 }),
+  );
+  writeFileSync(
+    join(nsDir, "active_session.json"),
+    JSON.stringify({
+      namespace: "oc-ns",
+      golden_rules: ["[rule] og1: OpenCode rule."],
+      namespace_rules: ["[rule] on1: Namespace rule."],
+    }),
+  );
+  const sessionHooks = new Map();
+  const subscribers = [];
+  await plugin.initialize({
+    location: { directory: tmpDir, project: { root: tmpDir, canonical: tmpDir } },
+    skipHandshake: true,
+    session: { hook: (name, fn) => sessionHooks.set(name, fn) },
+    event: { subscribe: (fn) => subscribers.push(fn) },
+    tool: { hook: () => {} },
+  });
+  assert.equal(subscribers.length, 1, "reads the event stream");
+  assert.ok(subscribers[0]?.signal instanceof AbortSignal, "subscribe({ signal }) returns an async iterable in OpenCode 2.x");
+  for (let i = 0; i < 2; i++) {
+    const ev = { sessionID: "ses_sys", agent: "build", system: [{ type: "text", text: "base" }], messages: [], tools: {} };
+    await sessionHooks.get("context")(ev);
+    assert.equal(ev.system.length, 2, `request ${i}`);
+    assert.deepEqual(Object.keys(ev.system[1]).sort(), ["text", "type"]);
+    assert.match(ev.system[1].text, /og1: OpenCode rule\./);
+    assert.match(ev.system[1].text, /on1: Namespace rule\./);
+  }
+});
+
+test("OpenCode shows a user line inline once, as a synthetic message, when the turn ends; no TUI entry", async () => {
+  assert.equal(existsSync(new URL("./tui.js", import.meta.url)), false, "no TUI entry is shipped");
+  const tmpDir = mkdtempSync(join(tmpdir(), "ns-oc2-userline-"));
+  const nsDir = join(tmpDir, ".NeuroStrata");
+  mkdirSync(nsDir, { recursive: true });
+  // A closed port refuses: session start gets no snapshot and owes the user a line.
+  const closed = http.createServer();
+  await new Promise((r) => closed.listen(0, "127.0.0.1", r));
+  const port = closed.address().port;
+  await new Promise((r) => closed.close(r));
+  writeFileSync(
+    join(nsDir, "neurostrata-plugin.json"),
+    JSON.stringify({ namespace: "oc-ns", endpoint: `http://127.0.0.1:${port}/mcp`, requestTimeoutMs: 1000 }),
+  );
+  writeFileSync(join(nsDir, "active_session.json"), JSON.stringify({ namespace: "oc-ns", golden_rules: ["[rule] og1: OpenCode rule."] }));
+  const sessionHooks = new Map();
+  const synthetics = [];
+  const queued = [];
+  let wake = () => {};
+  const cleanup = await plugin.initialize({
+    location: { directory: tmpDir, project: { root: tmpDir, canonical: tmpDir } },
+    skipHandshake: true,
+    session: {
+      hook: (name, fn) => sessionHooks.set(name, fn),
+      synthetic: async (input) => synthetics.push(input),
+    },
+    event: {
+      subscribe: (options) => {
+        return (async function* () {
+          while (!options?.signal?.aborted) {
+            if (queued.length) { yield queued.shift(); continue; }
+            await new Promise((r) => { wake = r; options?.signal?.addEventListener("abort", r, { once: true }); });
+          }
+        })();
+      },
+    },
+    tool: { hook: () => {} },
+  });
+  const emit = async (ev) => {
+    queued.push(ev);
+    wake();
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  };
+  const ev = { sessionID: "ses_line", agent: "build", system: [], messages: [], tools: {} };
+  await sessionHooks.get("context")(ev);
+  assert.deepEqual(synthetics, [], "never sent from the context hook");
+  await emit({ type: "session.execution.succeeded", data: { sessionID: "ses_line" } });
+  const line = "NeuroStrata: the daemon is still starting; session rules load on the first tool call.";
+  assert.deepEqual(synthetics, [{
+    sessionID: "ses_line",
+    description: line,
+    text: openCodeUserLineNote(line),
+    resume: false,
+    delivery: "steer",
+  }]);
+  await emit({ type: "session.execution.succeeded", data: { sessionID: "ses_line" } });
+  assert.equal(synthetics.length, 1, "once");
+  await cleanup?.();
 });
