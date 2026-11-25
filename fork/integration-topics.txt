@@ -1,0 +1,10 @@
+# Topic branches merged into the integration branch, in this order. One branch
+# per line; text after # is a note. Every topic starts from upstream main.
+# Remove a topic when upstream merges it.
+perf/task-replies-without-history      # upstream PR #422
+fix/worktree-match-same-location       # upstream PR #424
+fix/session-file-drops-finished-task   # upstream PR #430
+feat/task-get                          # upstream PR #437; with #422 it must call task_summary(.., true)
+fix/literal-dotdot-spelling            # ready for fork review
+fix/task-note-redaction                # ready for fork review
+feat/session-start                     # held: #420 PRs 7-9; rebuild on ContextService, reconcile with #435
