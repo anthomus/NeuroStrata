@@ -66,6 +66,15 @@ Claude Code `NotebookEdit` is a file-mutating tool like `Write` and `Edit`: it i
 
 `neurostrata-nb9q`: subagent graph-first injection is agent- and harness-aware: read-only subagents (`reviewer`, `checker`, `checker-free`, `explore`) receive a skip note instead of directives to call MCP tools they do not have, and Code Mode harnesses reference `execute` with `tools.neurostrata.*`. Intent extraction from `read`/`grep`/`glob`/shell tool output is suppressed, because `TODO:`/`defer` in stdout or source comments is not a task obligation; user and assistant turns still nudge.
 
+## Session start
+
+The session-start text is limited to `SESSION_START_MAX_BYTES` (9,500 UTF-8 bytes), which keeps it whole on Claude Code (10,000 characters) and Codex (about 10,000 bytes). The plugin sends `get_snapshot` a `max_bytes` of `SESSION_START_CONTENT_BUDGET` (the limit minus `SESSION_START_FRAMING_BYTES` for its own headings), and the daemon fits the content to it once, in named sections.
+
+- **Session start never waits for the daemon.** When `get_snapshot` is refused, the hook answers at once from `.NeuroStrata/active_session.json` and tells the user, in one inline line, that the rules load on the first tool call. The first tool round then loads the snapshot (`resolvePendingSnapshot`), retrying a refusal for up to `SNAPSHOT_WAIT_MS` (10 s) after the session started, and delivers the session-start text with the tool result.
+- **Nothing is left out silently.** Rules and a handoff note the daemon left out of the fit come on the next tool calls (`leftOutSessionStartBlock`): the first `LEFT_OUT_WHOLE_RULES` (5) whole, the rest once by first sentence, each rule once per session epoch.
+- **Handoff.** `SessionEnd` and `PreCompact` write a handoff note on the session's in-progress task; the next session start shows the latest one.
+- Every hook harness (Claude Code, Codex, Copilot CLI, OpenCode) injects the same text through the shared core. OpenCode shows the user lines inline in the conversation.
+
 ## Implementing a New Harness Adapter
 
 To add a new harness adapter:
