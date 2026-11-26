@@ -20,7 +20,7 @@
 // ──────────────────────────────────────────────────────────────────────
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, posix, relative, resolve, win32 } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
 // ──────────────────────────────────────────────────────────────────────
@@ -917,31 +917,12 @@ function effectiveProjectRoot(config) {
     return config.projectRoot ?? resolveProjectRoot();
 }
 /**
- * The recall label for a touched file: its absolute path made relative to
- * the project root, with `/` separators, so the label names the same file
- * from whichever folder the agent works in. A path outside the root is
- * returned as given.
+ * The recall label for a touched file: its absolute path relative to the
+ * project root, or the path as given when it lies outside the root.
  */
 function pathRelativeToProjectRoot(absPath, config) {
-    const root = effectiveProjectRoot(config);
-    const isWindowsPath = (p) => /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
-    // The root's style picks the path rules (win32 compares case-insensitively
-    // and takes either slash); an absolute path of the other style is outside.
-    const windows = isWindowsPath(root);
-    if (isAbsoluteAny(absPath) && isWindowsPath(absPath) !== windows) {
-        return absPath;
-    }
-    const p = windows ? win32 : posix;
-    try {
-        const rel = p.relative(p.resolve(root), p.resolve(root, absPath));
-        if (rel !== '..' && !rel.startsWith('..' + p.sep) && !p.isAbsolute(rel)) {
-            return rel.split(p.sep).join('/');
-        }
-    }
-    catch {
-        // fall through to the given path
-    }
-    return absPath;
+    const rel = relative(effectiveProjectRoot(config), absPath);
+    return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel) ? rel : absPath;
 }
 // ──────────────────────────────────────────────────────────────────────
 // Credential
