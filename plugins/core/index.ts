@@ -277,6 +277,15 @@ function isAbsoluteAny(p: string): boolean {
   return p.startsWith('/') || p.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(p)
 }
 
+/**
+ * A tool call's file path made absolute against the folder the agent works
+ * in. The daemon resolves a relative path against the project root, which is
+ * the wrong file when the agent works in a subfolder.
+ */
+function absoluteToolPath(p: string, baseDir: string): string {
+  return isAbsoluteAny(p) ? p : resolve(baseDir, p)
+}
+
 /** The canonical spelling of an existing path, as Rust's `dunce` gives it. */
 function canonicalPath(p: string): string | null {
   try {
@@ -989,6 +998,16 @@ function loadPluginConfigFromDisk(
     }
   }
   return {}
+}
+
+/** The folder an in-process host's agent works in; tool paths start there. */
+function agentDirFromCtx(ctx?: any): string {
+  return (
+    asString(ctx?.location?.directory) ??
+    asString(ctx?.directory) ??
+    asString(ctx?.cwd) ??
+    process.cwd()
+  )
 }
 
 /** Effective project root for reading .NeuroStrata state files. */
@@ -3462,7 +3481,7 @@ const executeAfterHandler = async (
     }
   }
 
-  // 3. JIT file-touch recall (deduplicated per sessionId:epoch:normalizedPath).
+  // 3. JIT file-touch recall (deduplicated per sessionId:epoch:absolutePath).
   if (toolName !== '' && isFileTouchTool(toolName)) {
     const filePath =
       event?.args?.path ??
@@ -3470,9 +3489,10 @@ const executeAfterHandler = async (
       event?.input?.path ??
       event?.toolInput?.path
     if (filePath) {
-      const fp = String(filePath)
-      const normalizedPath = pathRelativeToProjectRoot(fp, config)
-      const dedupKey = `${sessionId ?? '__no_session__'}:${epoch}:${normalizedPath}`
+      // The label keeps the agent's spelling; dedup keys on the recalled path.
+      const normalizedPath = pathRelativeToProjectRoot(String(filePath), config)
+      const fp = absoluteToolPath(String(filePath), agentDirFromCtx(pluginCtx))
+      const dedupKey = `${sessionId ?? '__no_session__'}:${epoch}:${fp}`
       const seen = sessionSeenFiles(sessionId)
       if (!seen.has(dedupKey)) {
         let snippets: string[] = []
@@ -3674,11 +3694,15 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
   // Bug 5: file-touch recall.
   let snippets: string[] = []
   let filePath: string | undefined
+  // The block shows the agent's own spelling; recall and its dedup key use
+  // the absolute path.
+  let recallPath: string | undefined
   if (isFileTouchTool(toolName)) {
     filePath = extractFilePath(args, altArgs, input?.input)
     if (filePath) {
+      recallPath = absoluteToolPath(filePath, agentDirFromCtx(pluginCtx))
       try {
-        snippets = await prefetchMemoriesForFile(config.namespace, filePath)
+        snippets = await prefetchMemoriesForFile(config.namespace, recallPath)
       } catch {
         snippets = []
       }
@@ -3694,7 +3718,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
   // Non-mutating file-touch with recalled snippets -> return the recall block.
   if (snippets.length > 0 && !isMutatingTool(toolName)) {
     if (block) enqueuePendingRecall(block, asRecord(input), args)
-    if (filePath) confirmPrefetchDelivery(config.namespace, filePath)
+    if (recallPath) confirmPrefetchDelivery(config.namespace, recallPath)
     return { additionalContext: block, neurostrataContext: block, snippets }
   }
 
@@ -3758,7 +3782,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
         // The recall block never reaches the caller on a rejection, so the
         // prefetch dedup state is rolled back: an allowed retry must still
         // see the governing rules.
-        if (filePath) restorePrefetchDelivery(config.namespace, filePath)
+        if (recallPath) restorePrefetchDelivery(config.namespace, recallPath)
         if (
           message.includes('Zero-Action Start violation:') ||
           message.includes('Guard rejected')
@@ -3772,7 +3796,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     if (!shellExempt) mutationsSinceNote++
   }
 
-  if (filePath) confirmPrefetchDelivery(config.namespace, filePath)
+  if (recallPath) confirmPrefetchDelivery(config.namespace, recallPath)
   if (block) {
     enqueuePendingRecall(block, asRecord(input), args)
     return { additionalContext: block, neurostrataContext: block, snippets }
@@ -4008,11 +4032,14 @@ export async function handleHookEvent(
     if (isFileTouchTool(toolNameRaw)) {
       const filePath = extractFilePath(toolInput, undefined, toolInputRaw)
       if (filePath) {
-        recalledFilePath = filePath
+        recalledFilePath = absoluteToolPath(
+          filePath,
+          asString(event.cwd) ?? process.cwd()
+        )
         try {
           const snippets = await prefetchMemoriesForFile(
             config.namespace,
-            filePath
+            recalledFilePath
           )
           if (snippets.length > 0)
             recallBlock = formatFileTouchRecallBlock(filePath, snippets)
