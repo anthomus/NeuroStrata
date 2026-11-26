@@ -61,7 +61,9 @@ const ROLLOVER_BYTES: u64 = 500 * 1024;
 /// request has taught the cache resolves to the construction root, which
 /// keeps a single-project daemon's behavior byte-identical.
 pub struct EpisodicPointerEcho {
-    project_root: PathBuf,
+    /// `None` when the daemon serves no project: only an explicit anchor
+    /// then gets a pointer.
+    project_root: Option<PathBuf>,
     /// Namespace → project-root anchors, for a daemon that serves more than
     /// one project. [`Self::root_for`] consults it first and falls back to
     /// the automatic `.NeuroStrata` marker lookup, then to the construction
@@ -81,7 +83,7 @@ pub struct EpisodicPointerEcho {
 impl EpisodicPointerEcho {
     /// `project_root` is the same root `neurostrata_append_log` is given: the
     /// buffer lives at `<project_root>/.NeuroStrata/sessions/`.
-    pub fn new(project_root: impl Into<PathBuf>) -> Self {
+    pub fn new(project_root: impl Into<Option<PathBuf>>) -> Self {
         Self::with_anchors(project_root, std::collections::HashMap::new())
     }
 
@@ -94,7 +96,7 @@ impl EpisodicPointerEcho {
     /// [`root_for`](Self::root_for) does per pulse) and, failing that, to
     /// `project_root`.
     pub fn with_anchors(
-        project_root: impl Into<PathBuf>,
+        project_root: impl Into<Option<PathBuf>>,
         anchors: std::collections::HashMap<String, PathBuf>,
     ) -> Self {
         Self {
@@ -109,7 +111,7 @@ impl EpisodicPointerEcho {
     /// without editing a machine-global file.
     #[cfg(test)]
     fn with_config(
-        project_root: impl Into<PathBuf>,
+        project_root: impl Into<Option<PathBuf>>,
         load_config: fn() -> buffer::BufferConfig,
     ) -> Self {
         Self {
@@ -126,12 +128,15 @@ impl EpisodicPointerEcho {
     /// sibling checkout whose directory name is the namespace and which
     /// carries a `.NeuroStrata` marker — while an unresolvable namespace
     /// stays on the construction root, exactly where a single-project daemon
-    /// always wrote.
-    fn root_for(&self, namespace: &str) -> PathBuf {
-        self.anchors.get(namespace).cloned().unwrap_or_else(|| {
-            resolve_anchor_for_namespace(namespace, &self.project_root)
-                .unwrap_or_else(|| self.project_root.clone())
-        })
+    /// always wrote. Without a construction root (the daemon serves no
+    /// project) only an explicit anchor resolves, and `None` means the echo
+    /// writes nothing.
+    fn root_for(&self, namespace: &str) -> Option<PathBuf> {
+        if let Some(anchor) = self.anchors.get(namespace) {
+            return Some(anchor.clone());
+        }
+        let root = self.project_root.as_ref()?;
+        Some(resolve_anchor_for_namespace(namespace, root).unwrap_or_else(|| root.clone()))
     }
 }
 
@@ -204,7 +209,13 @@ impl MemorySubscriber for EpisodicPointerEcho {
             return Ok(());
         }
 
-        let project_root = self.root_for(namespace);
+        let Some(project_root) = self.root_for(namespace) else {
+            tracing::debug!(
+                subscriber = self.name(),
+                "the daemon serves no project; no pointer written"
+            );
+            return Ok(());
+        };
         let buffer_file = current_log(&project_root);
         if already_echoed(&buffer_file, id, kind) {
             tracing::debug!(
@@ -737,14 +748,66 @@ mod tests {
         for hostile in ["", ".", "..", "a/b", r"a\b"] {
             assert_eq!(
                 echo.root_for(hostile),
-                project,
+                Some(project.clone()),
                 "a path-like namespace stays on the construction root: {hostile:?}"
             );
         }
         assert_eq!(
             echo.root_for("AnchoredSecondProject"),
-            project,
+            Some(project),
             "no sibling and no anchor: construction root"
+        );
+    }
+
+    /// A daemon that serves no project writes no pointer. Positive controls
+    /// on the same bus: an echo with a root writes the pulse there, and the
+    /// rootless echo still serves an explicit anchor, so the rootless echo
+    /// ran and chose not to write.
+    #[tokio::test]
+    async fn an_echo_without_a_root_writes_nothing() {
+        let served = scratch("no-root-served");
+        let anchored = scratch("no-root-anchored");
+        let rootless = EpisodicPointerEcho {
+            project_root: None,
+            anchors: [("Anchored".to_string(), anchored.clone())].into(),
+            load_config: buffer_on,
+        };
+        assert_eq!(rootless.root_for("NeuroStrata"), None);
+
+        let bus = ThalamicBus::new(16);
+        bus.register(Box::new(rootless));
+        bus.register(Box::new(echo_of(&served)));
+        bus.emit(created("mem-unserved", "task"), &RecursionToken::root());
+        bus.emit(
+            ThalamicPulse::Created {
+                id: "mem-anchored".to_string(),
+                namespace: "Anchored".to_string(),
+                kind: "task".to_string(),
+            },
+            &RecursionToken::root(),
+        );
+
+        // Pulses dispatch in order, so once the anchored pointer lands the
+        // rootless echo has handled the first pulse too.
+        let read = |root: &Path| std::fs::read_to_string(buffer_file(root)).ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !read(&anchored).is_some_and(|t| t.contains("mem-anchored")) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the anchored pointer never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let served_text = read(&served).expect("the echo with a root writes its buffer");
+        assert!(
+            served_text.contains("mem-unserved"),
+            "positive control: {served_text:?}"
+        );
+        let anchored_text = read(&anchored).unwrap();
+        assert!(
+            !anchored_text.contains("mem-unserved"),
+            "the rootless echo wrote the unserved pulse nowhere: {anchored_text:?}"
         );
     }
 

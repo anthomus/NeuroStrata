@@ -505,8 +505,14 @@ pub async fn start_daemon(
     // project.
     // Each harness config keeps its own namespace; a config naming none is
     // not written (an empty or made-up namespace is never written).
-    let startup_root = resolve_project_root();
-    let _ = crate::task::harness_plugins::boot_install_plugins(&startup_root);
+    match served_project_root() {
+        Some(root) => {
+            let _ = crate::task::harness_plugins::boot_install_plugins(&root);
+        }
+        None => tracing::info!(
+            "the daemon's working folder is not a project; no plugins installed there"
+        ),
+    }
     if let Ok(cfg) = crate::config::Config::load() {
         for dir in cfg.project_contexts.values() {
             let _ = crate::task::harness_plugins::boot_install_project_context(dir);
@@ -543,12 +549,13 @@ pub(crate) const BUS_CAPACITY: usize = 10_000;
 /// is a fixed-size `FLOAT[N]`, and the wrong width is a rejected write.
 ///
 /// `project_root` anchors `EpisodicPointerEcho`'s buffer. The production
-/// caller is [`daemon_bus`], which resolves it from the environment rather
-/// than guessing from the process's directory; tests pass a scratch root.
+/// caller is [`daemon_bus`], which passes [`served_project_root`]: `None`
+/// when the daemon serves no project, and the echo then writes nothing.
+/// Tests pass a scratch root.
 pub(crate) fn build_thalamic_bus(
     vector_store: Arc<dyn VectorStore>,
     dimensions: usize,
-    project_root: impl Into<PathBuf>,
+    project_root: impl Into<Option<PathBuf>>,
 ) -> Arc<ThalamicBus> {
     let bus = Arc::new(ThalamicBus::new(BUS_CAPACITY));
     bus.attach_store(vector_store);
@@ -571,6 +578,9 @@ const PROJECT_ROOT_ENV: &str = "NEUROSTRATA_PROJECT_ROOT";
 /// a unit file or wrapper shell sets; the cwd stays as the fallback so a
 /// plain `neurostrata-mcp daemon` on a developer's machine still serves the
 /// tree it was started from.
+///
+/// This root also bounds caller-path checks, so it always answers; where the
+/// daemon writes files is [`served_project_root`]'s answer.
 pub(crate) fn resolve_project_root() -> PathBuf {
     match std::env::var_os(PROJECT_ROOT_ENV) {
         Some(root) if !root.is_empty() => PathBuf::from(root),
@@ -589,6 +599,42 @@ pub(crate) fn resolve_project_root() -> PathBuf {
             }
         },
     }
+}
+
+/// The project the daemon writes plugin and session files into: the env var
+/// as given, else the process directory only when it is a project (a git
+/// checkout or a folder holding `.NeuroStrata/config.json`). An autostarted
+/// daemon starts in the home folder or the binary's folder, and files written
+/// there belong to no project, so then there is no served root.
+pub(crate) fn served_project_root() -> Option<PathBuf> {
+    let env = std::env::var_os(PROJECT_ROOT_ENV)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from);
+    // An unreadable cwd becomes the empty path, which is refused like a
+    // filesystem root.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    served_root_for(env, &cwd, dirs::home_dir().as_deref())
+}
+
+fn served_root_for(env: Option<PathBuf>, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if env.is_some() {
+        return env;
+    }
+    // A workspace folder above checkouts still counts when it holds a
+    // project config, so only these two refusals apply here.
+    if matches!(
+        crate::root_marker::refuse_root_target_with(cwd, home),
+        Some("home folder" | "filesystem root")
+    ) {
+        return None;
+    }
+    // A bare `.NeuroStrata` folder is no proof: earlier daemons left
+    // `plugins/` and `sessions/` in folders that are not projects. A git
+    // checkout counts only when its top is no home folder (a dotfiles repo).
+    let is_project = crate::paths::git_root_of_dir(&cwd.to_string_lossy()).is_some_and(|root| {
+        crate::root_marker::refuse_root_target_with(Path::new(&root), home).is_none()
+    }) || cwd.join(".NeuroStrata").join("config.json").is_file();
+    is_project.then(|| cwd.to_path_buf())
 }
 
 /// The caller-path policy (Task 2 re-file / J6 / `neurostrata-p1ex`): may the daemon act on
@@ -736,7 +782,7 @@ pub(crate) fn daemon_bus(
     vector_store: Arc<dyn VectorStore>,
     dimensions: usize,
 ) -> Arc<ThalamicBus> {
-    build_thalamic_bus(vector_store, dimensions, resolve_project_root())
+    build_thalamic_bus(vector_store, dimensions, served_project_root())
 }
 
 /// How often the mesh-worker drains the outbox when no mutation wakes it first.
@@ -3246,6 +3292,82 @@ mod tests {
         assert!(
             std::env::var_os(PROJECT_ROOT_ENV).is_none(),
             "the var is restored to unset so no later test observes this root"
+        );
+    }
+
+    /// The served root decides where the daemon writes files, so the cwd
+    /// counts only when it is a project; the env var always wins.
+    #[test]
+    fn the_cwd_is_served_only_when_it_is_a_project() {
+        let home = scratch_root("served-home");
+        std::fs::create_dir_all(home.join(".NeuroStrata")).unwrap();
+        std::fs::write(home.join(".NeuroStrata").join("config.json"), "{}").unwrap();
+        assert_eq!(
+            served_root_for(None, &home, Some(&home)),
+            None,
+            "the home folder is never served, even with a project config"
+        );
+
+        let plain = scratch_root("served-plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            served_root_for(None, &plain, None),
+            None,
+            "no .git, no config"
+        );
+
+        let leftovers = scratch_root("served-leftovers");
+        std::fs::create_dir_all(leftovers.join(".NeuroStrata").join("plugins")).unwrap();
+        assert_eq!(
+            served_root_for(None, &leftovers, None),
+            None,
+            "a bare .NeuroStrata folder left by an earlier daemon is no project"
+        );
+
+        let checkout = scratch_root("served-git");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        assert_eq!(
+            served_root_for(None, &checkout, None),
+            Some(checkout.clone())
+        );
+
+        let configured = scratch_root("served-config");
+        std::fs::create_dir_all(configured.join(".NeuroStrata")).unwrap();
+        std::fs::write(configured.join(".NeuroStrata").join("config.json"), "{}").unwrap();
+        assert_eq!(
+            served_root_for(None, &configured, None),
+            Some(configured.clone())
+        );
+
+        let workspace = scratch_root("served-workspace");
+        std::fs::create_dir_all(workspace.join("app").join(".git")).unwrap();
+        assert_eq!(
+            served_root_for(None, &workspace, None),
+            None,
+            "a workspace folder above checkouts is no project by itself"
+        );
+        std::fs::create_dir_all(workspace.join(".NeuroStrata")).unwrap();
+        std::fs::write(workspace.join(".NeuroStrata").join("config.json"), "{}").unwrap();
+        assert_eq!(
+            served_root_for(None, &workspace, None),
+            Some(workspace.clone()),
+            "a project config counts even above a nested checkout"
+        );
+
+        let dotfiles_home = scratch_root("served-dotfiles-home");
+        let bin = dotfiles_home.join(".cargo").join("bin");
+        std::fs::create_dir_all(dotfiles_home.join(".git")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        assert_eq!(
+            served_root_for(None, &bin, Some(&dotfiles_home)),
+            None,
+            "a folder inside a home that is a dotfiles checkout is no project"
+        );
+
+        assert_eq!(
+            served_root_for(Some(checkout.clone()), &plain, None),
+            Some(checkout),
+            "the env var names the served project wherever the daemon sits"
         );
     }
 
