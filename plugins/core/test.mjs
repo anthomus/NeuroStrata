@@ -12,7 +12,7 @@ import {
   symlinkSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
-import { join, isAbsolute, resolve, dirname } from 'node:path'
+import { join, isAbsolute, resolve, dirname, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { execFileSync as execFileSyncTop, spawn } from 'node:child_process'
 
@@ -3393,7 +3393,7 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         'memories_for_file must run for the patched file'
       )
       assert.ok(
-        counters.memoriesForFilePaths.includes(resolve('src/codex.rs')),
+        counters.memoriesForFilePaths.includes(`${process.cwd()}${sep}src/codex.rs`),
         `patched path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`
       )
       const blob = JSON.stringify(result ?? {})
@@ -3431,7 +3431,7 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         'memories_for_file must run for the added file'
       )
       assert.ok(
-        counters.memoriesForFilePaths.includes(resolve('src/new.rs')),
+        counters.memoriesForFilePaths.includes(`${process.cwd()}${sep}src/new.rs`),
         `added path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`
       )
       const blob = JSON.stringify(result ?? {})
@@ -3510,7 +3510,7 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       )
       assert.ok(
         counters.memoriesForFilePaths.includes(
-          resolve('notebooks/analysis.ipynb')
+          `${process.cwd()}${sep}notebooks/analysis.ipynb`
         ),
         `the notebook path must be recalled, got ${JSON.stringify(counters.memoriesForFilePaths)}`
       )
@@ -3576,7 +3576,7 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         tool_input: { command: patch }
       })
       assert.ok(
-        counters.memoriesForFilePaths.includes(resolve('src/run.rs')),
+        counters.memoriesForFilePaths.includes(`${process.cwd()}${sep}src/run.rs`),
         `the patched path must be recalled, got ${JSON.stringify(counters.memoriesForFilePaths)}`
       )
       assert.equal(counters.guardValidate, 1)
@@ -3679,6 +3679,24 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         assert.deepEqual(counters.memoriesForFilePaths, [
           resolve(root, 'one', 'lib.rs'),
           resolve(root, 'two', 'lib.rs')
+        ])
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+
+    // `..` after a symlink names a different file than the lexical collapse,
+    // so the daemon resolves it, not the plugin.
+    it('a relative path keeps its .. parts', async () => {
+      const { server, url, counters } = await createMockDaemonServer()
+      const root = mkdtempSync(join(tmpdir(), 'ns-abs-dotdot-'))
+      try {
+        await start(url)
+        await readFrom(root, { file_path: 'sub/../x.rs' })
+        assert.deepEqual(counters.memoriesForFilePaths, [
+          `${root}${sep}sub/../x.rs`
         ])
       } finally {
         server.close()

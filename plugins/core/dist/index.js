@@ -209,10 +209,11 @@ function isAbsoluteAny(p) {
 /**
  * A tool call's file path made absolute against the folder the agent works
  * in. The daemon resolves a relative path against the project root, which is
- * the wrong file when the agent works in a subfolder.
+ * the wrong file when the agent works in a subfolder. The path is prefixed,
+ * not normalized: `..` after a symlink is left for the daemon to resolve.
  */
 function absoluteToolPath(p, baseDir) {
-    return isAbsoluteAny(p) ? p : resolve(baseDir, p);
+    return isAbsoluteAny(p) ? p : `${baseDir}${sep}${p}`;
 }
 /** The canonical spelling of an existing path, as Rust's `dunce` gives it. */
 function canonicalPath(p) {
