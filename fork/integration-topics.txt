@@ -1,0 +1,9 @@
+# Topic branches merged into the integration branch, in this order. One branch
+# per line; text after # is a note. Every topic starts from upstream main.
+# Remove a topic when upstream merges it.
+fix/session-file-drops-finished-task   # upstream PR #430
+feat/task-get                          # upstream PR #437 (draft); fork PR #54, merged main + task_summary(.., true)
+fix/literal-dotdot-spelling            # fork PR #58
+fix/task-note-redaction                # fork PR #57; alternative to upstream #449
+fix/supersede-keeps-access-count       # fork PR #59
+# feat/session-start                   # out of RC 2026-11-26: 12-file conflict with main; held: #420 PRs 7-9; rebuild on ContextService, reconcile with #435
