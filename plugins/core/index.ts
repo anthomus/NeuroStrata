@@ -38,7 +38,8 @@ import {
   isAbsolute,
   join,
   relative,
-  resolve
+  resolve,
+  sep
 } from 'node:path'
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1024,11 +1025,14 @@ function effectiveProjectRoot(config: ResolvedConfig): string {
 
 /**
  * The recall label for a touched file: its absolute path relative to the
- * project root, or the path as given when it lies outside the root.
+ * project root, written with `/` on every host, or the path as given when it
+ * lies outside the root.
  */
 function pathRelativeToProjectRoot(absPath: string, config: ResolvedConfig): string {
   const rel = relative(effectiveProjectRoot(config), absPath)
-  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel) ? rel : absPath
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
+    ? rel.split(sep).join('/')
+    : absPath
 }
 
 // ──────────────────────────────────────────────────────────────────────
