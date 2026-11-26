@@ -1717,6 +1717,24 @@ describe('OpenCode handlers join a relative tool path onto the ctx folder', () =
     }
   })
 
+  it('execute.after labels sub/lib.rs relative to the project root', async () => {
+    const { server, url } = await createMockDaemonServer()
+    const root = mkdtempSync(join(tmpdir(), 'ns-oc-label-'))
+    try {
+      const h = await startOpenCode(url, root, { v2: true })
+      const evt = afterRead('lib.rs')
+      await h['execute.after'](evt)
+      assert.ok(
+        evt.result.content.includes('[NeuroStrata File Context — sub/lib.rs]'),
+        `label must be sub/lib.rs, got ${evt.result.content}`
+      )
+    } finally {
+      server.close()
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
   it('a guard rejection restores the absolute path so the retry recalls', async () => {
     let reject = true
     const { server, url, counters } = await createMockDaemonServer({
@@ -3666,6 +3684,66 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         server.close()
         rmSync(root, { recursive: true, force: true })
         resetModuleState()
+      }
+    })
+
+    // The recall label names the file relative to the project root, so an
+    // agent in a subfolder sees which file the rules govern.
+    const startAt = async (url, directory) =>
+      initialize({
+        directory,
+        config: {
+          namespace: 'abs-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: false,
+          requestTimeoutMs: 500
+        },
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+    const labelOf = (out) => {
+      const m = /\[NeuroStrata Governing Memories for ([^\]]*)\]/.exec(
+        String(out?.systemMessage ?? '')
+      )
+      return m ? m[1] : null
+    }
+
+    it('the label is relative to the project root from a subfolder', async () => {
+      const { server, url } = await createMockDaemonServer()
+      const root = mkdtempSync(join(tmpdir(), 'ns-abs-label-'))
+      try {
+        await startAt(url, root)
+        const out = await readFrom(join(root, 'sub'), { file_path: 'lib.rs' })
+        assert.equal(labelOf(out), 'sub/lib.rs')
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+
+    it('Windows and POSIX labels use / and keep outside paths', async () => {
+      const cases = [
+        ['C:/repo', 'C:\\repo\\sub\\lib.rs', 'sub/lib.rs'],
+        ['C:\\repo', 'C:\\repo\\sub\\lib.rs', 'sub/lib.rs'],
+        ['C:\\repo', 'c:/Repo/sub/lib.rs', 'sub/lib.rs'],
+        ['C:\\repo', 'D:\\other\\lib.rs', 'D:\\other\\lib.rs'],
+        ['C:\\repo', '/repo/sub/lib.rs', '/repo/sub/lib.rs'],
+        ['/repo', '/repo/sub/lib.rs', 'sub/lib.rs'],
+        ['/repo', '/other/lib.rs', '/other/lib.rs'],
+        ['/repo', 'C:\\repo\\sub\\lib.rs', 'C:\\repo\\sub\\lib.rs']
+      ]
+      for (const [root, filePath, label] of cases) {
+        const { server, url } = await createMockDaemonServer()
+        try {
+          await startAt(url, root)
+          const out = await readFrom('/elsewhere', { file_path: filePath })
+          assert.equal(labelOf(out), label, `${root} + ${filePath}`)
+        } finally {
+          server.close()
+          resetModuleState()
+        }
       }
     })
   })

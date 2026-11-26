@@ -32,7 +32,15 @@ import {
   writeFileSync
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, join, relative, resolve } from 'node:path'
+import {
+  basename,
+  dirname,
+  join,
+  posix,
+  relative,
+  resolve,
+  win32
+} from 'node:path'
 
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
@@ -1016,27 +1024,34 @@ function effectiveProjectRoot(config: ResolvedConfig): string {
 }
 
 /**
- * Make a touched-file path relative to the project root when it lives under
- * it, so the injected `[NeuroStrata File Context — <relPath>]` block is
- * stable and short. Falls back to the raw path otherwise.
+ * The recall label for a touched file: its absolute path made relative to
+ * the project root, with `/` separators, so the label names the same file
+ * from whichever folder the agent works in. A path outside the root is
+ * returned as given.
  */
 function pathRelativeToProjectRoot(
-  filePath: string,
+  absPath: string,
   config: ResolvedConfig
 ): string {
   const root = effectiveProjectRoot(config)
+  const isWindowsPath = (p: string) =>
+    /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\')
+  // The root's style picks the path rules (win32 compares case-insensitively
+  // and takes either slash); an absolute path of the other style is outside.
+  const windows = isWindowsPath(root)
+  if (isAbsoluteAny(absPath) && isWindowsPath(absPath) !== windows) {
+    return absPath
+  }
+  const p = windows ? win32 : posix
   try {
-    // Resolve a relative filePath against the project root (not process.cwd())
-    // so the startsWith check below is meaningful when cwd != projectRoot.
-    const resolved = resolve(root, filePath)
-    const rootWithSep = root.endsWith('/') ? root : root + '/'
-    if (resolved === root || resolved.startsWith(rootWithSep)) {
-      return resolved.slice(root.length).replace(/^\/+/, '')
+    const rel = p.relative(p.resolve(root), p.resolve(root, absPath))
+    if (rel !== '..' && !rel.startsWith('..' + p.sep) && !p.isAbsolute(rel)) {
+      return rel.split(p.sep).join('/')
     }
   } catch {
-    // fall through to the raw path
+    // fall through to the given path
   }
-  return filePath
+  return absPath
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -3489,9 +3504,8 @@ const executeAfterHandler = async (
       event?.input?.path ??
       event?.toolInput?.path
     if (filePath) {
-      // The label keeps the agent's spelling; dedup keys on the recalled path.
-      const normalizedPath = pathRelativeToProjectRoot(String(filePath), config)
       const fp = absoluteToolPath(String(filePath), agentDirFromCtx(pluginCtx))
+      const normalizedPath = pathRelativeToProjectRoot(fp, config)
       const dedupKey = `${sessionId ?? '__no_session__'}:${epoch}:${fp}`
       const seen = sessionSeenFiles(sessionId)
       if (!seen.has(dedupKey)) {
@@ -3694,8 +3708,6 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
   // Bug 5: file-touch recall.
   let snippets: string[] = []
   let filePath: string | undefined
-  // The block shows the agent's own spelling; recall and its dedup key use
-  // the absolute path.
   let recallPath: string | undefined
   if (isFileTouchTool(toolName)) {
     filePath = extractFilePath(args, altArgs, input?.input)
@@ -3709,8 +3721,11 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     }
   }
   let block: string | undefined
-  if (snippets.length > 0 && filePath) {
-    block = formatFileTouchRecallBlock(filePath, snippets)
+  if (snippets.length > 0 && recallPath) {
+    block = formatFileTouchRecallBlock(
+      pathRelativeToProjectRoot(recallPath, config),
+      snippets
+    )
     input.additionalContext = block
     input.neurostrataContext = block
   }
@@ -4042,7 +4057,10 @@ export async function handleHookEvent(
             recalledFilePath
           )
           if (snippets.length > 0)
-            recallBlock = formatFileTouchRecallBlock(filePath, snippets)
+            recallBlock = formatFileTouchRecallBlock(
+              pathRelativeToProjectRoot(recalledFilePath, config),
+              snippets
+            )
         } catch {
           // prefetch failures are fail-soft
         }
