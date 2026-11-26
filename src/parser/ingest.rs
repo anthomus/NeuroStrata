@@ -74,10 +74,19 @@ pub fn is_ingest_eligible_path(path: &Path, root: &Path) -> bool {
     if !is_within(path, root) {
         return false;
     }
-    if path_is_in_skipped_dir(path) {
+    // Only the part below the root counts: a project that itself sits under
+    // a folder named `build` or `target` is still ingested.
+    if path_is_in_skipped_dir(below_root(path, root)) {
         return false;
     }
     !is_store_artifact(path)
+}
+
+/// `path` with its `root` prefix removed, for matching skipped folders.
+/// Callers walk from the root as given, so the root prefixes the path; when
+/// it does not, the whole path is checked, as before.
+fn below_root<'a>(path: &'a Path, root: &Path) -> &'a Path {
+    path.strip_prefix(root).unwrap_or(path)
 }
 
 /// Lexical root containment that copes with relative roots (CLI-style) as well
@@ -6326,6 +6335,28 @@ use super::x;"#;
             std::path::Path::new("/tmp/fresh-root/src/lib.rs"),
             root
         ));
+    }
+
+    /// A project inside a folder named like a skipped one (`build`, `target`)
+    /// is ingested: only folders below the root are matched.
+    #[test]
+    fn eligibility_ignores_skipped_names_above_the_root() {
+        for root in ["/home/u/build/proj", "/work/target/app", "/srv/vendor/x"] {
+            let root = std::path::Path::new(root);
+            assert!(is_ingest_eligible_path(&root.join("src").join("lib.rs"), root), "{}", root.display());
+            assert!(!is_ingest_eligible_path(&root.join("target").join("x.rs"), root), "{}", root.display());
+            assert!(!is_ingest_eligible_path(&root.join("node_modules").join("a.js"), root), "{}", root.display());
+        }
+        // A trailing slash on the root and a `.` in the path: Path components
+        // drop both.
+        let root = std::path::Path::new("/home/u/build/proj/");
+        assert!(is_ingest_eligible_path(
+            std::path::Path::new("/home/u/build/./proj/src/lib.rs"),
+            root
+        ));
+        // A root itself named like a skipped folder: main rejected this.
+        let root = std::path::Path::new("/x/target");
+        assert!(is_ingest_eligible_path(&root.join("src").join("lib.rs"), root));
     }
 
     #[test]
