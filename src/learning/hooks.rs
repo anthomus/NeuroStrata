@@ -894,11 +894,14 @@ pub async fn on_action_reverted(
     namespace: &str,
     outcome: &ActionRevertOutcome,
 ) -> ActionRevertHookReport {
+    // The queue belongs to the learning root with the other learning files,
+    // not the daemon's project root: that falls back to the working folder,
+    // which for an autostarted daemon is the home folder or ~/.cargo/bin.
     on_action_reverted_with_root(
         store,
         namespace,
         outcome,
-        &crate::daemon::resolve_project_root(),
+        &crate::learning::control::default_learning_dir(),
     )
     .await
 }
@@ -908,7 +911,7 @@ pub async fn on_action_reverted_with_root(
     store: &LadybugStore,
     namespace: &str,
     outcome: &ActionRevertOutcome,
-    project_root: &Path,
+    learning_root: &Path,
 ) -> ActionRevertHookReport {
     let mut report = ActionRevertHookReport {
         revert_receipt_id: outcome.revert_receipt_id.clone(),
@@ -934,7 +937,7 @@ pub async fn on_action_reverted_with_root(
         .map(|r| &r.payload)
         .collect();
     let targets = collect_reflection_targets(&rows, None, &reverted_payloads, "", None);
-    let queue = crate::judgment::laya_onnx::ContradictionQueue::new(project_root);
+    let queue = crate::judgment::laya_onnx::ContradictionQueue::new(learning_root);
     let now = chrono::Utc::now();
     let mut reflected = BTreeSet::new();
     for target in &targets {
@@ -1424,6 +1427,107 @@ mod tests {
         let rep2 = on_action_reverted_with_root(ls, "ns-e", &outcome, &root).await;
         assert_eq!(rep2.negative_reflections, 0);
         assert_eq!(rep2.contradictions_queued, 0);
+    }
+
+    /// The production hook queues under the learning dir, where the other
+    /// learning files live, never in the daemon's project root or cwd.
+    #[test]
+    fn revert_hook_queues_under_the_learning_dir_not_the_project_root() {
+        /// Restores both variables on drop, so a panic inside the hook run
+        /// cannot leave them pointing at temp dirs for later tests.
+        struct RootEnvGuard {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            previous: [(&'static str, Option<std::ffi::OsString>); 2],
+        }
+        impl Drop for RootEnvGuard {
+            fn drop(&mut self) {
+                for (name, value) in &self.previous {
+                    match value {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        let project_root = tmp_dir("revert-project-root");
+        let learning_dir = tmp_dir("revert-learning-dir");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let _env = RootEnvGuard {
+            _lock: crate::daemon::project_root_env_test_lock(),
+            previous: [
+                (
+                    "NEUROSTRATA_PROJECT_ROOT",
+                    std::env::var_os("NEUROSTRATA_PROJECT_ROOT"),
+                ),
+                (
+                    "NEUROSTRATA_LEARNING_DIR",
+                    std::env::var_os("NEUROSTRATA_LEARNING_DIR"),
+                ),
+            ],
+        };
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &project_root);
+        std::env::set_var("NEUROSTRATA_LEARNING_DIR", &learning_dir);
+
+        let rep = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tmp_dir("revert-hook-prod");
+                let store = LadybugStore::for_testing(&dir, 4).expect("store");
+                store.init("ns-e").await.unwrap();
+                let mut reverted = receipt_row("apply-1", "t1", "do-thing", true);
+                if let Some(ar) = reverted.payload.metadata.get_mut("action_receipt") {
+                    ar["governs"] = j!(["rule-gov"]);
+                }
+                seed(
+                    &store,
+                    "ns-e",
+                    vec![reverted, memory("rule-gov", "rule", j!({}))],
+                )
+                .await;
+                let outcome = ActionRevertOutcome {
+                    reverted_receipt_id: "apply-1".to_string(),
+                    active_receipt_version_id: "apply-1-v2".to_string(),
+                    revert_receipt_id: "revert-1".to_string(),
+                    revert_receipt: ActionReceiptPayload {
+                        receipt_id: "revert-1".to_string(),
+                        action_slug: "revert-do-thing".to_string(),
+                        principal: "agent".to_string(),
+                        executed_at: 1_700_000_010,
+                        params: Default::default(),
+                        target_pointer_id: None,
+                        target_pool_id: None,
+                        superseded_pairs: vec![],
+                        created_ids: vec![],
+                        twin_deltas: vec![],
+                        edge_deltas: vec![],
+                        row_deltas: vec![],
+                        task_deltas: vec![],
+                        reverted_at: None,
+                        reverted_by_receipt_id: None,
+                        reverts_receipt_id: Some("apply-1".to_string()),
+                        forced_by: None,
+                        forced_at: None,
+                    },
+                    forced: false,
+                };
+                on_action_reverted(&store, "ns-e", &outcome).await
+            });
+
+        assert!(rep.errors.is_empty(), "revert hook errors: {:?}", rep.errors);
+        assert_eq!(rep.contradictions_queued, 1);
+        let queued = crate::judgment::laya_onnx::ContradictionQueue::new(&learning_dir)
+            .pending()
+            .unwrap();
+        assert_eq!(queued.len(), 1, "the request lands in the learning dir");
+        assert_eq!(queued[0].target_memory_id, "rule-gov");
+        assert!(
+            !project_root.join("contradiction_queue.jsonl").exists()
+                && !project_root.join("contradiction_queue.lock").exists(),
+            "nothing may be written into the daemon's project root"
+        );
     }
 
     // ── Review-fix regressions (F1–F6) ──────────────────────────────────────
