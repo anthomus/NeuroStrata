@@ -8823,15 +8823,21 @@ impl LadybugStore {
             .to_string();
         doc.location = payload.location.clone();
         doc.valid_from = metadata.get("valid_from").and_then(|v| v.as_i64());
-        // Align with is_retired_at contract (ladybug.rs:5528): unparseable/non-null
-        // valid_to treated as 0 (retired); null → unspecified (active).
-        doc.valid_to = metadata.get("valid_to").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                Some(v.as_i64().unwrap_or(0))
-            }
-        });
+        // Align with the is_retired_at contract: unparseable/non-null valid_to
+        // reads as 0 (retired); null → unspecified (active); a row that names
+        // its replacement without a valid_to is retired at an unknown time,
+        // which also reads as 0. The in-house engine and the WASM export
+        // judge retirement from this field alone.
+        doc.valid_to = metadata
+            .get("valid_to")
+            .and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    Some(v.as_i64().unwrap_or(0))
+                }
+            })
+            .or_else(|| is_superseded(metadata).then_some(0));
         doc.archived = is_archived(metadata);
         // PAR-02 B4 owner parity: the vector route resolves the owner as
         // user_id, then metadata.user_id / mesh / lifecycle. Using the raw
@@ -19420,6 +19426,37 @@ eurostrata\src\daemon.rs",
         assert_eq!(payload.metadata["superseded_by"], json!("rule-b"));
     }
 
+    /// The in-house lexical engine and the WASM export judge retirement from
+    /// the lexical document alone, without the store's check on hydration.
+    #[tokio::test]
+    async fn lexical_search_and_wasm_export_leave_out_a_superseded_memory() {
+        let store = superseded_chain_store().await;
+        let rule_ids = |ids: Vec<String>| -> Vec<String> {
+            let mut ids: Vec<String> = ids
+                .into_iter()
+                .filter(|id| id.starts_with("rule-"))
+                .collect();
+            ids.sort();
+            ids
+        };
+        let lexical = store
+            .search_lexical("probe", "rule", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            rule_ids(lexical.into_iter().map(|r| r.id).collect()),
+            vec!["rule-c".to_string()]
+        );
+        let (docs, _) = store.export_wasm_snapshot("probe", false).await.unwrap();
+        assert_eq!(
+            rule_ids(docs.into_iter().map(|d| d.id).collect()),
+            vec!["rule-c".to_string()]
+        );
+        let (docs, _) = store.export_wasm_snapshot("probe", true).await.unwrap();
+        assert_eq!(rule_ids(docs.into_iter().map(|d| d.id).collect()).len(), 3);
+    }
+
     #[test]
     fn a_declaration_prefers_its_own_namespace_then_its_exact_id_then_one_suffix() {
         // Generation 5 is active; the qualified form is now generation-scoped.
@@ -26685,12 +26722,14 @@ eurostrata\src\daemon.rs",
             .iter()
             .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap())
             .collect();
+        // mem-rule-a names its replacement, so it is retired and no longer
+        // counts as a caller, though its SUPERSEDES target is still related.
         assert_eq!(
             caller_ids.len(),
-            3,
+            2,
             "callers depend on file symbols: {caller_ids:?}"
         );
-        assert!(caller_ids.contains(&"mem-rule-a"));
+        assert!(!caller_ids.contains(&"mem-rule-a"));
         assert!(caller_ids.contains(&"mem-sym-foo"));
         assert!(caller_ids.contains(&"mem-sym-x"));
 
