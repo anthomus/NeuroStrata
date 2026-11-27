@@ -748,6 +748,80 @@ const TASK_BLOCK_ENTRIES_HEADER: &str = "- Auto-Retrieved Governing Rules & Grap
 /// The line that opens the conceptual bridges in a rendered task block.
 const TASK_BLOCK_BRIDGES_HEADER: &str = "### Cross-Domain Bridges";
 
+/// The retirement checks search applies to a memory row: not superseded,
+/// not past its `valid_to`, not archived.
+fn is_live_memory(row: &MemoryPayload, now: i64) -> bool {
+    row.metadata.get("superseded_by").is_none_or(Value::is_null)
+        && !crate::store::ladybug::is_retired_at(&row.metadata, now)
+        && !crate::handlers::archive_memory::is_archived(row)
+}
+
+/// `task_decisions` for `task_claim` and `task_get`: the live rule and fact
+/// memories of the namespace whose `metadata.waits_on` or
+/// `metadata.extracted_from` names `task_id` (one id or an array of ids),
+/// with their whole content, sorted by id. A ruling reaches search only when
+/// the question reuses its words; listing it by the task's key makes it reach
+/// whoever picks the task up.
+async fn task_decisions(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+) -> Result<Vec<Value>, String> {
+    // The id as it appears inside the stored metadata JSON text.
+    let encoded = serde_json::to_string(task_id).map_err(|e| e.to_string())?;
+    let rows = store
+        .list_metadata_containing(namespace, encoded.trim_matches('"'))
+        .await
+        .map_err(|e| e.to_string())?;
+    let names_task = |v: Option<&Value>| match v {
+        Some(Value::String(s)) => s == task_id,
+        Some(Value::Array(ids)) => ids.iter().any(|t| t.as_str() == Some(task_id)),
+        _ => false,
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut tied: Vec<&SearchResult> = rows
+        .iter()
+        .filter(|r| matches!(r.payload.memory_type.as_str(), "rule" | "fact"))
+        .filter(|r| {
+            names_task(r.payload.metadata.get("waits_on"))
+                || names_task(r.payload.metadata.get("extracted_from"))
+        })
+        .filter(|r| is_live_memory(&r.payload, now))
+        .collect();
+    tied.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(tied
+        .into_iter()
+        .map(|r| json!({ "id": r.id, "memory_type": r.payload.memory_type, "content": r.payload.content }))
+        .collect())
+}
+
+/// Puts `task_decisions` on a claim or get reply: always present, `[]` when
+/// nothing is tied to the task; a failed read adds `task_decisions_error`.
+async fn add_task_decisions(
+    reply: &mut Value,
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+) {
+    let decisions = task_decisions(store, namespace, task_id).await;
+    if let Some(obj) = reply.as_object_mut() {
+        match decisions {
+            Ok(list) => {
+                obj.insert("task_decisions".to_string(), json!(list));
+            }
+            Err(e) => {
+                obj.insert("task_decisions".to_string(), json!([]));
+                obj.insert(
+                    "task_decisions_error".to_string(),
+                    json!(format!(
+                        "could not read the memories tied to this task: {e}"
+                    )),
+                );
+            }
+        }
+    }
+}
+
 /// The active task's payload with the entries of its cached
 /// `subagent_prompt_injection` left out that quote a memory retired since the
 /// claim (superseded, expired or archived): memory entries naming it and
@@ -792,11 +866,7 @@ pub(crate) async fn task_payload_without_retired_entries(
         return payload.clone();
     };
     let now = chrono::Utc::now().timestamp();
-    let is_live = |row: &MemoryPayload| {
-        row.metadata.get("superseded_by").is_none_or(Value::is_null)
-            && !crate::store::ladybug::is_retired_at(&row.metadata, now)
-            && !crate::handlers::archive_memory::is_archived(row)
-    };
+    let is_live = |row: &MemoryPayload| is_live_memory(row, now);
     // An id is dropped only when no row found for it passes; the same id can
     // exist once in the task's namespace and once in `global`. Golden entries
     // are held to the test that picked them (`collect_golden_rules`), the
@@ -2984,7 +3054,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
                     return e;
                 }
             }
-            let body = json!({
+            let mut body = json!({
                 "id": id,
                 "namespace": namespace,
                 "status": from.as_str(),
@@ -2992,6 +3062,9 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
                 "note": "already claimed by this session",
                 "task": task_summary(&id, &task.payload, false),
             });
+            // Unlike the notes, the holder may not have these yet: a ruling
+            // can be tied to the task after the first claim.
+            add_task_decisions(&mut body, &store, &namespace, &id).await;
             return encode(&body);
         }
         KernelClaimDecision::RefuseLiveHolder => {
@@ -3174,6 +3247,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         "auto_retrieved_context": hits_json,
         "subagent_prompt_injection": subagent_prompt,
     });
+    add_task_decisions(&mut reply, &store, &namespace, &id).await;
     if let Some(hint) = hint_root
         .as_deref()
         .and_then(|root| crate::root_marker::root_hint(&namespace, root))
@@ -3573,7 +3647,9 @@ pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String
     }
     let retired = gate::is_retired(&task.payload.metadata, chrono::Utc::now().timestamp());
     label_history_row(&mut summary, &task.payload, retired);
-    encode(&json!({ "id": id, "namespace": namespace, "task": summary }))
+    let mut reply = json!({ "id": id, "namespace": namespace, "task": summary });
+    add_task_decisions(&mut reply, &store, &namespace, &id).await;
+    encode(&reply)
 }
 
 pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> String {
@@ -11662,6 +11738,190 @@ exit 0
         };
         assert_eq!(row("the old work")["retired"], json!(true), "{list}");
         assert_eq!(row("the shelved work")["archived"], json!(true), "{list}");
+    }
+
+    async fn put_tied_memory(
+        store: &Arc<dyn VectorStore>,
+        id: &str,
+        memory_type: &str,
+        content: &str,
+        metadata: Value,
+    ) {
+        store
+            .upsert(
+                "MyProj",
+                id,
+                StubEmbedder.embed(content).await.unwrap(),
+                MemoryPayload {
+                    content: content.to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: memory_type.to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata,
+                },
+            )
+            .await
+            .expect("seed a memory");
+    }
+
+    fn decision_ids(reply: &Value) -> Vec<String> {
+        reply["task_decisions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("task_decisions missing: {reply}"))
+            .iter()
+            .map(|d| d["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Decisions reach the agent by key: every live rule or fact naming the
+    /// task in waits_on or extracted_from (one id or an array) is listed whole;
+    /// rows naming another task, retired, archived or of another type are not.
+    #[tokio::test]
+    async fn task_get_lists_memories_tied_to_the_task() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let other = create_task(&store, "MyProj", "other work", 2).await;
+        let long = format!("the ruling, whole: {}", "keep every word. ".repeat(60));
+        let past = chrono::Utc::now().timestamp() - 60;
+        let rows = [
+            ("d1", "rule", long.as_str(), json!({ "waits_on": id })),
+            (
+                "d2",
+                "rule",
+                "waits, array",
+                json!({ "waits_on": [other, id] }),
+            ),
+            (
+                "d3",
+                "fact",
+                "extracted, string",
+                json!({ "extracted_from": id }),
+            ),
+            (
+                "d4",
+                "fact",
+                "extracted, array",
+                json!({ "extracted_from": [id] }),
+            ),
+            (
+                "x1",
+                "rule",
+                "another task",
+                json!({ "waits_on": other, "extracted_from": [other] }),
+            ),
+            (
+                "x2",
+                "rule",
+                "a longer id",
+                json!({ "waits_on": format!("{id}x") }),
+            ),
+            (
+                "x3",
+                "rule",
+                "retired",
+                json!({ "waits_on": id, "valid_to": past }),
+            ),
+            (
+                "x4",
+                "fact",
+                "archived",
+                json!({ "extracted_from": [id], "archived": true }),
+            ),
+            (
+                "x5",
+                "rule",
+                "superseded",
+                json!({ "waits_on": id, "superseded_by": "d1" }),
+            ),
+            (
+                "x6",
+                "context",
+                "a log line",
+                json!({ "extracted_from": [id] }),
+            ),
+            ("x7", "rule", "mentions only", json!({ "related_to": [id] })),
+        ];
+        for (row_id, memory_type, content, metadata) in rows {
+            put_tied_memory(&store, row_id, memory_type, content, metadata).await;
+        }
+
+        let reply: Value = serde_json::from_str(
+            &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await,
+        )
+        .expect("task_get replies with json");
+        assert_eq!(decision_ids(&reply), ["d1", "d2", "d3", "d4"], "{reply}");
+        let first = &reply["task_decisions"][0];
+        assert_eq!(
+            first["content"],
+            json!(long),
+            "whole content, not a snippet"
+        );
+        assert_eq!(first["memory_type"], json!("rule"));
+        assert!(reply.get("task_decisions_error").is_none(), "{reply}");
+    }
+
+    /// A claim lists the tied memories too, and a repeat claim by the holder
+    /// lists them again: a ruling can be tied to the task after the claim.
+    #[tokio::test]
+    async fn task_claim_lists_memories_tied_to_the_task() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        put_tied_memory(
+            &store,
+            "d1",
+            "rule",
+            "ruled before the claim",
+            json!({ "waits_on": [id] }),
+        )
+        .await;
+        let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
+        let fresh: Value =
+            serde_json::from_str(&handle_task_claim(args.clone(), store.clone()).await).unwrap();
+        assert_eq!(fresh["transition"]["to"], json!("in_progress"), "{fresh}");
+        assert_eq!(decision_ids(&fresh), ["d1"], "{fresh}");
+        assert_eq!(
+            fresh["task_decisions"][0]["content"],
+            json!("ruled before the claim")
+        );
+
+        put_tied_memory(
+            &store,
+            "d2",
+            "fact",
+            "ruled during the work",
+            json!({ "extracted_from": id }),
+        )
+        .await;
+        let repeat: Value =
+            serde_json::from_str(&handle_task_claim(args, store.clone()).await).unwrap();
+        assert_eq!(
+            repeat["note"],
+            json!("already claimed by this session"),
+            "{repeat}"
+        );
+        assert_eq!(decision_ids(&repeat), ["d1", "d2"], "{repeat}");
+    }
+
+    #[tokio::test]
+    async fn task_with_no_tied_memories_lists_none() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let read: Value = serde_json::from_str(
+            &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await,
+        )
+        .unwrap();
+        assert_eq!(read["task_decisions"], json!([]), "{read}");
+        let claimed: Value = serde_json::from_str(
+            &handle_task_claim(
+                json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+                store,
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(claimed["task_decisions"], json!([]), "{claimed}");
     }
 
     #[tokio::test]

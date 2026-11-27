@@ -552,7 +552,7 @@ async fn _with_watch(
                     },
                     {
                         "name": "neurostrata_task_claim",
-                        "description": "Claim a task for this session (open -> in_progress). Refused while another live session holds it; a stale claim (no update for 60 minutes) is released and taken over.",
+                        "description": "Claim a task for this session (open -> in_progress). Refused while another live session holds it; a stale claim (no update for 60 minutes) is released and taken over. The reply lists the memories tied to the task in task_decisions, as task_get does.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -592,7 +592,7 @@ async fn _with_watch(
                     },
                     {
                         "name": "neurostrata_task_get",
-                        "description": "Read one task without claiming it: status, holder (assignee, session_id), branch, worktree, blockers and its latest notes, plus history_count. include_history: true returns every note. Use it to check a task another session holds, a finished task, or a blocker; a claim is a write and cannot stand in for a read.",
+                        "description": "Read one task without claiming it: status, holder (assignee, session_id), branch, worktree, blockers and its latest notes, plus history_count, and task_decisions: the live rules and facts whose waits_on or extracted_from names the task, whole. include_history: true returns every note. Use it to check a task another session holds, a finished task, or a blocker; a claim is a write and cannot stand in for a read.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {

@@ -12975,6 +12975,14 @@ impl VectorStore for LadybugStore {
         self.list_rows(namespace, None, None, Some("pinned")).await
     }
 
+    async fn list_metadata_containing(
+        &self,
+        namespace: &str,
+        needle: &str,
+    ) -> Result<Vec<SearchResult>> {
+        self.list_rows(namespace, None, None, Some(needle)).await
+    }
+
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
         let namespace = namespace.to_string();
         let id = id.to_string();
