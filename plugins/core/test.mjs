@@ -12,7 +12,14 @@ import {
   symlinkSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
-import { join, isAbsolute, resolve, dirname } from 'node:path'
+import {
+  join,
+  isAbsolute,
+  relative,
+  resolve,
+  dirname,
+  sep
+} from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { execFileSync as execFileSyncTop, spawn } from 'node:child_process'
 
@@ -189,9 +196,19 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
   })
 }
 
+// The daemon's `resolved_path`: project-relative with `/` under a root, the
+// path itself outside every root. `root: null` replies without the field.
+function mockResolvedPath(path, root) {
+  const rel = relative(root, path)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
+    ? rel.split(sep).join('/')
+    : path
+}
+
 function createMockDaemonServer({
   returnTask = null,
-  guardReject = false
+  guardReject = false,
+  root = process.cwd()
 } = {}) {
   const counters = {
     memoriesForFile: 0,
@@ -249,6 +266,9 @@ function createMockDaemonServer({
                 {
                   type: 'text',
                   text: JSON.stringify({
+                    ...(root !== null && typeof args.path === 'string'
+                      ? { resolved_path: mockResolvedPath(args.path, root) }
+                      : {}),
                     hits: [
                       {
                         id: 'mem-rule-1',
@@ -1617,6 +1637,141 @@ describe('execute.before / execute.after recall delivery', () => {
       )
     } finally {
       server.close()
+      resetModuleState()
+    }
+  })
+})
+
+describe('OpenCode handlers join a relative tool path onto the ctx folder', () => {
+  // An OpenCode-shaped ctx: the agent works in <root>/sub, the project root
+  // is <root>. `v2` puts both in `location`; otherwise only `directory`.
+  const startOpenCode = async (url, root, { v2 = false, strict = false } = {}) => {
+    mkdirSync(join(root, '.NeuroStrata'), { recursive: true })
+    mkdirSync(join(root, 'sub'), { recursive: true })
+    const handlers = {}
+    await initialize({
+      ...(v2
+        ? {
+            location: {
+              directory: join(root, 'sub'),
+              project: { root, canonical: root }
+            }
+          }
+        : { directory: join(root, 'sub') }),
+      session: { hook: () => {} },
+      tool: {
+        hook: async (name, cb) => {
+          handlers[name] = cb
+        }
+      },
+      hooks: {},
+      config: {
+        namespace: 'oc-abs-ns',
+        endpoint: url,
+        bearerToken: 'tok',
+        strictMode: strict,
+        requestTimeoutMs: 500,
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+    })
+    return handlers
+  }
+  const afterRead = (path) => ({
+    name: 'read',
+    callID: `call-${path}`,
+    sessionID: 'ses-oc-abs',
+    args: { path },
+    status: 'completed',
+    result: { content: 'file text', output: 'file text' }
+  })
+
+  for (const v2 of [false, true]) {
+    it(`execute.before sends the path joined onto the ctx folder (v2=${v2})`, async () => {
+      const { server, url, counters } = await createMockDaemonServer()
+      const root = mkdtempSync(join(tmpdir(), 'ns-oc-before-'))
+      try {
+        const h = await startOpenCode(url, root, { v2 })
+        await h['execute.before']({ tool: 'read', input: { path: 'lib.rs' } })
+        assert.deepEqual(counters.memoriesForFilePaths, [
+          resolve(root, 'sub', 'lib.rs')
+        ])
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+
+    it(`execute.after sends the path joined onto the ctx folder (v2=${v2})`, async () => {
+      const { server, url, counters } = await createMockDaemonServer()
+      const root = mkdtempSync(join(tmpdir(), 'ns-oc-after-'))
+      try {
+        const h = await startOpenCode(url, root, { v2 })
+        await h['execute.after'](afterRead('lib.rs'))
+        assert.deepEqual(counters.memoriesForFilePaths, [
+          resolve(root, 'sub', 'lib.rs')
+        ])
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+  }
+
+  it('execute.after recalls sub/lib.rs and the root lib.rs separately', async () => {
+    const { server, url, counters } = await createMockDaemonServer()
+    const root = mkdtempSync(join(tmpdir(), 'ns-oc-dedup-'))
+    try {
+      const h = await startOpenCode(url, root, { v2: true })
+      await h['execute.after'](afterRead('lib.rs'))
+      await h['execute.after'](afterRead(join(root, 'lib.rs')))
+      assert.deepEqual(counters.memoriesForFilePaths, [
+        resolve(root, 'sub', 'lib.rs'),
+        join(root, 'lib.rs')
+      ])
+    } finally {
+      server.close()
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('execute.after labels sub/lib.rs by the resolved_path', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ns-oc-label-'))
+    const { server, url } = await createMockDaemonServer({ root })
+    try {
+      const h = await startOpenCode(url, root, { v2: true })
+      const evt = afterRead('lib.rs')
+      await h['execute.after'](evt)
+      assert.ok(
+        evt.result.content.includes('[NeuroStrata File Context — sub/lib.rs]'),
+        `label must be sub/lib.rs, got ${evt.result.content}`
+      )
+    } finally {
+      server.close()
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('a guard rejection restores the absolute path so the retry recalls', async () => {
+    let reject = true
+    const { server, url, counters } = await createMockDaemonServer({
+      guardReject: () => reject
+    })
+    const root = mkdtempSync(join(tmpdir(), 'ns-oc-deny-'))
+    try {
+      const h = await startOpenCode(url, root, { strict: true })
+      const call = { tool: 'write', input: { path: 'lib.rs', content: 'x' } }
+      await assert.rejects(h['execute.before']({ ...call }))
+      reject = false
+      await h['execute.before']({ ...call })
+      const abs = resolve(root, 'sub', 'lib.rs')
+      assert.deepEqual(counters.memoriesForFilePaths, [abs, abs])
+    } finally {
+      server.close()
+      rmSync(root, { recursive: true, force: true })
       resetModuleState()
     }
   })
@@ -3258,7 +3413,7 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         'memories_for_file must run for the patched file'
       )
       assert.ok(
-        counters.memoriesForFilePaths.includes('src/codex.rs'),
+        counters.memoriesForFilePaths.includes(`${process.cwd()}${sep}src/codex.rs`),
         `patched path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`
       )
       const blob = JSON.stringify(result ?? {})
@@ -3296,7 +3451,7 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         'memories_for_file must run for the added file'
       )
       assert.ok(
-        counters.memoriesForFilePaths.includes('src/new.rs'),
+        counters.memoriesForFilePaths.includes(`${process.cwd()}${sep}src/new.rs`),
         `added path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`
       )
       const blob = JSON.stringify(result ?? {})
@@ -3374,7 +3529,9 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         `the cell body must reach guard_validate, got ${counters.guardArgs[0].payload}`
       )
       assert.ok(
-        counters.memoriesForFilePaths.includes('notebooks/analysis.ipynb'),
+        counters.memoriesForFilePaths.includes(
+          `${process.cwd()}${sep}notebooks/analysis.ipynb`
+        ),
         `the notebook path must be recalled, got ${JSON.stringify(counters.memoriesForFilePaths)}`
       )
     } finally {
@@ -3439,7 +3596,7 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         tool_input: { command: patch }
       })
       assert.ok(
-        counters.memoriesForFilePaths.includes('src/run.rs'),
+        counters.memoriesForFilePaths.includes(`${process.cwd()}${sep}src/run.rs`),
         `the patched path must be recalled, got ${JSON.stringify(counters.memoriesForFilePaths)}`
       )
       assert.equal(counters.guardValidate, 1)
@@ -3451,6 +3608,172 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       server.close()
       resetModuleState()
     }
+  })
+
+  describe('relative tool paths are joined onto the agent folder', () => {
+    const start = async (url) =>
+      initialize({
+        config: {
+          namespace: 'abs-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: false,
+          requestTimeoutMs: 500
+        },
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+    const readFrom = (cwd, toolInput) =>
+      handleHookEvent({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'read',
+        cwd,
+        tool_input: toolInput
+      })
+
+    it('a relative file_path is sent joined onto event.cwd', async () => {
+      const { server, url, counters } = await createMockDaemonServer()
+      const root = mkdtempSync(join(tmpdir(), 'ns-abs-cwd-'))
+      try {
+        await start(url)
+        await readFrom(join(root, 'src'), { file_path: 'lib.rs' })
+        assert.deepEqual(counters.memoriesForFilePaths, [
+          resolve(root, 'src', 'lib.rs')
+        ])
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+
+    it('absolute POSIX and Windows paths pass through unchanged', async () => {
+      const { server, url, counters } = await createMockDaemonServer()
+      try {
+        await start(url)
+        await readFrom('/elsewhere', { file_path: '/repo/src/a.rs' })
+        await readFrom('/elsewhere', { file_path: 'C:\\repo\\src\\b.rs' })
+        await readFrom('/elsewhere', { file_path: 'D:/repo/src/c.rs' })
+        assert.deepEqual(counters.memoriesForFilePaths, [
+          '/repo/src/a.rs',
+          'C:\\repo\\src\\b.rs',
+          'D:/repo/src/c.rs'
+        ])
+      } finally {
+        server.close()
+        resetModuleState()
+      }
+    })
+
+    it('a Codex apply_patch header is joined onto event.cwd', async () => {
+      const { server, url, counters } = await createMockDaemonServer()
+      const root = mkdtempSync(join(tmpdir(), 'ns-abs-patch-'))
+      try {
+        await start(url)
+        await handleHookEvent({
+          hook_event_name: 'PreToolUse',
+          tool_name: 'apply_patch',
+          cwd: join(root, 'crate'),
+          tool_input: {
+            command:
+              '*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** End Patch'
+          }
+        })
+        assert.deepEqual(counters.memoriesForFilePaths, [
+          resolve(root, 'crate', 'a.rs')
+        ])
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+
+    it('one relative name from two folders is recalled twice', async () => {
+      const { server, url, counters } = await createMockDaemonServer()
+      const root = mkdtempSync(join(tmpdir(), 'ns-abs-two-'))
+      try {
+        await start(url)
+        await readFrom(join(root, 'one'), { file_path: 'lib.rs' })
+        await readFrom(join(root, 'two'), { file_path: 'lib.rs' })
+        assert.deepEqual(counters.memoriesForFilePaths, [
+          resolve(root, 'one', 'lib.rs'),
+          resolve(root, 'two', 'lib.rs')
+        ])
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+
+    // `..` after a symlink names a different file than the lexical collapse,
+    // so the daemon resolves it, not the plugin.
+    it('a relative path keeps its .. parts', async () => {
+      const { server, url, counters } = await createMockDaemonServer()
+      const root = mkdtempSync(join(tmpdir(), 'ns-abs-dotdot-'))
+      try {
+        await start(url)
+        await readFrom(root, { file_path: 'sub/../x.rs' })
+        assert.deepEqual(counters.memoriesForFilePaths, [
+          `${root}${sep}sub/../x.rs`
+        ])
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+
+    // The recall label is the daemon's resolved_path, so an agent in a
+    // subfolder sees which file the rules govern.
+    const startAt = async (url, directory) =>
+      initialize({
+        directory,
+        config: {
+          namespace: 'abs-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: false,
+          requestTimeoutMs: 500
+        },
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+    const labelOf = (out) => {
+      const m = /\[NeuroStrata Governing Memories for ([^\]]*)\]/.exec(
+        String(out?.systemMessage ?? '')
+      )
+      return m ? m[1] : null
+    }
+
+    it('the label is the resolved_path from a subfolder', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'ns-abs-label-'))
+      const { server, url } = await createMockDaemonServer({ root })
+      try {
+        await startAt(url, root)
+        const out = await readFrom(join(root, 'sub'), { file_path: 'lib.rs' })
+        assert.equal(labelOf(out), 'sub/lib.rs')
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+
+    it('a reply without resolved_path labels the path as sent', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'ns-abs-nolabel-'))
+      const { server, url } = await createMockDaemonServer({ root: null })
+      try {
+        await startAt(url, root)
+        const out = await readFrom(join(root, 'sub'), { file_path: 'lib.rs' })
+        assert.equal(labelOf(out), resolve(root, 'sub', 'lib.rs'))
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
   })
 
   it('hook runners keep the disk namespace when NEUROSTRATA_NAMESPACE is unset', async () => {
@@ -4258,7 +4581,7 @@ describe('Task 1.1: execute.after V2 result mutation (via hook registration)', (
     const tmpDir = mkdtempSync(join(tmpdir(), 'ns-core-exec-'))
     const nsDir = join(tmpDir, '.NeuroStrata')
     mkdirSync(nsDir, { recursive: true })
-    const { server, url, counters } = await createMockDaemonServer()
+    const { server, url, counters } = await createMockDaemonServer({ root: tmpDir })
     let afterHandler = null
     try {
       const ctx = {
@@ -4321,7 +4644,7 @@ describe('Task 1.1: execute.after V2 result mutation (via hook registration)', (
     const tmpDir = mkdtempSync(join(tmpdir(), 'ns-core-dedup-'))
     const nsDir = join(tmpDir, '.NeuroStrata')
     mkdirSync(nsDir, { recursive: true })
-    const { server, url, counters } = await createMockDaemonServer()
+    const { server, url, counters } = await createMockDaemonServer({ root: tmpDir })
     let afterHandler = null
     try {
       const ctx = {

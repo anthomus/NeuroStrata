@@ -354,10 +354,14 @@ export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
 /**
  * Recall governing memories for a touched file. LRU path dedup (no re-query within the
  * window) and injectedMemoryIds dedup (each memory injected once per session).
+ * `opts.resolved.path` receives the daemon's `resolved_path`, the recall label.
  */
 export declare function prefetchMemoriesForFile(namespace: string, filePath: string, opts?: {
     recordLedgerDir?: string;
     projectRoot?: string;
+    resolved?: {
+        path?: string;
+    };
 }): Promise<string[]>;
 /**
  * Mark a prefetch as delivered: its memories were handed to the caller, so the
