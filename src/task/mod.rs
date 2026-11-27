@@ -793,8 +793,7 @@ pub(crate) async fn task_payload_without_retired_entries(
     };
     let now = chrono::Utc::now().timestamp();
     let is_live = |row: &MemoryPayload| {
-        row.metadata.get("superseded_by").is_none_or(Value::is_null)
-            && !crate::store::ladybug::is_retired_at(&row.metadata, now)
+        !crate::store::ladybug::is_retired_at(&row.metadata, now)
             && !crate::handlers::archive_memory::is_archived(row)
     };
     // An id is dropped only when no row found for it passes; the same id can

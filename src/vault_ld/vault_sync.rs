@@ -642,13 +642,7 @@ pub async fn export_vault_with_limits(
     // kinds of still-active Markdown exports to `.retired`.
     let active_ids: BTreeSet<String> = memories
         .iter()
-        .filter(|m| {
-            let metadata = &m.payload.metadata;
-            !crate::store::ladybug::is_retired_at(metadata, now)
-                && metadata
-                    .get("superseded_by")
-                    .map_or(true, serde_json::Value::is_null)
-        })
+        .filter(|m| !crate::store::ladybug::is_retired_at(&m.payload.metadata, now))
         .map(|m| m.id.clone())
         .collect();
 
@@ -657,13 +651,7 @@ pub async fn export_vault_with_limits(
     let filtered: Vec<SearchResult> = memories
         .into_iter()
         .filter(|m| rebac::can_read_memory(principal, &m.payload.user_id, &m.payload.metadata))
-        .filter(|m| {
-            let metadata = &m.payload.metadata;
-            !crate::store::ladybug::is_retired_at(metadata, now)
-                && metadata
-                    .get("superseded_by")
-                    .map_or(true, serde_json::Value::is_null)
-        })
+        .filter(|m| !crate::store::ladybug::is_retired_at(&m.payload.metadata, now))
         .collect();
 
     // Convert to VaultNotes

@@ -16662,7 +16662,8 @@ fn is_write_collision(err: &anyhow::Error) -> bool {
         .contains("Cannot start a new write transaction")
 }
 
-/// Whether a memory has been retired, meaning its `valid_to` has passed.
+/// Whether a memory has been retired: its `valid_to` has passed, or it names
+/// the memory that replaced it (see `is_retired_at`).
 ///
 /// A retired row has to stop surfacing wherever results come from: the vector
 /// match, the graph around that match, and the edges relinking replays.
@@ -16671,12 +16672,32 @@ fn is_retired(metadata: &Value) -> bool {
     is_retired_at(metadata, chrono::Utc::now().timestamp())
 }
 
-/// Timestamp-aware variant so callers that fetch many rows in one pass can
-/// capture `now` once instead of calling Utc::now() per row.
+/// The retirement check every read surface shares (search, file recall,
+/// GraphQL, SPARQL, exports). Callers that fetch many rows in one pass
+/// capture `now` once.
+///
+/// The `valid_to` half is `formal_kernel::is_retired_at`; a non-null
+/// `valid_to` that is not an integer reads as 0, so an unreadable expiry hides
+/// the row. A row is also retired when `superseded_by` names a replacement:
+/// supersede writes both fields, but a hand-edited or imported row may carry
+/// only the pointer. `archived` is not part of this check, because
+/// `include_archived` reads it on its own. The task gate keeps its own,
+/// `valid_to`-only check (`task::gate::is_retired`).
 pub(crate) fn is_retired_at(metadata: &Value, now: i64) -> bool {
-    match metadata.get("valid_to") {
-        Some(valid_to) if !valid_to.is_null() => valid_to.as_i64().unwrap_or(0) <= now,
-        _ => false,
+    let valid_to = metadata
+        .get("valid_to")
+        .filter(|v| !v.is_null())
+        .map(|v| v.as_i64().unwrap_or(0));
+    crate::formal_kernel::is_retired_at(valid_to, now) || is_superseded(metadata)
+}
+
+/// Whether `superseded_by` names a replacement: any value but null or a
+/// blank string.
+fn is_superseded(metadata: &Value) -> bool {
+    match metadata.get("superseded_by") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(_) => true,
     }
 }
 
@@ -19294,6 +19315,109 @@ eurostrata\src\daemon.rs",
             "a retired rule stays retired: {:?}",
             ids
         );
+    }
+
+    #[test]
+    fn a_superseded_memory_without_valid_to_is_retired() {
+        let now = 1_000;
+        assert!(is_retired_at(&json!({ "superseded_by": "newer" }), now));
+        assert!(is_retired_at(
+            &json!({ "superseded_by": "newer", "valid_to": now + 10 }),
+            now
+        ));
+        for live in [
+            json!({}),
+            json!({ "superseded_by": null }),
+            json!({ "superseded_by": "" }),
+            json!({ "superseded_by": "  " }),
+            json!({ "valid_to": null }),
+            json!({ "valid_to": now + 1 }),
+        ] {
+            assert!(!is_retired_at(&live, now), "{live} is live");
+        }
+        assert!(is_retired_at(&json!({ "valid_to": now }), now));
+        // The store's policy for an unreadable expiry is unchanged: hidden.
+        assert!(is_retired_at(&json!({ "valid_to": "soon" }), now));
+    }
+
+    /// A chain written without `valid_to` (an older daemon, a hand edit or an
+    /// import): A was replaced by B, B by C.
+    async fn superseded_chain_store() -> LadybugStore {
+        let store = retired_test_store().await;
+        let file = "probe::src/a.rs";
+        let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+        file_payload.location = "src/a.rs".to_string();
+        store
+            .upsert("probe", file, vec![0.0; 4], file_payload)
+            .await
+            .unwrap();
+        for (id, metadata) in [
+            (
+                "rule-a",
+                json!({ "governs": [file], "superseded_by": "rule-b" }),
+            ),
+            (
+                "rule-b",
+                json!({ "governs": [file], "superseded_by": "rule-c" }),
+            ),
+            ("rule-c", json!({ "governs": [file] })),
+        ] {
+            store
+                .upsert(
+                    "probe",
+                    id,
+                    vec![0.1, 0.2, 0.3, 0.4],
+                    retired_test_payload("rule", "agent", metadata),
+                )
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn search_leaves_out_a_superseded_memory_without_valid_to() {
+        let store = superseded_chain_store().await;
+        let ids: Vec<String> = store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 10, false, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .filter(|id| id.starts_with("rule-"))
+            .collect();
+        assert_eq!(ids, vec!["rule-c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn file_recall_leaves_out_a_superseded_memory_without_valid_to() {
+        let store = superseded_chain_store().await;
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                10,
+            )
+            .await
+            .expect("graph read succeeds");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["rule-c"]);
+    }
+
+    #[tokio::test]
+    async fn get_memory_still_reads_a_superseded_memory_by_id() {
+        let store = superseded_chain_store().await;
+        let (_, payload) = store
+            .get("probe", "rule-a")
+            .await
+            .unwrap()
+            .expect("a superseded row is still readable by id");
+        assert_eq!(payload.metadata["superseded_by"], json!("rule-b"));
     }
 
     #[test]

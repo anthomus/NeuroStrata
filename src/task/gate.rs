@@ -208,7 +208,10 @@ pub fn stale_memory_violations(memories: &[SearchResult], now: i64) -> Vec<Viola
 /// (`store::ladybug::is_retired_at`), which treats an unparseable expiry as
 /// expired and hides the row from search. The store hides; the gate
 /// refuses to forgive. A row the gate still judges is at least still
-/// visible in `task_list`.
+/// visible in `task_list`. For the same reason a `superseded_by` without a
+/// `valid_to` does not retire a row here, though the store hides it: every
+/// supersede writes both, and `proofs/NeuroStrata/TaskGate.lean` models
+/// `isRetired` on `valid_to` alone.
 pub(crate) fn is_retired(metadata: &Value, now: i64) -> bool {
     crate::formal_kernel::is_retired_at(metadata.get("valid_to").and_then(Value::as_i64), now)
 }

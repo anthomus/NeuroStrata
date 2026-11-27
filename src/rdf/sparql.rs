@@ -14,7 +14,7 @@ use spareval::QueryEvaluator;
 use spargebra::SparqlParser;
 
 use crate::parser::ingest::split_scoped_id;
-use crate::store::ladybug::active_generations_by_source_of;
+use crate::store::ladybug::{active_generations_by_source_of, is_retired_at};
 use std::collections::{HashMap, HashSet};
 
 /// Configuration for SPARQL query execution.
@@ -77,13 +77,6 @@ fn is_archived(metadata: &serde_json::Value) -> bool {
 
 fn is_mesh_conflicting(metadata: &serde_json::Value) -> bool {
     crate::synaptic_mesh::conflict::is_conflicting_metadata(metadata)
-}
-
-fn is_retired_at(metadata: &serde_json::Value, now: i64) -> bool {
-    match metadata.get("valid_to") {
-        Some(valid_to) if !valid_to.is_null() => valid_to.as_i64().unwrap_or(0) <= now,
-        _ => false,
-    }
 }
 
 /// Compute memory salience score per spec §5.3 / custom function definition.
@@ -1240,6 +1233,54 @@ mod tests {
         assert!(!truncated);
         assert!(!timed_out);
         assert!(serialized.contains("urn:neurostrata:memory:mem-1"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn sparql_leaves_out_a_superseded_memory_without_valid_to() {
+        use crate::traits::{MemoryPayload, VectorStore};
+        let tmp = std::env::temp_dir().join(format!("ns-sparql-sup-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("sup").await.unwrap();
+        for (id, metadata) in [
+            (
+                "sup-old",
+                serde_json::json!({ "superseded_by": "sup-newer" }),
+            ),
+            (
+                "sup-newer",
+                serde_json::json!({ "superseded_by": "sup-newest" }),
+            ),
+            ("sup-newest", serde_json::json!({})),
+        ] {
+            let payload = MemoryPayload {
+                content: "a fact".to_string(),
+                user_id: "u1".to_string(),
+                memory_type: "fact".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata,
+            };
+            store
+                .upsert("sup", id, vec![0.1, 0.2, 0.3, 0.4], payload)
+                .await
+                .unwrap();
+        }
+        let query = "SELECT DISTINCT ?s WHERE { ?s ?p ?o }";
+        let (live, _, _, _) =
+            execute_sparql_query(query, "sup", QueryResultsFormat::Json, false, false, &store)
+                .await
+                .expect("sparql query succeeds");
+        assert!(live.contains("urn:neurostrata:memory:sup-newest"), "{live}");
+        assert!(!live.contains("sup-old"), "{live}");
+        assert!(!live.contains("sup-newer"), "{live}");
+        let (all, _, _, _) =
+            execute_sparql_query(query, "sup", QueryResultsFormat::Json, true, false, &store)
+                .await
+                .expect("sparql query succeeds");
+        assert!(all.contains("urn:neurostrata:memory:sup-old"), "{all}");
+        drop(store);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
