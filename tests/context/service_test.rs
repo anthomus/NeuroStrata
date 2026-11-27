@@ -63,7 +63,13 @@ fn plan_with_items_dedups_budgets_and_truncates() {
         mk("i4", "content-4"),
     ];
     // Dedup by id/content leaves 3 items; max_items=2 truncates further.
-    let plan = service.plan_with_items(&request, candidates, plan::Budget::from(10_000usize), 2);
+    let plan = service.plan_with_items(
+        &request,
+        Vec::new(),
+        candidates,
+        plan::Budget::from(10_000usize),
+        2,
+    );
     assert_eq!(plan.items.len(), 2);
     assert_eq!(plan.items[0].id, "i1");
     assert_eq!(plan.items[1].id, "i3");
@@ -72,7 +78,13 @@ fn plan_with_items_dedups_budgets_and_truncates() {
 
     // A tight budget starves expensive items instead of half-delivering them.
     let candidates = vec![mk("big", &"x".repeat(1000)), mk("small", "tiny")];
-    let plan = service.plan_with_items(&request, candidates, plan::Budget::from(30usize), 10);
+    let plan = service.plan_with_items(
+        &request,
+        Vec::new(),
+        candidates,
+        plan::Budget::from(30usize),
+        10,
+    );
     assert_eq!(plan.items.len(), 1);
     assert_eq!(plan.items[0].id, "small");
     assert!(plan.truncation); // the out-of-budget item counts as dropped

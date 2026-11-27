@@ -314,11 +314,78 @@ pub struct ContextPlan {
     /// The items to deliver.
     #[serde(default)]
     pub items: Vec<ContextItem>,
-    /// Whether a budget cut the plan short.
+    /// Governing rules that did not fit, as pointers to fetch.
+    ///
+    /// Always present, empty when every governing rule was sent whole.
+    #[serde(default)]
+    pub not_shown: Vec<NotShown>,
+    /// Whether a budget cut the plan short: a pointer in `not_shown` or a
+    /// search hit that was left out.
     #[serde(default)]
     pub truncation: bool,
     /// How much of the request was actually delivered.
     pub degradation: Degradation,
+}
+
+state_enum! {
+    /// What a governing rule is attached to: the requested file's symbol,
+    /// the file itself, or a folder above it.
+    Governs {
+        Symbol => "symbol",
+        File => "file",
+        Folder => "folder",
+    }
+}
+
+state_enum! {
+    /// How well a rule left out of the plan matched the query, against the
+    /// weakest rule sent whole: `close` is as near the query or nearer
+    /// (also when no rule sent whole has a distance), `weaker` is farther,
+    /// `none` has no distance (no query, or no usable embedding).
+    QueryMatch {
+        Close => "close",
+        Weaker => "weaker",
+        NoMatch => "none",
+    }
+}
+
+/// A governing rule the plan did not send: enough to judge and fetch it.
+///
+/// It carries no content, preview or snippet on purpose. A cut rule loses
+/// the part that mattered as often as not, so the rule is either sent whole
+/// or named here for the agent to fetch before relying on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotShown {
+    /// The memory id.
+    pub id: String,
+    /// The requested file the rule governs, as the caller spelled it.
+    pub file: String,
+    /// Whether it governs a symbol in the file, the file, or a folder above it.
+    pub governs: Governs,
+    /// Its place among the file's governing rules in plan order, "N of M".
+    pub query_rank: String,
+    /// How well it matched the query (see [`QueryMatch`]).
+    #[serde(rename = "match")]
+    pub query_match: QueryMatch,
+    /// The tool that fetches the rule by id.
+    pub fetch: String,
+}
+
+/// The tool a pointer in [`NotShown`] names for fetching the rule.
+pub const FETCH_TOOL: &str = "neurostrata_get_memory";
+
+/// One rule that governs a requested file, handed to the planner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoverningRule {
+    /// The rule, as it would be delivered.
+    pub item: ContextItem,
+    /// The requested file it governs, as the caller spelled it.
+    pub file: String,
+    /// What it is attached to.
+    pub governs: Governs,
+    /// Its distance from the query (lower is closer); `None` when there is
+    /// no query or the rule has no usable embedding.
+    pub distance: Option<f32>,
 }
 
 impl ContextPlan {
@@ -333,6 +400,7 @@ impl ContextPlan {
             index_generation: 0,
             applied_scope: String::new(),
             items: Vec::new(),
+            not_shown: Vec::new(),
             truncation: false,
             degradation,
         }
@@ -399,6 +467,8 @@ mod all_states_tests {
         assert!(!Coverage::ALL.is_empty());
         assert!(!DecisionLifecycle::ALL.is_empty());
         assert!(!Degradation::ALL.is_empty());
+        assert!(!Governs::ALL.is_empty());
+        assert!(!QueryMatch::ALL.is_empty());
     }
 
     /// `LookupStatus` is the tests/privacy egress vocabulary; keep it useful

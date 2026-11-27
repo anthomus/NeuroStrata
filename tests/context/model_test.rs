@@ -163,6 +163,7 @@ fn context_plan_round_trips_and_reports_truncation_and_degradation() {
                 decision_lifecycle: DecisionLifecycle::Accepted,
             }),
         }],
+        not_shown: Vec::new(),
         truncation: true,
         degradation: Degradation::Partial,
     };
