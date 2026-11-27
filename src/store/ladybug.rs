@@ -216,20 +216,7 @@ async fn search_inner(
     let outcome = store
         .with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
-            let vec_str = format!(
-                "[{}]",
-                // R16: defense-in-depth (no native bind in lbug 0.20.4).
-                // Always emit decimal (e.g. 0 → 0.0) so ARRAY_DISTANCE
-                // binder never sees pure-integer arrays.
-                vector.iter().map(|f| {
-                    let s = format!("{}", f);
-                    if s.contains('.') || s.contains('e') || s.contains('E') {
-                        s
-                    } else {
-                        format!("{}.0", s)
-                    }
-                }).collect::<Vec<_>>().join(",")
-            );
+            let vec_str = cypher_float_array(&vector);
             let now = chrono::Utc::now().timestamp();
 
             // Active generations for this namespace, resolved per source so a
@@ -7607,6 +7594,25 @@ fn norm_path(
         .collect()
 }
 
+/// A Cypher float-array literal for `vector`. There is no native bind in
+/// lbug 0.20.4, so vectors are spelled into the query; every element is
+/// written with a decimal point (0 as 0.0) because the ARRAY_DISTANCE binder
+/// refuses a pure-integer array.
+fn cypher_float_array(vector: &[f32]) -> String {
+    let elements: Vec<String> = vector
+        .iter()
+        .map(|f| {
+            let s = format!("{}", f);
+            if s.contains('.') || s.contains('e') || s.contains('E') {
+                s
+            } else {
+                format!("{}.0", s)
+            }
+        })
+        .collect();
+    format!("[{}]", elements.join(","))
+}
+
 fn escape_ladybug_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
@@ -11092,20 +11098,7 @@ impl VectorStore for LadybugStore {
             let safe_location_lines = escape_ladybug_string(&payload.location_lines);
             let safe_metadata = escape_ladybug_string(&serde_json::to_string(&payload.metadata)?);
 
-            let vec_str = format!(
-                "[{}]",
-                // R16: defense-in-depth (no native bind in lbug 0.20.4).
-                // Always emit decimal (e.g. 0 → 0.0) so ARRAY_DISTANCE
-                // binder never sees pure-integer arrays.
-                vector.iter().map(|f| {
-                    let s = format!("{}", f);
-                    if s.contains('.') || s.contains('e') || s.contains('E') {
-                        s
-                    } else {
-                        format!("{}.0", s)
-                    }
-                }).collect::<Vec<_>>().join(",")
-            );
+            let vec_str = cypher_float_array(&vector);
 
             let insert_query = format!(
                 "MERGE (m:Memory {{id: '{}'}})
@@ -11699,20 +11692,7 @@ impl VectorStore for LadybugStore {
 
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
-            let vec_str = format!(
-                "[{}]",
-                // R16: defense-in-depth (no native bind in lbug 0.20.4).
-                // Always emit decimal (e.g. 0 → 0.0) so ARRAY_DISTANCE
-                // binder never sees pure-integer arrays.
-                vector.iter().map(|f| {
-                    let s = format!("{}", f);
-                    if s.contains('.') || s.contains('e') || s.contains('E') {
-                        s
-                    } else {
-                        format!("{}.0", s)
-                    }
-                }).collect::<Vec<_>>().join(",")
-            );
+            let vec_str = cypher_float_array(&vector);
             let now = chrono::Utc::now().timestamp();
 
             const FETCH_MULTIPLIER: usize = 10;
@@ -14675,6 +14655,46 @@ impl LadybugStore {
             .into_iter()
             .map(|result| result.map(|form| rank_and_cap_file_form(form, exclude_ids)))
             .collect())
+    }
+
+    /// The distance from `vector` to the stored embedding of each listed
+    /// memory, measured by the engine's `array_distance` as `search` measures
+    /// it (before search's boosts): lower is closer. Only the listed ids are
+    /// read, so the cost is bounded by the list, not the namespace. A memory
+    /// without a usable embedding is absent from the answer.
+    pub async fn embedding_distances(
+        &self,
+        namespace: &str,
+        ids: &[String],
+        vector: &[f32],
+    ) -> Result<HashMap<String, f32>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let query = format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id IN [{}] RETURN m.id, array_distance(m.embedding, {})",
+            escape_ladybug_string(namespace),
+            ids.iter()
+                .map(|id| format!("'{}'", escape_ladybug_string(id)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            cypher_float_array(vector)
+        );
+        self.with_conn(move |conn| {
+            let mut distances: HashMap<String, f32> = HashMap::new();
+            for row in conn.query(&query)? {
+                let distance = match &row[1] {
+                    lbug::Value::Float(f) if f.is_finite() && *f >= 0.0 => *f,
+                    lbug::Value::Double(d) if d.is_finite() && *d >= 0.0 => *d as f32,
+                    _ => continue,
+                };
+                let id = format!("{}", row[0]);
+                let best = distances.entry(id).or_insert(distance);
+                *best = best.min(distance);
+            }
+            Ok(distances)
+        })
+        .await
     }
 
     /// Retrieve memories for every distinct logical form of one file as a
@@ -37672,21 +37692,7 @@ fn conn_upsert_action_row(
     let safe_location_lines = escape_ladybug_string(&payload.location_lines);
     let safe_metadata = escape_ladybug_string(&serde_json::to_string(&payload.metadata)?);
 
-    let vec_str = format!(
-        "[{}]",
-        vector
-            .iter()
-            .map(|f| {
-                let s = format!("{}", f);
-                if s.contains('.') || s.contains('e') || s.contains('E') {
-                    s
-                } else {
-                    format!("{}.0", s)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let vec_str = cypher_float_array(vector);
 
     let insert_query = format!(
         "MERGE (m:Memory {{id: '{}'}})

@@ -87,7 +87,7 @@ impl ContextService {
     ///
     /// `governing` holds one list per requested file, in the fixed order
     /// (symbol > file > folder, then type and reads). Each list is reordered
-    /// by search rank, rules the search did not find after, and the lists
+    /// by distance from the query, rules without one after, and the lists
     /// are dealt in turns: every file's first rule, then every file's
     /// second, so one file's rules never crowd out another's. A rule is sent
     /// whole or, when it does not fit, listed in `not_shown` as a pointer
@@ -118,9 +118,13 @@ impl ContextService {
         let files: Vec<Vec<super::model::GoverningRule>> = governing
             .into_iter()
             .map(|mut rules| {
-                // Stable: rules with the same search standing keep the
-                // fixed order.
-                rules.sort_by_key(|rule| rule.search.map_or(usize::MAX, |hit| hit.rank));
+                // Stable: rules at the same distance keep the fixed order.
+                rules.sort_by(|a, b| match (a.distance, b.distance) {
+                    (Some(x), Some(y)) => x.total_cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                });
                 rules
             })
             .collect();
@@ -128,8 +132,7 @@ impl ContextService {
         // (rule, its 1-based place in its file, the file's rule count)
         let mut left_out: Vec<(&super::model::GoverningRule, usize, usize)> = Vec::new();
         let mut left_out_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        // The weakest search score among rules sent whole; scores are
-        // distances, so the weakest is the largest.
+        // The largest distance among rules sent whole: the weakest match.
         let mut weakest_whole: Option<f32> = None;
         for turn in 0..depth {
             for rules in &files {
@@ -143,8 +146,8 @@ impl ContextService {
                 let taken =
                     selection.count() < max_items && selection.offer(&rule.item) == Offer::Taken;
                 if taken {
-                    if let Some(hit) = rule.search {
-                        weakest_whole = Some(weakest_whole.map_or(hit.score, |w| w.max(hit.score)));
+                    if let Some(d) = rule.distance {
+                        weakest_whole = Some(weakest_whole.map_or(d, |w| w.max(d)));
                     }
                 } else {
                     left_out_ids.insert(rule.item.id.as_str());
@@ -159,9 +162,9 @@ impl ContextService {
                 file: rule.file.clone(),
                 governs: rule.governs,
                 query_rank: format!("{place} of {of}"),
-                query_match: match (rule.search, weakest_whole) {
+                query_match: match (rule.distance, weakest_whole) {
                     (None, _) => QueryMatch::NoMatch,
-                    (Some(hit), Some(weakest)) if hit.score > weakest => QueryMatch::Weaker,
+                    (Some(d), Some(weakest)) if d > weakest => QueryMatch::Weaker,
                     (Some(_), _) => QueryMatch::Close,
                 },
                 fetch: FETCH_TOOL.to_string(),
@@ -329,18 +332,18 @@ mod tests {
         id: &str,
         file: &str,
         content: &str,
-        search: Option<(usize, f32)>,
+        distance: Option<f32>,
     ) -> super::super::model::GoverningRule {
         super::super::model::GoverningRule {
             item: item(id, content),
             file: file.into(),
             governs: super::super::model::Governs::File,
-            search: search.map(|(rank, score)| super::super::model::SearchMatch { rank, score }),
+            distance,
         }
     }
 
-    /// Rules are dealt in turns across files; within a file, search rank
-    /// comes first and the given order breaks ties; a rule that governs two
+    /// Rules are dealt in turns across files; within a file, distance from
+    /// the query comes first and the given order breaks ties; a rule that governs two
     /// files is dealt once.
     #[test]
     fn governing_rules_are_dealt_in_turns_by_search_rank() {
@@ -348,11 +351,11 @@ mod tests {
         let governing = vec![
             vec![
                 rule("a1", "a.rs", "a one", None),
-                rule("a2", "a.rs", "a two", Some((3, 0.4))),
-                rule("shared", "a.rs", "shared", Some((0, 0.1))),
+                rule("a2", "a.rs", "a two", Some(0.4)),
+                rule("shared", "a.rs", "shared", Some(0.1)),
             ],
             vec![
-                rule("shared", "b.rs", "shared", Some((0, 0.1))),
+                rule("shared", "b.rs", "shared", Some(0.1)),
                 rule("b1", "b.rs", "b one", None),
                 rule("b2", "b.rs", "b two", None),
             ],
@@ -380,18 +383,18 @@ mod tests {
         assert!(plan.truncation);
     }
 
-    /// `match` compares a pointer's search score (a distance) with the
-    /// weakest rule sent whole: as close or closer is `close`, farther is
-    /// `weaker`, not found is `none`.
+    /// `match` compares a pointer's distance from the query with the
+    /// weakest rule sent whole: as near or nearer is `close`, farther is
+    /// `weaker`, no distance is `none`.
     #[test]
     fn pointers_carry_match_bands() {
         use super::super::model::QueryMatch;
         let service = ContextService::new();
         let long = "x".repeat(400);
         let governing = vec![vec![
-            rule("whole", "a.rs", "short", Some((0, 0.2))),
-            rule("tie", "a.rs", &format!("tie {long}"), Some((1, 0.2))),
-            rule("far", "a.rs", &format!("far {long}"), Some((2, 0.5))),
+            rule("whole", "a.rs", "short", Some(0.2)),
+            rule("tie", "a.rs", &format!("tie {long}"), Some(0.2)),
+            rule("far", "a.rs", &format!("far {long}"), Some(0.5)),
             rule("unfound", "a.rs", &format!("unfound {long}"), None),
         ]];
         // 50 tokens: room for "short" (9), not for any 400-character rule.

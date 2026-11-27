@@ -2682,6 +2682,10 @@ async fn handle_context_plan(
             vec![0.0f32; embedder.dimensions()]
         }
     };
+    // The query's embedding, kept to rank each file's governing rules by
+    // distance. Without a query (or when embedding failed) there is nothing
+    // to rank by, and the fixed order alone decides.
+    let query_vector = (!query.trim().is_empty() && !had_backend_error).then(|| vector.clone());
     let results = match store
         .search(effective_ns, vector, max_items.max(1), false, false)
         .await
@@ -2701,25 +2705,6 @@ async fn handle_context_plan(
     let project_root = crate::daemon::resolve_project_root()
         .to_string_lossy()
         .to_string();
-    // Where each hit stood in the search for `query`: it orders each file's
-    // governing rules. Without a query the search ran on an empty string and
-    // says nothing, so the fixed order alone decides.
-    let search_matches: std::collections::HashMap<String, crate::context::model::SearchMatch> =
-        if query.trim().is_empty() {
-            std::collections::HashMap::new()
-        } else {
-            results
-                .iter()
-                .enumerate()
-                .map(|(rank, res)| {
-                    let hit = crate::context::model::SearchMatch {
-                        rank,
-                        score: res.score,
-                    };
-                    (res.id.clone(), hit)
-                })
-                .collect()
-        };
     for res in results {
         let freshness =
             context_item_freshness(&res.payload.metadata, !res.payload.location.is_empty());
@@ -2870,7 +2855,7 @@ async fn handle_context_plan(
                                 match governs {
                                     Some(governs) => {
                                         file_rules.push(crate::context::model::GoverningRule {
-                                            search: search_matches.get(&item.id).copied(),
+                                            distance: None,
                                             item,
                                             file: fp.clone(),
                                             governs,
@@ -2886,6 +2871,32 @@ async fn handle_context_plan(
                             had_backend_error = true;
                             tracing::warn!("context_plan backend error: {e}");
                             continue;
+                        }
+                    }
+                }
+                // Every governing rule is measured against the query, not
+                // only those the search happened to return: one store read
+                // for at most 20 rules per requested file.
+                if let Some(query_vector) = &query_vector {
+                    let ids: Vec<String> = governing
+                        .iter()
+                        .flatten()
+                        .map(|rule| rule.item.id.clone())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    match ls
+                        .embedding_distances(effective_ns, &ids, query_vector)
+                        .await
+                    {
+                        Ok(distances) => {
+                            for rule in governing.iter_mut().flatten() {
+                                rule.distance = distances.get(&rule.item.id).copied();
+                            }
+                        }
+                        Err(e) => {
+                            had_backend_error = true;
+                            tracing::warn!("context_plan rule distance error: {e}");
                         }
                     }
                 }
@@ -26692,6 +26703,101 @@ mod context_plan_tests {
         assert_eq!(plan["truncation"], false, "{plan}");
     }
 
+    /// Every governing rule is ranked by its distance to the query, not only
+    /// the ones inside the plan's search hits. Here a fact takes the only
+    /// search slot, yet the folder rule nearest the query is sent whole ahead
+    /// of the file's own rules, and the rules left out carry a real band.
+    /// When the nearest rule does not fit, its pointer is `close`.
+    #[tokio::test]
+    async fn context_plan_ranks_governing_rules_outside_the_search_hits_by_query() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        let query = "podman";
+        let q = LocalStubEmbedder.embed(query).await.expect("embed");
+        // The fact sits on the query and takes the single search slot.
+        store
+            .upsert(
+                "ns",
+                "fact:hit",
+                q.clone(),
+                crate::traits::MemoryPayload {
+                    content: "a fact on the query".to_string(),
+                    user_id: "test".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("upsert fact");
+        let near: Vec<f32> = q.iter().map(|x| x * 1.05).collect();
+        for i in 0..2 {
+            seed_rule(
+                &store,
+                &format!("rule:file:{i}"),
+                vec![-1.0f32, 0.5, 0.0, 0.0],
+                "src/one.rs",
+                &format!("file rule {i}"),
+            )
+            .await;
+        }
+        seed_rule(&store, "rule:near", near.clone(), "src/", "use podman").await;
+        let args = serde_json::json!({
+            "namespace": "ns",
+            "query": query,
+            "files": ["src/one.rs"],
+            "max_items": 1,
+        });
+        let plan = plan_for(&store, args).await;
+        assert_eq!(item_ids(&plan), vec!["rule:near"], "{plan}");
+        let not_shown = pointers(&plan);
+        assert_eq!(not_shown.len(), 2, "{plan}");
+        for pointer in &not_shown {
+            assert_eq!(pointer["match"], "weaker", "{pointer}");
+        }
+
+        // Too big to fit: the nearest rule becomes a `close` pointer and
+        // ranks first in its file.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        seed_rule(
+            &store,
+            "rule:file:0",
+            vec![-1.0f32, 0.5, 0.0, 0.0],
+            "src/one.rs",
+            "small",
+        )
+        .await;
+        seed_rule(
+            &store,
+            "rule:near",
+            near,
+            "src/",
+            &format!("use podman {}", "x".repeat(1000)),
+        )
+        .await;
+        let plan = plan_for(
+            &store,
+            serde_json::json!({
+                "namespace": "ns",
+                "query": query,
+                "files": ["src/one.rs"],
+                "max_items": 4,
+                "max_bytes": 256,
+            }),
+        )
+        .await;
+        assert_eq!(item_ids(&plan), vec!["rule:file:0"], "{plan}");
+        let near = pointers(&plan)
+            .into_iter()
+            .find(|p| p["id"] == "rule:near")
+            .unwrap_or_else(|| panic!("near rule is a pointer: {plan}"));
+        assert_eq!(near["match"], "close", "{near}");
+        assert_eq!(near["query_rank"], "1 of 2", "{near}");
+    }
+
     /// A governing rule that `exclude_stale` dropped from the search hits
     /// does not come back through the file lookup, neither whole nor as a
     /// pointer.
@@ -26973,6 +27079,109 @@ mod context_plan_tests {
         assert!(
             !ids.contains(&rule_a.as_str()),
             "other worktree's rule: ids={ids:?}"
+        );
+    }
+
+    /// Measures what ranking every governing rule by query distance adds:
+    /// one `embedding_distances` read for 5 files x 20 rules, in a store of
+    /// 1,100 memories. Run with `--ignored --nocapture`.
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_plan_rule_distance_cost_100_rules() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        let mut ids = Vec::new();
+        for file in 0..5 {
+            for i in 0..20 {
+                let id = format!("rule:{file}:{i}");
+                let v = vec![file as f32 + 0.5, i as f32 + 0.25, 1.5, 2.5];
+                seed_rule(&store, &id, v, &format!("src/f{file}.rs"), &id).await;
+                ids.push(id);
+            }
+        }
+        for i in 0..1000 {
+            store
+                .upsert(
+                    "ns",
+                    &format!("fact:{i}"),
+                    vec![i as f32 + 0.5, 3.5, 0.25, 1.25],
+                    crate::traits::MemoryPayload {
+                        content: format!("background fact {i}"),
+                        user_id: "test".to_string(),
+                        memory_type: "fact".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({}),
+                    },
+                )
+                .await
+                .expect("upsert fact");
+        }
+        let ls = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::LadybugStore>()
+            .expect("ladybug store");
+        let q = LocalStubEmbedder.embed("rule").await.expect("embed");
+        let mut samples = Vec::new();
+        for _ in 0..30 {
+            let start = std::time::Instant::now();
+            let distances = ls
+                .embedding_distances("ns", &ids, &q)
+                .await
+                .expect("distances");
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(distances.len(), ids.len());
+        }
+        samples.sort_by(f64::total_cmp);
+        let files: Vec<String> = (0..5).map(|f| format!("src/f{f}.rs")).collect();
+        let mut plans = Vec::new();
+        for _ in 0..10 {
+            let start = std::time::Instant::now();
+            plan_for(
+                &store,
+                serde_json::json!({"namespace": "ns", "query": "rule", "files": files}),
+            )
+            .await;
+            plans.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        plans.sort_by(f64::total_cmp);
+        // The per-file lookup the plan already made, at the old per-file
+        // limit (max_items, default 10) and at the store's 20.
+        let types: Vec<String> = crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let mut lookups = Vec::new();
+        for limit in [10usize, 20] {
+            let mut runs = Vec::new();
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                for file in &files {
+                    ls.memories_for_file_forms(
+                        "ns",
+                        None,
+                        std::slice::from_ref(file),
+                        None,
+                        true,
+                        &types,
+                        &[],
+                        limit,
+                    )
+                    .await
+                    .expect("lookup");
+                }
+                runs.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            runs.sort_by(f64::total_cmp);
+            lookups.push(runs[runs.len() / 2]);
+        }
+        println!(
+            "rule distances, 100 ids: median {:.2} ms, max {:.2} ms; whole plan, 5 files: median {:.2} ms; 5 file lookups: limit 10 {:.2} ms, limit 20 {:.2} ms",
+            samples[samples.len() / 2],
+            samples[samples.len() - 1],
+            plans[plans.len() / 2],
+            lookups[0],
+            lookups[1]
         );
     }
 

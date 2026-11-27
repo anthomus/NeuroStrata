@@ -339,8 +339,9 @@ state_enum! {
 
 state_enum! {
     /// How well a rule left out of the plan matched the query, against the
-    /// weakest rule sent whole: `close` matched as well or better, `weaker`
-    /// matched worse, `none` was not among the search hits.
+    /// weakest rule sent whole: `close` is as near the query or nearer
+    /// (also when no rule sent whole has a distance), `weaker` is farther,
+    /// `none` has no distance (no query, or no usable embedding).
     QueryMatch {
         Close => "close",
         Weaker => "weaker",
@@ -373,15 +374,6 @@ pub struct NotShown {
 /// The tool a pointer in [`NotShown`] names for fetching the rule.
 pub const FETCH_TOOL: &str = "neurostrata_get_memory";
 
-/// Where a rule stood in the request's search hits.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SearchMatch {
-    /// 0-based position in the search hits.
-    pub rank: usize,
-    /// The hit's score, a distance: lower is closer to the query.
-    pub score: f32,
-}
-
 /// One rule that governs a requested file, handed to the planner.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoverningRule {
@@ -391,9 +383,9 @@ pub struct GoverningRule {
     pub file: String,
     /// What it is attached to.
     pub governs: Governs,
-    /// Its place in the search hits for the query; `None` when there is no
-    /// query or the search did not find it.
-    pub search: Option<SearchMatch>,
+    /// Its distance from the query (lower is closer); `None` when there is
+    /// no query or the rule has no usable embedding.
+    pub distance: Option<f32>,
 }
 
 impl ContextPlan {
