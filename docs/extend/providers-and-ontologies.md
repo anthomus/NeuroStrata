@@ -25,6 +25,8 @@ The `VectorStore` trait is the pluggable interface for vector persistence and si
 
 `get_many(namespaces, ids)` returns the payloads of the rows with those ids in those namespaces, without their vectors, and leaves out ids with no row. Its default reads them one by one with `get`; a backend that can answer in one query should override it, as `LadybugStore` does. `get_snapshot` uses it to leave retired rules out of the session file's task block.
 
+`list_metadata_containing(namespace, needle)` returns the rows whose stored metadata text contains `needle`, a superset of the rows that name it in some field; the caller checks the field itself. Its default lists the whole namespace; `LadybugStore` narrows in the engine, as it does for `list_pinned`. `task_claim` and `task_get` use it to find the memories tied to a task by id.
+
 Stores that project edges into a graph additionally implement the optional seam
 
 - `async fn reconcile_declared_edges(&self, namespace: &str, id: &str, rel_type: &str, keep: &[String]) -> Result<usize>` — retire the edges this store materialised from a previous declaration of `rel_type` whose target is not in `keep`

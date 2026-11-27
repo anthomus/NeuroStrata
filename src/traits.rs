@@ -675,6 +675,18 @@ pub trait VectorStore: Send + Sync + AsAny {
         self.list(namespace, None, None).await
     }
 
+    /// Rows whose stored metadata text contains `needle`: a superset of the
+    /// rows that name `needle` in some metadata field, for callers that check
+    /// the field themselves. Stores that can narrow in the engine override
+    /// this; the default lists the whole namespace.
+    async fn list_metadata_containing(
+        &self,
+        namespace: &str,
+        _needle: &str,
+    ) -> Result<Vec<SearchResult>> {
+        self.list(namespace, None, None).await
+    }
+
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
 
