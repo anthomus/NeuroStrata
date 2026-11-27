@@ -10915,7 +10915,7 @@ async fn handle_supersede_memory(
     // Write the replacement BEFORE retiring the original. If the second write
     // fails the namespace holds both versions, which is visible and repairable;
     // the other order would leave the rule retired with no successor.
-    let similar_query_vector = vector.clone();
+    let similar_query_vectors = [vector.clone(), old_vector.clone()];
     let similar_scope = dedup_scope(&new_payload);
     let old_content = old_payload.content.clone();
     let old_is_task = old_payload.memory_type == "task";
@@ -11028,7 +11028,7 @@ async fn handle_supersede_memory(
         similar_live_memories(
             &store,
             namespace,
-            similar_query_vector,
+            similar_query_vectors,
             similar_scope,
             [content, old_content.as_str()],
             [id, new_id.as_str()],
@@ -11103,25 +11103,28 @@ async fn handle_supersede_memory(
             content_lists.len()
         ));
     }
-    // Always present, and last, so a reader finds it on its own line.
-    match similar {
+    // Always present, and the last line, so a reader finds it in one place.
+    let listed = match similar {
         Ok(listed) => {
-            let any = !listed.is_empty();
-            report.push_str(&format!(
-                "\nsimilar_memories: {}",
-                serde_json::Value::Array(listed)
-            ));
-            if any {
+            if !listed.is_empty() {
                 report.push_str(
-                    "\nThese live memories read like the same claim: supersede or archive each one that states it, so no stale copy stays live.",
+                    "\nThe live memories below read like the same claim: supersede or archive each one that states it, so no stale copy stays live.",
                 );
             }
+            listed
         }
-        Err(e) => report.push_str(&format!(
-            "\nsimilar_memories: []\nCould not look for other memories that state the same claim: {}.",
-            e
-        )),
-    }
+        Err(e) => {
+            report.push_str(&format!(
+                "\nCould not look for other memories that state the same claim: {}.",
+                e
+            ));
+            Vec::new()
+        }
+    };
+    report.push_str(&format!(
+        "\nsimilar_memories: {}",
+        serde_json::Value::Array(listed)
+    ));
     report
 }
 
@@ -11135,27 +11138,37 @@ const SIMILAR_MEMORIES_LISTED: usize = 5;
 const SIMILAR_MEMORIES_POOL: usize = 20;
 
 /// Live memories that read like the same claim as either text, best first.
-/// One vector query through the dedup candidate seam add_memory uses, so it
-/// returns only live rows (not retired, archived, tasks or structural), then
-/// the duplicate bound on text similarity.
+/// One vector query per text through the dedup candidate seam add_memory
+/// uses, so only live rows come back (not retired, archived, tasks or
+/// structural), then the duplicate bound on text similarity. Both texts are
+/// queried: stale copies sit near the old wording, and a rewrite can move the
+/// new wording far enough that they fall outside its pool.
 async fn similar_live_memories(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
-    vector: Vec<f32>,
+    vectors: [Vec<f32>; 2],
     scope: crate::traits::DedupCandidateScope,
     texts: [&str; 2],
     exclude: [&str; 2],
 ) -> anyhow::Result<Vec<Value>> {
-    let candidates = store
-        .nearest_by_raw_distance(
-            namespace,
-            vector,
-            crate::traits::RawDistanceQuery {
-                limit: SIMILAR_MEMORIES_POOL,
-                scope,
-            },
-        )
-        .await?;
+    let mut candidates: Vec<crate::traits::RawDistanceCandidate> = Vec::new();
+    for vector in vectors {
+        for c in store
+            .nearest_by_raw_distance(
+                namespace,
+                vector,
+                crate::traits::RawDistanceQuery {
+                    limit: SIMILAR_MEMORIES_POOL,
+                    scope: scope.clone(),
+                },
+            )
+            .await?
+        {
+            if !candidates.iter().any(|seen| seen.id == c.id) {
+                candidates.push(c);
+            }
+        }
+    }
     let mut scored: Vec<(f64, crate::traits::RawDistanceCandidate)> = candidates
         .into_iter()
         .filter(|c| !exclude.contains(&c.id.as_str()))
@@ -19363,8 +19376,9 @@ mod tests {
     fn similar_entries_from(reply: &str) -> Vec<serde_json::Value> {
         let line = reply
             .lines()
-            .find_map(|l| l.strip_prefix("similar_memories: "))
-            .unwrap_or_else(|| panic!("the reply always carries similar_memories: {}", reply));
+            .last()
+            .and_then(|l| l.strip_prefix("similar_memories: "))
+            .unwrap_or_else(|| panic!("the reply always ends with similar_memories: {}", reply));
         serde_json::from_str(line).expect("similar_memories is a JSON array")
     }
 
@@ -19476,6 +19490,62 @@ mod tests {
         }
     }
 
+    /// The stub embedder sums bytes by position modulo 4, so shuffling the
+    /// characters within each residue class keeps the vector. Each class turns
+    /// by a different amount, so the words do not survive as a shifted whole.
+    fn same_vector_scramble(text: &str, k: usize) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = chars.clone();
+        for r in 0..4 {
+            let idx: Vec<usize> = (r..chars.len()).step_by(4).collect();
+            for (j, &i) in idx.iter().enumerate() {
+                out[i] = chars[idx[(j + k + 7 * r) % idx.len()]];
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// A rewrite can move the new wording away from the stale copies: rows
+    /// that sit on the new text's vector fill its whole candidate pool, and
+    /// the copy of the old claim is found only through the old text's vector.
+    #[tokio::test]
+    async fn supersede_lists_copies_of_the_old_claim_after_a_rewrite() {
+        let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("probe").await.unwrap();
+        let old_text =
+            "build every container image with podman and never call docker in this repository";
+        let new_text = "container images in this repository are built and tested only with podman and the docker binary is never invoked by any script";
+        let old_id = seed_rule(&store, "probe", old_text, serde_json::json!({})).await;
+        let stale_copy = seed_rule(&store, "probe", old_text, serde_json::json!({})).await;
+        for k in 1..=SIMILAR_MEMORIES_POOL + 1 {
+            let filler = same_vector_scramble(new_text, k);
+            assert_eq!(
+                StubEmbedder.embed(&filler).await.unwrap(),
+                StubEmbedder.embed(new_text).await.unwrap()
+            );
+            for text in [old_text, new_text] {
+                assert!(
+                    f64::from(compute_token_jaccard(text, &filler)) < DUPLICATE_TEXT_SIMILARITY,
+                    "a filler must not read like either claim: {filler}"
+                );
+            }
+            seed_rule(&store, "probe", &filler, serde_json::json!({})).await;
+        }
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": new_text }),
+            Arc::new(StubEmbedder),
+            store,
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+        assert_eq!(similar_ids_from(&reply), vec![stale_copy], "got {}", reply);
+    }
+
     /// Explicit zero: the field is there even when nothing matches.
     #[tokio::test]
     async fn supersede_with_no_similar_memories_lists_none() {
@@ -19500,7 +19570,9 @@ mod tests {
     }
 
     /// The row being corrected and its replacement state the claim by
-    /// construction; listing them would only be noise.
+    /// construction; listing them would only be noise. The retired original is
+    /// also dropped by the store's live-row filter, so the new row, live and
+    /// word for word the same, is the exclusion this pins.
     #[tokio::test]
     async fn supersede_never_lists_the_old_or_the_new_row() {
         let (store, old_id) = store_with_one_rule("probe").await;
