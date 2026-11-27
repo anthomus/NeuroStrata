@@ -64,7 +64,7 @@ Both call sites forward the analysable tool input as the guard payload. A raw-st
 
 Claude Code `NotebookEdit` is a file-mutating tool like `Write` and `Edit`: it is in `MUTATING_FILE_TOOLS`, so its input (including the cell body in `new_source`) reaches `neurostrata_guard_validate`, and its `notebook_path` drives file-touch recall. The Claude hook the installer writes matches `Read|Write|Edit|MultiEdit|NotebookEdit|Bash|Task`; an install that still has the older matcher without `NotebookEdit` is widened on the next install or init.
 
-File-touch recall sends `neurostrata_memories_for_file` an absolute path. A relative tool path is joined onto the agent's folder first: the hook event's `cwd` for CLI hooks, the plugin context's folder for OpenCode. Absolute paths are sent as they are. The recall block names the file by its path relative to the project root, written with `/` on every host; a file outside the root keeps its absolute path.
+File-touch recall sends `neurostrata_memories_for_file` an absolute path. A relative tool path is joined onto the agent's folder first: the hook event's `cwd` for CLI hooks, the plugin context's folder for OpenCode. Absolute paths are sent as they are. The recall block names the file by the `resolved_path` the daemon returns; an older daemon without it shows the path as sent.
 
 `neurostrata-1e14`: subagent context headers sanitize namespace and task labels to `[A-Za-z0-9_.:-]` before interpolation. Code Mode's `execute`/`mcp_execute` tool output is also excluded from task-intent intake.
 

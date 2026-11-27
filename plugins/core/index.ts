@@ -35,7 +35,6 @@ import { homedir } from 'node:os'
 import {
   basename,
   dirname,
-  isAbsolute,
   join,
   relative,
   resolve,
@@ -1022,18 +1021,6 @@ function agentDirFromCtx(ctx?: any): string {
 /** Effective project root for reading .NeuroStrata state files. */
 function effectiveProjectRoot(config: ResolvedConfig): string {
   return config.projectRoot ?? resolveProjectRoot()
-}
-
-/**
- * The recall label for a touched file: its absolute path relative to the
- * project root, written with `/` on every host, or the path as given when it
- * lies outside the root.
- */
-function pathRelativeToProjectRoot(absPath: string, config: ResolvedConfig): string {
-  const rel = relative(effectiveProjectRoot(config), absPath)
-  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
-    ? rel.split(sep).join('/')
-    : absPath
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2337,11 +2324,16 @@ function parseRawFileRecallEntries(
 /**
  * Recall governing memories for a touched file. LRU path dedup (no re-query within the
  * window) and injectedMemoryIds dedup (each memory injected once per session).
+ * `opts.resolved.path` receives the daemon's `resolved_path`, the recall label.
  */
 export async function prefetchMemoriesForFile(
   namespace: string,
   filePath: string,
-  opts?: { recordLedgerDir?: string; projectRoot?: string }
+  opts?: {
+    recordLedgerDir?: string
+    projectRoot?: string
+    resolved?: { path?: string }
+  }
 ): Promise<string[]> {
   const normalized = filePath.trim()
   if (normalized === '') return []
@@ -2358,6 +2350,15 @@ export async function prefetchMemoriesForFile(
       limit: 5
     })
     recordPrefetchedPath(key)
+    if (opts?.resolved) {
+      try {
+        const resolved = JSON.parse(text).resolved_path
+        if (typeof resolved === 'string' && resolved !== '')
+          opts.resolved.path = resolved
+      } catch {
+        // a reply that is not JSON has no resolved_path
+      }
+    }
     // Persist conceptual bridges from the hits into active_session.json so
     // sessionContextHandler can inject them as [NeuroStrata Conceptual Bridges].
     const projectRoot = opts?.projectRoot ?? opts?.recordLedgerDir
@@ -3487,14 +3488,15 @@ const executeAfterHandler = async (
       event?.toolInput?.path
     if (filePath) {
       const fp = absoluteToolPath(String(filePath), agentDirFromCtx(pluginCtx))
-      const normalizedPath = pathRelativeToProjectRoot(fp, config)
+      const resolved: { path?: string } = {}
       const dedupKey = `${sessionId ?? '__no_session__'}:${epoch}:${fp}`
       const seen = sessionSeenFiles(sessionId)
       if (!seen.has(dedupKey)) {
         let snippets: string[] = []
         try {
           snippets = await prefetchMemoriesForFile(config.namespace, fp, {
-            recordLedgerDir: config.projectRoot
+            recordLedgerDir: config.projectRoot,
+            resolved
           })
           // Only mark the path as seen once the prefetch has actually run;
           // a failed/empty prefetch leaves the path unmarked so a retry
@@ -3506,7 +3508,7 @@ const executeAfterHandler = async (
         if (snippets.length > 0) {
           confirmPrefetchDelivery(config.namespace, fp)
           suffixParts.push(
-            `[NeuroStrata File Context — ${normalizedPath}]\n${snippets.slice(0, 2).join('\n')}`
+            `[NeuroStrata File Context — ${resolved.path ?? fp}]\n${snippets.slice(0, 2).join('\n')}`
           )
         }
       }
@@ -3691,12 +3693,15 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
   let snippets: string[] = []
   let filePath: string | undefined
   let recallPath: string | undefined
+  const resolved: { path?: string } = {}
   if (isFileTouchTool(toolName)) {
     filePath = extractFilePath(args, altArgs, input?.input)
     if (filePath) {
       recallPath = absoluteToolPath(filePath, agentDirFromCtx(pluginCtx))
       try {
-        snippets = await prefetchMemoriesForFile(config.namespace, recallPath)
+        snippets = await prefetchMemoriesForFile(config.namespace, recallPath, {
+          resolved
+        })
       } catch {
         snippets = []
       }
@@ -3704,10 +3709,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
   }
   let block: string | undefined
   if (snippets.length > 0 && recallPath) {
-    block = formatFileTouchRecallBlock(
-      pathRelativeToProjectRoot(recallPath, config),
-      snippets
-    )
+    block = formatFileTouchRecallBlock(resolved.path ?? recallPath, snippets)
     input.additionalContext = block
     input.neurostrataContext = block
   }
@@ -4034,13 +4036,15 @@ export async function handleHookEvent(
           asString(event.cwd) ?? process.cwd()
         )
         try {
+          const resolved: { path?: string } = {}
           const snippets = await prefetchMemoriesForFile(
             config.namespace,
-            recalledFilePath
+            recalledFilePath,
+            { resolved }
           )
           if (snippets.length > 0)
             recallBlock = formatFileTouchRecallBlock(
-              pathRelativeToProjectRoot(recalledFilePath, config),
+              resolved.path ?? recalledFilePath,
               snippets
             )
         } catch {

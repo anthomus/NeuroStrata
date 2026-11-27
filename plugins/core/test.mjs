@@ -12,7 +12,14 @@ import {
   symlinkSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
-import { join, isAbsolute, resolve, dirname, sep } from 'node:path'
+import {
+  join,
+  isAbsolute,
+  relative,
+  resolve,
+  dirname,
+  sep
+} from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { execFileSync as execFileSyncTop, spawn } from 'node:child_process'
 
@@ -189,9 +196,19 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
   })
 }
 
+// The daemon's `resolved_path`: project-relative with `/` under a root, the
+// path itself outside every root. `root: null` replies without the field.
+function mockResolvedPath(path, root) {
+  const rel = relative(root, path)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
+    ? rel.split(sep).join('/')
+    : path
+}
+
 function createMockDaemonServer({
   returnTask = null,
-  guardReject = false
+  guardReject = false,
+  root = process.cwd()
 } = {}) {
   const counters = {
     memoriesForFile: 0,
@@ -249,6 +266,9 @@ function createMockDaemonServer({
                 {
                   type: 'text',
                   text: JSON.stringify({
+                    ...(root !== null && typeof args.path === 'string'
+                      ? { resolved_path: mockResolvedPath(args.path, root) }
+                      : {}),
                     hits: [
                       {
                         id: 'mem-rule-1',
@@ -1717,9 +1737,9 @@ describe('OpenCode handlers join a relative tool path onto the ctx folder', () =
     }
   })
 
-  it('execute.after labels sub/lib.rs relative to the project root', async () => {
-    const { server, url } = await createMockDaemonServer()
+  it('execute.after labels sub/lib.rs by the resolved_path', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ns-oc-label-'))
+    const { server, url } = await createMockDaemonServer({ root })
     try {
       const h = await startOpenCode(url, root, { v2: true })
       const evt = afterRead('lib.rs')
@@ -3705,8 +3725,8 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       }
     })
 
-    // The recall label names the file relative to the project root, so an
-    // agent in a subfolder sees which file the rules govern.
+    // The recall label is the daemon's resolved_path, so an agent in a
+    // subfolder sees which file the rules govern.
     const startAt = async (url, directory) =>
       initialize({
         directory,
@@ -3727,13 +3747,27 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       return m ? m[1] : null
     }
 
-    it('the label is relative to the project root from a subfolder', async () => {
-      const { server, url } = await createMockDaemonServer()
+    it('the label is the resolved_path from a subfolder', async () => {
       const root = mkdtempSync(join(tmpdir(), 'ns-abs-label-'))
+      const { server, url } = await createMockDaemonServer({ root })
       try {
         await startAt(url, root)
         const out = await readFrom(join(root, 'sub'), { file_path: 'lib.rs' })
         assert.equal(labelOf(out), 'sub/lib.rs')
+      } finally {
+        server.close()
+        rmSync(root, { recursive: true, force: true })
+        resetModuleState()
+      }
+    })
+
+    it('a reply without resolved_path labels the path as sent', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'ns-abs-nolabel-'))
+      const { server, url } = await createMockDaemonServer({ root: null })
+      try {
+        await startAt(url, root)
+        const out = await readFrom(join(root, 'sub'), { file_path: 'lib.rs' })
+        assert.equal(labelOf(out), resolve(root, 'sub', 'lib.rs'))
       } finally {
         server.close()
         rmSync(root, { recursive: true, force: true })
@@ -4547,7 +4581,7 @@ describe('Task 1.1: execute.after V2 result mutation (via hook registration)', (
     const tmpDir = mkdtempSync(join(tmpdir(), 'ns-core-exec-'))
     const nsDir = join(tmpDir, '.NeuroStrata')
     mkdirSync(nsDir, { recursive: true })
-    const { server, url, counters } = await createMockDaemonServer()
+    const { server, url, counters } = await createMockDaemonServer({ root: tmpDir })
     let afterHandler = null
     try {
       const ctx = {
@@ -4610,7 +4644,7 @@ describe('Task 1.1: execute.after V2 result mutation (via hook registration)', (
     const tmpDir = mkdtempSync(join(tmpdir(), 'ns-core-dedup-'))
     const nsDir = join(tmpDir, '.NeuroStrata')
     mkdirSync(nsDir, { recursive: true })
-    const { server, url, counters } = await createMockDaemonServer()
+    const { server, url, counters } = await createMockDaemonServer({ root: tmpDir })
     let afterHandler = null
     try {
       const ctx = {

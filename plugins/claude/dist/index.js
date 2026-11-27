@@ -20,7 +20,7 @@
 // ──────────────────────────────────────────────────────────────────────
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
 // ──────────────────────────────────────────────────────────────────────
@@ -916,17 +916,6 @@ function agentDirFromCtx(ctx) {
 /** Effective project root for reading .NeuroStrata state files. */
 function effectiveProjectRoot(config) {
     return config.projectRoot ?? resolveProjectRoot();
-}
-/**
- * The recall label for a touched file: its absolute path relative to the
- * project root, written with `/` on every host, or the path as given when it
- * lies outside the root.
- */
-function pathRelativeToProjectRoot(absPath, config) {
-    const rel = relative(effectiveProjectRoot(config), absPath);
-    return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
-        ? rel.split(sep).join('/')
-        : absPath;
 }
 // ──────────────────────────────────────────────────────────────────────
 // Credential
@@ -1996,6 +1985,7 @@ function parseRawFileRecallEntries(text, normalized) {
 /**
  * Recall governing memories for a touched file. LRU path dedup (no re-query within the
  * window) and injectedMemoryIds dedup (each memory injected once per session).
+ * `opts.resolved.path` receives the daemon's `resolved_path`, the recall label.
  */
 export async function prefetchMemoriesForFile(namespace, filePath, opts) {
     const normalized = filePath.trim();
@@ -2015,6 +2005,16 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
             limit: 5
         });
         recordPrefetchedPath(key);
+        if (opts?.resolved) {
+            try {
+                const resolved = JSON.parse(text).resolved_path;
+                if (typeof resolved === 'string' && resolved !== '')
+                    opts.resolved.path = resolved;
+            }
+            catch {
+                // a reply that is not JSON has no resolved_path
+            }
+        }
         // Persist conceptual bridges from the hits into active_session.json so
         // sessionContextHandler can inject them as [NeuroStrata Conceptual Bridges].
         const projectRoot = opts?.projectRoot ?? opts?.recordLedgerDir;
@@ -2937,14 +2937,15 @@ const executeAfterHandler = async (output, secondArg) => {
             event?.toolInput?.path;
         if (filePath) {
             const fp = absoluteToolPath(String(filePath), agentDirFromCtx(pluginCtx));
-            const normalizedPath = pathRelativeToProjectRoot(fp, config);
+            const resolved = {};
             const dedupKey = `${sessionId ?? '__no_session__'}:${epoch}:${fp}`;
             const seen = sessionSeenFiles(sessionId);
             if (!seen.has(dedupKey)) {
                 let snippets = [];
                 try {
                     snippets = await prefetchMemoriesForFile(config.namespace, fp, {
-                        recordLedgerDir: config.projectRoot
+                        recordLedgerDir: config.projectRoot,
+                        resolved
                     });
                     // Only mark the path as seen once the prefetch has actually run;
                     // a failed/empty prefetch leaves the path unmarked so a retry
@@ -2956,7 +2957,7 @@ const executeAfterHandler = async (output, secondArg) => {
                 }
                 if (snippets.length > 0) {
                     confirmPrefetchDelivery(config.namespace, fp);
-                    suffixParts.push(`[NeuroStrata File Context — ${normalizedPath}]\n${snippets.slice(0, 2).join('\n')}`);
+                    suffixParts.push(`[NeuroStrata File Context — ${resolved.path ?? fp}]\n${snippets.slice(0, 2).join('\n')}`);
                 }
             }
         }
@@ -3119,12 +3120,15 @@ const executeBeforeHandler = async (input) => {
     let snippets = [];
     let filePath;
     let recallPath;
+    const resolved = {};
     if (isFileTouchTool(toolName)) {
         filePath = extractFilePath(args, altArgs, input?.input);
         if (filePath) {
             recallPath = absoluteToolPath(filePath, agentDirFromCtx(pluginCtx));
             try {
-                snippets = await prefetchMemoriesForFile(config.namespace, recallPath);
+                snippets = await prefetchMemoriesForFile(config.namespace, recallPath, {
+                    resolved
+                });
             }
             catch {
                 snippets = [];
@@ -3133,7 +3137,7 @@ const executeBeforeHandler = async (input) => {
     }
     let block;
     if (snippets.length > 0 && recallPath) {
-        block = formatFileTouchRecallBlock(pathRelativeToProjectRoot(recallPath, config), snippets);
+        block = formatFileTouchRecallBlock(resolved.path ?? recallPath, snippets);
         input.additionalContext = block;
         input.neurostrataContext = block;
     }
@@ -3403,9 +3407,10 @@ export async function handleHookEvent(event) {
             if (filePath) {
                 recalledFilePath = absoluteToolPath(filePath, asString(event.cwd) ?? process.cwd());
                 try {
-                    const snippets = await prefetchMemoriesForFile(config.namespace, recalledFilePath);
+                    const resolved = {};
+                    const snippets = await prefetchMemoriesForFile(config.namespace, recalledFilePath, { resolved });
                     if (snippets.length > 0)
-                        recallBlock = formatFileTouchRecallBlock(pathRelativeToProjectRoot(recalledFilePath, config), snippets);
+                        recallBlock = formatFileTouchRecallBlock(resolved.path ?? recalledFilePath, snippets);
                 }
                 catch {
                     // prefetch failures are fail-soft
