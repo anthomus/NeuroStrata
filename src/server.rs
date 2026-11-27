@@ -1276,6 +1276,7 @@ async fn _with_watch(
                                 "max_bytes": { "type": "integer", "description": "Approx byte budget (converted to tokens at ~4 bytes/token; defaults to max_items * 1024 bytes). Governing rules and search hits share it; nothing is cut, a rule that does not fit becomes a pointer in not_shown." },
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale from the context plan." },
                                 "file_paths": { "type": "array", "items": { "type": "string" }, "description": "Alias for files." },
+                                "project_root": { "type": "string", "description": "Optional absolute path of the caller's worktree, as on neurostrata_memories_for_file: it places absolute file paths and reads each file's governing rules from that worktree's ingest generation." },
                                 "target_namespace": { "type": "string", "description": "Optional cross-scope target namespace when authorized." },
                                 "turn_used": { "type": "integer", "description": "Bytes already used in the current turn budget." },
                                 "session_used": { "type": "integer", "description": "Bytes already used in the current session budget." },
@@ -2605,6 +2606,11 @@ async fn handle_context_plan(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let file_path = arguments.get("file_path").and_then(|v| v.as_str());
+    // The caller's worktree, as on neurostrata_memories_for_file: it places
+    // absolute paths and pins each file lookup to that worktree's generation.
+    let caller_root = arguments.get("project_root").and_then(|v| v.as_str());
+    let caller_source: Option<String> =
+        caller_root.map(|root| crate::parser::ingest::source_key_for(std::path::Path::new(root)));
     // Dedupe requested work at construction time by the same normalized path
     // key the lookup/form layer uses, keeping first-seen order and the caller's
     // original spelling for the synthetic source item below.
@@ -2755,9 +2761,10 @@ async fn handle_context_plan(
                     std::collections::HashSet::new();
                 for fp in &requested_files {
                     // Same resolution as neurostrata_memories_for_file, but
-                    // against the hoisted registry root. An absolute spelling
-                    // therefore reaches the same relative locations as its
-                    // relative twin and is recognized as the same logical file.
+                    // against the hoisted registry root and the caller's
+                    // root. An absolute spelling therefore reaches the same
+                    // relative locations as its relative twin and is
+                    // recognized as the same logical file.
                     let registry_root = match registry_root_for_lookup(
                         registry_root_read
                             .as_ref()
@@ -2765,7 +2772,7 @@ async fn handle_context_plan(
                             .map_err(|e| anyhow::anyhow!("{e}")),
                         effective_ns,
                         fp,
-                        None,
+                        caller_root,
                     ) {
                         Ok(root) => root,
                         Err(e) => {
@@ -2784,7 +2791,7 @@ async fn handle_context_plan(
                     log_marker_note("context_plan", used.note.as_deref());
                     let (lookup, forms) = match lookup_path_with_registry_root(
                         fp,
-                        None,
+                        caller_root,
                         registry_root.as_deref(),
                         used.spelling,
                         MarkerOrder::First,
@@ -2810,7 +2817,7 @@ async fn handle_context_plan(
                     match memories_for_forms(
                         ls,
                         effective_ns,
-                        None,
+                        caller_source.as_deref(),
                         &forms,
                         None,
                         true,
@@ -26840,6 +26847,133 @@ mod context_plan_tests {
             "{seen} of {total} rules seen: {plan}"
         );
         assert_eq!(plan["truncation"], true, "{plan}");
+    }
+
+    /// Two worktrees of one project can hold different rules for the same
+    /// file. `project_root` pins each requested file to the caller's
+    /// worktree, as it does on neurostrata_memories_for_file.
+    #[tokio::test]
+    async fn context_plan_files_resolve_against_the_callers_worktree() {
+        use crate::traits::{MemoryPayload, VectorStore};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 4).expect("open"),
+        );
+        store.init("ns").await.expect("init ns");
+        let root_a = tmp.path().join("wt-a");
+        let root_b = tmp.path().join("wt-b");
+        for root in [&root_a, &root_b] {
+            std::fs::create_dir_all(root.join("src")).expect("create src dir");
+            std::fs::write(root.join("src/one.rs"), "pub fn one() {}\n").expect("write one.rs");
+        }
+        let key_a = crate::parser::ingest::source_key_for(&root_a);
+        let key_b = crate::parser::ingest::source_key_for(&root_b);
+        assert_ne!(key_a, key_b);
+
+        let embedder: Arc<dyn Embedder> = Arc::new(LocalStubEmbedder);
+        let query = "fact";
+        let query_vector = embedder.embed(query).await.expect("embed query");
+        // Each worktree's ingest made its own generation of src/one.rs, and
+        // each holds a rule governing its own copy of the file.
+        let file_a = crate::parser::ingest::generation_scoped_id("ns", 1, "src/one.rs");
+        let file_b = crate::parser::ingest::generation_scoped_id("ns", 2, "src/one.rs");
+        let rule_a = "rule:worktree-a".to_string();
+        let rule_b = "rule:worktree-b".to_string();
+        let mut seed: Vec<(String, &str, Vec<f32>, serde_json::Value, &str)> = vec![
+            (
+                file_a.clone(),
+                "file",
+                vec![0.0f32; 4],
+                serde_json::json!({}),
+                "src/one.rs",
+            ),
+            (
+                file_b.clone(),
+                "file",
+                vec![0.0f32; 4],
+                serde_json::json!({}),
+                "src/one.rs",
+            ),
+            (
+                rule_a.clone(),
+                "rule",
+                vec![0.1f32; 4],
+                serde_json::json!({"governs": [file_a]}),
+                "",
+            ),
+            (
+                rule_b.clone(),
+                "rule",
+                vec![0.1f32; 4],
+                serde_json::json!({"governs": [file_b]}),
+                "",
+            ),
+        ];
+        // Facts on the query vector take every search slot, so a rule can
+        // only enter the plan through the per-file lookup.
+        for i in 0..3 {
+            seed.push((
+                format!("fact:hit:{i}"),
+                "fact",
+                query_vector.clone(),
+                serde_json::json!({}),
+                "",
+            ));
+        }
+        for (id, memory_type, vector, metadata, location) in seed {
+            store
+                .upsert(
+                    "ns",
+                    &id,
+                    vector,
+                    MemoryPayload {
+                        content: format!("content of {id}"),
+                        user_id: "test".to_string(),
+                        memory_type: memory_type.to_string(),
+                        agent_name: None,
+                        location: location.to_string(),
+                        location_lines: String::new(),
+                        metadata,
+                    },
+                )
+                .await
+                .expect("upsert seed");
+        }
+        store
+            .publish_generation("ns", &key_a, 1)
+            .await
+            .expect("publish worktree a");
+        store
+            .publish_generation("ns", &key_b, 2)
+            .await
+            .expect("publish worktree b");
+
+        let result = handle_context_plan(
+            &serde_json::json!({
+                "namespace": "ns",
+                "query": query,
+                "files": ["src/one.rs"],
+                "project_root": root_b.to_string_lossy(),
+                "max_items": 2,
+            }),
+            embedder.clone(),
+            store.clone(),
+        )
+        .await;
+        let plan: serde_json::Value = serde_json::from_str(&result).expect("plan json");
+        let ids: Vec<&str> = plan["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .filter_map(|it| it["id"].as_str())
+            .collect();
+        assert!(ids.contains(&rule_b.as_str()), "caller's rule: ids={ids:?}");
+        assert!(
+            !ids.contains(&rule_a.as_str()),
+            "other worktree's rule: ids={ids:?}"
+        );
     }
 
     #[ignore]
