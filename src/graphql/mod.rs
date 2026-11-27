@@ -1,5 +1,6 @@
 pub const SCHEMA_SDL: &str = include_str!("../schemas/graphql/schema.v1.graphql");
 
+use crate::store::ladybug::is_retired_at;
 use crate::traits::VectorStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -286,13 +287,6 @@ fn is_archived(metadata: &Value) -> bool {
     // but every read surface shares the wider search-visibility predicate so
     // the legacy integer tombstone cannot leak through GraphQL either.
     crate::lexical::archived_flag(metadata)
-}
-
-fn is_retired_at(metadata: &Value, now: i64) -> bool {
-    match metadata.get("valid_to") {
-        Some(valid_to) if !valid_to.is_null() => valid_to.as_i64().unwrap_or(0) <= now,
-        _ => false,
-    }
 }
 
 /// Grouped to replace `build_memory_node`'s 9-argument signature; field
@@ -1646,6 +1640,45 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(rows2.len(), 1);
+    }
+
+    #[test]
+    fn graphql_leaves_out_a_superseded_memory_without_valid_to() {
+        let payload = |metadata: serde_json::Value| crate::traits::MemoryPayload {
+            content: "x".into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata,
+        };
+        let records = vec![
+            (
+                "old".into(),
+                payload(serde_json::json!({ "superseded_by": "newer" })),
+            ),
+            (
+                "newer".into(),
+                payload(serde_json::json!({ "superseded_by": "newest" })),
+            ),
+            ("newest".into(), payload(serde_json::json!({}))),
+        ];
+        let ids = |query: &str| {
+            let resp =
+                execute_on_records(&records, &Default::default(), "ns", "admin", query, None);
+            assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+            t3_edge_ids(&resp, "memories")
+        };
+        assert_eq!(
+            ids("{ memories { edges { node { id } } } }"),
+            vec!["newest".to_string()]
+        );
+        assert_eq!(
+            ids("{ memories(includeRetired: true) { edges { node { id } } } }").len(),
+            3,
+            "includeRetired still shows the replaced rows"
+        );
     }
 
     #[test]

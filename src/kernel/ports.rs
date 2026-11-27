@@ -259,10 +259,10 @@ impl LadybugMemoryPort {
 }
 
 /// Returns `true` when a `data_pointer` / pool row is retired or inactive:
-/// - `valid_to` is expired (`store::ladybug::is_retired_at(metadata, now)`),
-/// - `archived == true`,
-/// - `retired == true`, or
-/// - `superseded_by` is a non-blank string.
+/// - the store's retirement check says so (`valid_to` expired or
+///   `superseded_by` set, `store::ladybug::is_retired_at(metadata, now)`),
+/// - `archived == true`, or
+/// - `retired == true`.
 fn is_retired_data_metadata(metadata: &Value, now: i64) -> bool {
     if crate::store::ladybug::is_retired_at(metadata, now) {
         return true;
@@ -278,13 +278,6 @@ fn is_retired_data_metadata(metadata: &Value, now: i64) -> bool {
         .get("retired")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
-    {
-        return true;
-    }
-    if metadata
-        .get("superseded_by")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.trim().is_empty())
     {
         return true;
     }
