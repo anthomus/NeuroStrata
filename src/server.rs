@@ -485,7 +485,7 @@ async fn _with_watch(
                     },
                     {
                         "name": "neurostrata_supersede_memory",
-                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced. The reply ends with a similar_memories line: a JSON list of up to 5 other live memories in the namespace whose text reads like the same claim (id, memory_type, first_sentence, similarity), [] when there are none; supersede or archive each one that states the same claim.",
+                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced. The reply ends with a similar_memories line: a JSON list of up to 5 other live memories in the namespace whose text reads like the same claim (id, memory_type, first_sentence, similarity), [] when there are none; read each one whole and supersede or archive each one that states the same claim.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -11023,7 +11023,7 @@ async fn handle_supersede_memory(
     // drops the retired original; both ids are still excluded by name. A task
     // is work, not a claim, so there is nothing for it to duplicate.
     let similar = if old_is_task {
-        Ok(Vec::new())
+        (Vec::new(), None)
     } else {
         similar_live_memories(
             &store,
@@ -11104,23 +11104,20 @@ async fn handle_supersede_memory(
         ));
     }
     // Always present, and the last line, so a reader finds it in one place.
-    let listed = match similar {
-        Ok(listed) => {
-            if !listed.is_empty() {
-                report.push_str(
-                    "\nThe live memories below read like the same claim: supersede or archive each one that states it, so no stale copy stays live.",
-                );
-            }
-            listed
-        }
-        Err(e) => {
-            report.push_str(&format!(
-                "\nCould not look for other memories that state the same claim: {}.",
-                e
-            ));
-            Vec::new()
-        }
-    };
+    let (listed, lookup_error) = similar;
+    if let Some(e) = lookup_error {
+        report.push_str(&format!(
+            "\nThe lookup for other memories that state the same claim failed, so the list below may be incomplete: {}.",
+            e
+        ));
+    }
+    if !listed.is_empty() {
+        // Word overlap cannot tell "always X" from "never X": the agent reads
+        // each one whole before retiring anything.
+        report.push_str(
+            "\nThe live memories below share most of their words with this claim. Read each one whole (neurostrata_get_memory); supersede or archive each one that states the same claim, so no stale copy stays live.",
+        );
+    }
     report.push_str(&format!(
         "\nsimilar_memories: {}",
         serde_json::Value::Array(listed)
@@ -11150,10 +11147,12 @@ async fn similar_live_memories(
     scope: crate::traits::DedupCandidateScope,
     texts: [&str; 2],
     exclude: [&str; 2],
-) -> anyhow::Result<Vec<Value>> {
+) -> (Vec<Value>, Option<String>) {
     let mut candidates: Vec<crate::traits::RawDistanceCandidate> = Vec::new();
+    // One failed query keeps what the other found; the error is reported.
+    let mut lookup_error = None;
     for vector in vectors {
-        for c in store
+        let found = store
             .nearest_by_raw_distance(
                 namespace,
                 vector,
@@ -11162,11 +11161,16 @@ async fn similar_live_memories(
                     scope: scope.clone(),
                 },
             )
-            .await?
-        {
-            if !candidates.iter().any(|seen| seen.id == c.id) {
-                candidates.push(c);
+            .await;
+        match found {
+            Ok(rows) => {
+                for c in rows {
+                    if !candidates.iter().any(|seen| seen.id == c.id) {
+                        candidates.push(c);
+                    }
+                }
             }
+            Err(e) => lookup_error = Some(e.to_string()),
         }
     }
     let mut scored: Vec<(f64, crate::traits::RawDistanceCandidate)> = candidates
@@ -11185,7 +11189,7 @@ async fn similar_live_memories(
             .unwrap_or(Ordering::Equal)
             .then_with(|| a.1.id.cmp(&b.1.id))
     });
-    Ok(scored
+    let listed = scored
         .into_iter()
         .take(SIMILAR_MEMORIES_LISTED)
         .map(|(sim, c)| {
@@ -11196,7 +11200,8 @@ async fn similar_live_memories(
                 "similarity": (sim * 100.0).round() / 100.0,
             })
         })
-        .collect())
+        .collect();
+    (listed, lookup_error)
 }
 
 /// The first sentence (or first line) of a memory, at most 200 characters.
