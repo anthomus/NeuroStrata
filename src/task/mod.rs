@@ -197,6 +197,39 @@ fn ruling_nudge(task_id: &str, note: Option<&str>) -> Value {
     }
 }
 
+/// The `waiting_memories` reply field of `task_complete`: live rule and fact
+/// rows whose `metadata.waits_on` names the completed task (one id or a
+/// list), each as `{id, first_sentence}`. Filters the namespace listing the
+/// completion already holds; reads nothing more.
+fn waiting_memories(memories: &[SearchResult], task_id: &str, now: i64) -> Vec<Value> {
+    memories
+        .iter()
+        .filter(|m| matches!(m.payload.memory_type.as_str(), "rule" | "fact"))
+        .filter(|m| match m.payload.metadata.get("waits_on") {
+            Some(Value::String(s)) => s == task_id,
+            Some(Value::Array(ids)) => ids.iter().any(|v| v.as_str() == Some(task_id)),
+            _ => false,
+        })
+        .filter(|m| {
+            !crate::store::ladybug::is_retired_at(&m.payload.metadata, now)
+                && !crate::handlers::archive_memory::is_archived(&m.payload)
+        })
+        .map(|m| json!({ "id": m.id, "first_sentence": first_sentence(&m.payload.content) }))
+        .collect()
+}
+
+/// A memory's first sentence (through the first ". " or line end), capped at
+/// 200 chars.
+fn first_sentence(content: &str) -> String {
+    let content = content.trim();
+    let end = [content.find(". ").map(|i| i + 1), content.find('\n')]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(content.len());
+    content[..end].trim_end().chars().take(200).collect()
+}
+
 const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 /// How many fresh suffixes to try before declaring a collision problem.
 const ID_ATTEMPTS: usize = 64;
@@ -4357,6 +4390,7 @@ pub async fn handle_task_complete(
     )
     .await;
 
+    let waiting = waiting_memories(&memories, &id, now);
     let mut reply = json!({
         "task": task_summary(&id, &completed.payload, false),
         "extracted_memory_ids": extracted,
@@ -4365,6 +4399,13 @@ pub async fn handle_task_complete(
         "transition": { "from": task.status().as_str(), "to": "done" },
         "redactions": redactions_json(&redactions),
     });
+    if !waiting.is_empty() {
+        reply["retire_hint"] = json!(
+            "These memories waited on this task. Keep only what stays true: replace each with \
+             neurostrata_supersede_memory, or retire it with neurostrata_archive_memory."
+        );
+    }
+    reply["waiting_memories"] = json!(waiting);
     reply["learning_hook"] = serde_json::to_value(&learning_report)
         .unwrap_or_else(|_| json!({ "errors": ["serialize learning hook report"] }));
     if !registry_warnings.is_empty() {
@@ -12270,6 +12311,133 @@ exit 0
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].as_str(), Some(mem_id.as_str()));
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::Done);
+    }
+
+    /// Writes a decision row with the given metadata; returns its id.
+    async fn put_decision(
+        store: &Arc<dyn VectorStore>,
+        memory_type: &str,
+        content: &str,
+        metadata: Value,
+    ) -> String {
+        let mem_id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed(content).await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &mem_id,
+                vector,
+                MemoryPayload {
+                    content: content.to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: memory_type.to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata,
+                },
+            )
+            .await
+            .unwrap();
+        mem_id
+    }
+
+    async fn complete_with_lesson(store: &Arc<dyn VectorStore>, id: &str) -> Value {
+        let reply = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "reason": "shipped",
+                "memory": { "content": "the lesson of this work" }
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("completes");
+        serde_json::from_str(&reply).expect("json reply")
+    }
+
+    #[tokio::test]
+    async fn completing_a_task_lists_memories_waiting_on_it() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let other = create_task(&store, "MyProj", "other work", 2).await;
+        claim(&store, &id).await;
+
+        let rule = put_decision(
+            &store,
+            "rule",
+            "Reply only on #465. Revisit after the merge.",
+            json!({ "waits_on": id.as_str() }),
+        )
+        .await;
+        let fact = put_decision(
+            &store,
+            "fact",
+            "The race is out of scope",
+            json!({ "waits_on": [id.as_str()] }),
+        )
+        .await;
+        put_decision(
+            &store,
+            "rule",
+            "waits elsewhere",
+            json!({ "waits_on": other.as_str() }),
+        )
+        .await;
+        put_decision(
+            &store,
+            "rule",
+            "already retired",
+            json!({ "waits_on": id.as_str(), "valid_to": 1 }),
+        )
+        .await;
+        put_decision(
+            &store,
+            "fact",
+            "already archived",
+            json!({ "waits_on": id.as_str(), "archived": true }),
+        )
+        .await;
+
+        let parsed = complete_with_lesson(&store, &id).await;
+        let mut listed: Vec<(String, String)> = parsed["waiting_memories"]
+            .as_array()
+            .expect("waiting_memories is a list")
+            .iter()
+            .map(|m| {
+                (
+                    m["id"].as_str().unwrap().to_string(),
+                    m["first_sentence"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        listed.sort();
+        let mut expected = vec![
+            (rule, "Reply only on #465.".to_string()),
+            (fact, "The race is out of scope".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(listed, expected);
+        let hint = parsed["retire_hint"]
+            .as_str()
+            .expect("hint when something waits");
+        assert!(hint.contains("neurostrata_supersede_memory"), "{hint}");
+        assert!(hint.contains("neurostrata_archive_memory"), "{hint}");
+    }
+
+    #[tokio::test]
+    async fn completing_a_task_with_nothing_waiting_returns_an_empty_list() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        let parsed = complete_with_lesson(&store, &id).await;
+        assert_eq!(parsed.get("waiting_memories"), Some(&json!([])));
+        assert!(parsed.get("retire_hint").is_none());
     }
 
     #[tokio::test]
