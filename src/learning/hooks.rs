@@ -1433,12 +1433,39 @@ mod tests {
     /// learning files live, never in the daemon's project root or cwd.
     #[test]
     fn revert_hook_queues_under_the_learning_dir_not_the_project_root() {
-        let _env = crate::daemon::project_root_env_test_lock();
+        /// Restores both variables on drop, so a panic inside the hook run
+        /// cannot leave them pointing at temp dirs for later tests.
+        struct RootEnvGuard {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            previous: [(&'static str, Option<std::ffi::OsString>); 2],
+        }
+        impl Drop for RootEnvGuard {
+            fn drop(&mut self) {
+                for (name, value) in &self.previous {
+                    match value {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
         let project_root = tmp_dir("revert-project-root");
         let learning_dir = tmp_dir("revert-learning-dir");
         std::fs::create_dir_all(&project_root).unwrap();
-        let prev_root = std::env::var_os("NEUROSTRATA_PROJECT_ROOT");
-        let prev_learning = std::env::var_os("NEUROSTRATA_LEARNING_DIR");
+        let _env = RootEnvGuard {
+            _lock: crate::daemon::project_root_env_test_lock(),
+            previous: [
+                (
+                    "NEUROSTRATA_PROJECT_ROOT",
+                    std::env::var_os("NEUROSTRATA_PROJECT_ROOT"),
+                ),
+                (
+                    "NEUROSTRATA_LEARNING_DIR",
+                    std::env::var_os("NEUROSTRATA_LEARNING_DIR"),
+                ),
+            ],
+        };
         std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &project_root);
         std::env::set_var("NEUROSTRATA_LEARNING_DIR", &learning_dir);
 
@@ -1488,15 +1515,6 @@ mod tests {
                 };
                 on_action_reverted(&store, "ns-e", &outcome).await
             });
-
-        match prev_root {
-            Some(v) => std::env::set_var("NEUROSTRATA_PROJECT_ROOT", v),
-            None => std::env::remove_var("NEUROSTRATA_PROJECT_ROOT"),
-        }
-        match prev_learning {
-            Some(v) => std::env::set_var("NEUROSTRATA_LEARNING_DIR", v),
-            None => std::env::remove_var("NEUROSTRATA_LEARNING_DIR"),
-        }
 
         assert!(rep.errors.is_empty(), "revert hook errors: {:?}", rep.errors);
         assert_eq!(rep.contradictions_queued, 1);
