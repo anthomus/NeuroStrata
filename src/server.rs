@@ -571,7 +571,7 @@ async fn _with_watch(
                     },
                     {
                         "name": "neurostrata_task_update",
-                        "description": "Update a task: title (the rename surface: rewrites the task's content and re-embeds it, with the old and new wording appended to history), status (open/in_progress/blocked), a note appended to history (the Breath prompt lands here), priority, assignee, labels, or blockers. 'done' is rejected here on purpose: finish with neurostrata_task_complete.",
+                        "description": "Update a task: title (the rename surface: rewrites the task's content and re-embeds it, with the old and new wording appended to history), status (open/in_progress/blocked), a note appended to history (the Breath prompt lands here), priority, assignee, labels, or blockers. 'done' is rejected here on purpose: finish with neurostrata_task_complete. Notes are not searched: when a note records a decision or ruling, also save it with neurostrata_add_memory as a rule or fact (metadata.waits_on names the task it waits on).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -19295,6 +19295,82 @@ mod tests {
         assert!(reply.contains("Deferred GOVERNS edge[0]"), "{}", reply);
         assert!(reply.contains("src/not-ingested.rs"), "{}", reply);
         assert!(reply.contains("missing"), "{}", reply);
+    }
+
+    /// End to end through the handlers an agent calls: a ruling note gets the
+    /// nudge, the memory the nudge asks for is saved with add_memory, and
+    /// completing the task it waits on lists that memory.
+    #[tokio::test]
+    async fn a_ruling_saved_as_the_nudge_asks_is_listed_when_its_task_completes() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let created = crate::task::handle_task_create(
+            serde_json::json!({ "namespace": "probe", "title": "the work" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let created: Value = serde_json::from_str(&created).expect("create replies with json");
+        let id = created["id"].as_str().expect("id").to_string();
+        crate::task::handle_task_claim(
+            serde_json::json!({ "namespace": "probe", "id": id, "assignee": "agent-a" }),
+            store.clone(),
+        )
+        .await;
+
+        let updated = crate::task::handle_task_update(
+            serde_json::json!({ "namespace": "probe", "id": id, "note": "Owner: reply only, filed #465" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let updated: Value = serde_json::from_str(&updated).expect("update replies with json");
+        let nudge = updated["ruling_nudge"]
+            .as_str()
+            .expect("a ruling note gets the nudge");
+        assert!(nudge.contains("memory_type rule or fact"), "{nudge}");
+
+        let added = handle_add_memory(
+            serde_json::json!({
+                "content": "Reply only on #465; the split is filed upstream.",
+                "namespace": "probe",
+                "memory_type": "rule",
+                "metadata": { "waits_on": id }
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        let ruling_id = added
+            .lines()
+            .find_map(|l| l.strip_prefix("Memory ID: "))
+            .unwrap_or_else(|| panic!("add_memory saved the ruling: {added}"))
+            .trim()
+            .to_string();
+
+        let completed = crate::task::handle_task_complete(
+            serde_json::json!({
+                "namespace": "probe",
+                "id": id,
+                "memory": { "content": "the lesson of this work" }
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("the task completes");
+        let completed: Value =
+            serde_json::from_str(&completed).expect("complete replies with json");
+        let listed: Vec<&str> = completed["waiting_memories"]
+            .as_array()
+            .expect("waiting_memories is a list")
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert_eq!(listed, vec![ruling_id.as_str()], "{completed}");
     }
 
     #[tokio::test]
