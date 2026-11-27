@@ -103,24 +103,100 @@ pub fn detect_task_intents(text: &str) -> Vec<TaskIntentSignal> {
             continue;
         }
 
-        // excerpt: from marker to end of clause, capped 160
-        let from = idx;
-        let rest = &text[from..];
-        let end = rest.find('\n').unwrap_or(rest.len()).min(160);
-        let mut excerpt: String = safe_prefix(rest, end).trim_end().to_string();
-        if excerpt.chars().count() > 160 {
-            excerpt = excerpt.chars().take(160).collect();
-        }
-        // also trim trailing sentence if ". " appears within cap
-        // keep simple: already capped.
-
         seen.insert(canonical);
         out.push(TaskIntentSignal {
             marker: canonical,
-            excerpt,
+            excerpt: excerpt_at(text, idx),
         });
     }
     // stable order = MARKERS order (already iterated in order)
+    out
+}
+
+/// From the marker at `idx` to the end of its line, capped at 160 chars.
+fn excerpt_at(text: &str, idx: usize) -> String {
+    let rest = &text[idx..];
+    let end = rest.find('\n').unwrap_or(rest.len()).min(160);
+    let mut excerpt: String = safe_prefix(rest, end).trim_end().to_string();
+    if excerpt.chars().count() > 160 {
+        excerpt = excerpt.chars().take(160).collect();
+    }
+    excerpt
+}
+
+/// Phrases that record an owner's decision (lowercase). Order is the
+/// emission order.
+const RULING_MARKERS: &[&str] = &[
+    "decided",
+    "out of scope",
+    "reply only",
+    "won't fix",
+    "filed #",
+    "owner ok",
+    "owner:",
+    "deferred until",
+];
+
+/// Words that, between the clause start and a ruling marker, make it the
+/// absence of a decision ("we never decided", "not yet decided"). Covers
+/// what `NEGATION_PREFIXES` covers, anywhere in the clause rather than only
+/// at its start.
+const RULING_NEGATIONS: &[&str] = &[
+    "never", "not", "no", "don't", "didn't", "hasn't", "haven't", "isn't", "wasn't", "nothing",
+];
+
+/// The clause around a marker: back to the last line, sentence, comma,
+/// semicolon, colon or dash boundary.
+fn ruling_clause_start(text: &str, idx: usize) -> usize {
+    ["\n", ". ", ", ", "; ", ": ", " - ", " \u{2014} "]
+        .iter()
+        .filter_map(|sep| text[..idx].rfind(sep).map(|p| p + sep.len()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Detect a recorded decision in `text`: the same scan as
+/// [`detect_task_intents`], over [`RULING_MARKERS`]. A marker counts only
+/// as whole words ("undecided" and "decidedly" are not "decided") and only
+/// when no negation word stands before it in its clause; a negated mention
+/// does not hide a later one. A typographic apostrophe reads as `'`.
+pub fn detect_ruling_signals(text: &str) -> Vec<TaskIntentSignal> {
+    let text = &text.replace('\u{2019}', "'");
+    let mut out = Vec::new();
+    for &marker in RULING_MARKERS {
+        let mut from = 0;
+        while let Some(rel) = find_ascii_ci(&text[from..], marker) {
+            let idx = from + rel;
+            // Markers start with an ASCII byte, so idx + 1 is a char boundary.
+            from = idx + 1;
+            let end = idx + marker.len();
+            let mid_word = text[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+                || (marker.ends_with(|c: char| c.is_ascii_alphanumeric())
+                    && text[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_alphanumeric));
+            if mid_word {
+                continue;
+            }
+            let clause = text[ruling_clause_start(text, idx)..idx].to_lowercase();
+            let negated = clause.split_whitespace().any(|w| {
+                RULING_NEGATIONS
+                    .contains(&w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\''))
+            });
+            if negated {
+                continue;
+            }
+            out.push(TaskIntentSignal {
+                marker,
+                excerpt: excerpt_at(text, idx),
+            });
+            break;
+        }
+    }
     out
 }
 
@@ -180,5 +256,47 @@ mod tests {
         assert_eq!(sigs[0].marker, "todo:");
         assert!(sigs[0].excerpt.starts_with("TODO:"));
         assert!(sigs[0].excerpt.chars().count() <= 160);
+    }
+
+    #[test]
+    fn ruling_markers_are_detected() {
+        let sigs = detect_ruling_signals("Owner: reply only, filed #465");
+        let markers: Vec<&str> = sigs.iter().map(|s| s.marker).collect();
+        assert_eq!(markers, vec!["reply only", "filed #", "owner:"]);
+    }
+
+    #[test]
+    fn negated_ruling_is_not_detected() {
+        assert!(detect_ruling_signals("we never decided this").is_empty());
+        assert!(detect_ruling_signals("Not yet decided; it is not out of scope").is_empty());
+        assert!(detect_ruling_signals("Never decided").is_empty());
+        assert!(detect_ruling_signals("We haven\u{2019}t decided yet").is_empty());
+    }
+
+    #[test]
+    fn a_negation_in_an_earlier_clause_does_not_hide_a_ruling() {
+        let sigs = detect_ruling_signals("No blockers: decided to ship");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].marker, "decided");
+        let sigs = detect_ruling_signals("Won\u{2019}t fix: the race stays");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].marker, "won't fix");
+    }
+
+    #[test]
+    fn ruling_markers_match_whole_words_only() {
+        assert!(detect_ruling_signals("still undecided").is_empty());
+        assert!(detect_ruling_signals("landowner: none").is_empty());
+        assert!(detect_ruling_signals("decidedly odd").is_empty());
+        // A negated first mention does not hide a later ruling.
+        let sigs = detect_ruling_signals("we never decided before. Now decided: keep it");
+        assert_eq!(sigs.len(), 1);
+        assert!(sigs[0].excerpt.starts_with("decided: keep it"));
+    }
+
+    #[test]
+    fn plain_note_has_no_ruling() {
+        assert!(detect_ruling_signals("3 of 5: parser done").is_empty());
+        assert!(detect_ruling_signals("").is_empty());
     }
 }

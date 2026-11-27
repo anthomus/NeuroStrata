@@ -183,6 +183,20 @@ fn redactions_json(found: &[&'static str]) -> Value {
         .collect::<Vec<_>>())
 }
 
+/// The `ruling_nudge` reply field of `task_update`: a note that reads like a
+/// decision is only in the task's history, which search never reads, so the
+/// reply asks for it as a memory. Null for any other note.
+fn ruling_nudge(task_id: &str, note: Option<&str>) -> Value {
+    match note {
+        Some(n) if !crate::task::intent::detect_ruling_signals(n).is_empty() => json!(format!(
+            "This note records a decision; save it with neurostrata_add_memory (memory_type rule or fact, \
+             in this namespace) so recall can find it. If it waits on work, set metadata.waits_on to that \
+             task's id (this task: {task_id}); completing that task then lists it."
+        )),
+        _ => Value::Null,
+    }
+}
+
 const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 /// How many fresh suffixes to try before declaring a collision problem.
 const ID_ATTEMPTS: usize = 64;
@@ -3503,6 +3517,7 @@ pub async fn handle_task_update(
         "task": task_summary(&id, &task.payload, false),
         "graph_queries_count": graph_queries_count,
         "graph_lookup_nudge": Value::Null,
+        "ruling_nudge": ruling_nudge(&id, note.as_deref()),
         "redactions": redactions_json(&redactions),
     }))
 }
@@ -9761,6 +9776,40 @@ exit 0
         assert_eq!(history[0]["from"], "open");
         assert_eq!(history[0]["to"], "open");
         assert_eq!(history[0]["note"], "3 of 5: parser done");
+    }
+
+    #[tokio::test]
+    async fn task_update_note_with_a_ruling_carries_a_nudge() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": "Owner: reply only, filed #465" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        let nudge = parsed["ruling_nudge"]
+            .as_str()
+            .expect("a ruling note carries a nudge");
+        assert!(nudge.contains("neurostrata_add_memory"), "{nudge}");
+        assert!(nudge.contains("waits_on"), "{nudge}");
+    }
+
+    #[tokio::test]
+    async fn task_update_plain_note_has_null_ruling_nudge() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": "3 of 5: parser done" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed.get("ruling_nudge"), Some(&Value::Null));
     }
 
     /// R7 fix round 1: the count-based nudge is retired but its two wire
