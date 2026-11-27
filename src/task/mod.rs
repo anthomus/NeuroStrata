@@ -787,6 +787,9 @@ async fn task_decisions(
                 || names_task(r.payload.metadata.get("extracted_from"))
         })
         .filter(|r| is_live_memory(&r.payload, now))
+        // An unresolved mesh variant is disputed, not a decision; search
+        // leaves it out too.
+        .filter(|r| !crate::synaptic_mesh::conflict::is_conflicting(&r.payload))
         .collect();
     tied.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(tied
@@ -11845,6 +11848,12 @@ exit 0
                 json!({ "extracted_from": [id] }),
             ),
             ("x7", "rule", "mentions only", json!({ "related_to": [id] })),
+            (
+                "x8",
+                "rule",
+                "unresolved mesh variant",
+                json!({ "waits_on": id, "mesh": { "conflict": true } }),
+            ),
         ];
         for (row_id, memory_type, content, metadata) in rows {
             put_tied_memory(&store, row_id, memory_type, content, metadata).await;
