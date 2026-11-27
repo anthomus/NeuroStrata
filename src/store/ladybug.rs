@@ -8823,21 +8823,9 @@ impl LadybugStore {
             .to_string();
         doc.location = payload.location.clone();
         doc.valid_from = metadata.get("valid_from").and_then(|v| v.as_i64());
-        // Align with the is_retired_at contract: unparseable/non-null valid_to
-        // reads as 0 (retired); null → unspecified (active); a row that names
-        // its replacement without a valid_to is retired at an unknown time,
-        // which also reads as 0. The in-house engine and the WASM export
-        // judge retirement from this field alone.
-        doc.valid_to = metadata
-            .get("valid_to")
-            .and_then(|v| {
-                if v.is_null() {
-                    None
-                } else {
-                    Some(v.as_i64().unwrap_or(0))
-                }
-            })
-            .or_else(|| is_superseded(metadata).then_some(0));
+        // The in-house engine and the WASM export judge retirement from this
+        // field alone, so it carries the same reading is_retired_at uses.
+        doc.valid_to = effective_valid_to(metadata);
         doc.archived = is_archived(metadata);
         // PAR-02 B4 owner parity: the vector route resolves the owner as
         // user_id, then metadata.user_id / mesh / lifecycle. Using the raw
@@ -16682,19 +16670,27 @@ fn is_retired(metadata: &Value) -> bool {
 /// GraphQL, SPARQL, exports). Callers that fetch many rows in one pass
 /// capture `now` once.
 ///
-/// The `valid_to` half is `formal_kernel::is_retired_at`; a non-null
-/// `valid_to` that is not an integer reads as 0, so an unreadable expiry hides
-/// the row. A row is also retired when `superseded_by` names a replacement:
-/// supersede writes both fields, but a hand-edited or imported row may carry
-/// only the pointer. `archived` is not part of this check, because
-/// `include_archived` reads it on its own. The task gate keeps its own,
-/// `valid_to`-only check (`task::gate::is_retired`).
+/// The time test is `formal_kernel::is_retired_at` on `effective_valid_to`.
+/// `archived` is not part of this check, because `include_archived` reads it
+/// on its own. The task gate keeps its own, `valid_to`-only check
+/// (`task::gate::is_retired`).
 pub(crate) fn is_retired_at(metadata: &Value, now: i64) -> bool {
-    let valid_to = metadata
-        .get("valid_to")
-        .filter(|v| !v.is_null())
-        .map(|v| v.as_i64().unwrap_or(0));
-    crate::formal_kernel::is_retired_at(valid_to, now) || is_superseded(metadata)
+    crate::formal_kernel::is_retired_at(effective_valid_to(metadata), now)
+}
+
+/// When a row stops being live, as every retirement reader sees it (this
+/// module's check, the lexical document and the WASM export built from it).
+///
+/// A non-null `valid_to` decides, and one that is not an integer reads as 0,
+/// so an unreadable expiry hides the row. Without one, a row that names its
+/// replacement in `superseded_by` is retired at an unknown time, which also
+/// reads as 0: supersede writes both fields, but a hand-edited or imported
+/// row may carry only the pointer.
+pub(crate) fn effective_valid_to(metadata: &Value) -> Option<i64> {
+    match metadata.get("valid_to") {
+        Some(v) if !v.is_null() => Some(v.as_i64().unwrap_or(0)),
+        _ => is_superseded(metadata).then_some(0),
+    }
 }
 
 /// Whether `superseded_by` names a replacement: any value but null or a
@@ -19328,7 +19324,11 @@ eurostrata\src\daemon.rs",
         let now = 1_000;
         assert!(is_retired_at(&json!({ "superseded_by": "newer" }), now));
         assert!(is_retired_at(
-            &json!({ "superseded_by": "newer", "valid_to": now + 10 }),
+            &json!({ "superseded_by": "newer", "valid_to": null }),
+            now
+        ));
+        assert!(is_retired_at(
+            &json!({ "superseded_by": "newer", "valid_to": now - 10 }),
             now
         ));
         for live in [
@@ -19338,6 +19338,8 @@ eurostrata\src\daemon.rs",
             json!({ "superseded_by": "  " }),
             json!({ "valid_to": null }),
             json!({ "valid_to": now + 1 }),
+            // A valid_to decides when there is one: retired when it passes.
+            json!({ "superseded_by": "newer", "valid_to": now + 10 }),
         ] {
             assert!(!is_retired_at(&live, now), "{live} is live");
         }
