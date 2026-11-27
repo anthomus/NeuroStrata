@@ -3063,7 +3063,9 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
                 "task": task_summary(&id, &task.payload, false),
             });
             // Unlike the notes, the holder may not have these yet: a ruling
-            // can be tied to the task after the first claim.
+            // can be tied to the task after the first claim. A read: other
+            // claims need not wait for it.
+            drop(_claim_guard);
             add_task_decisions(&mut body, &store, &namespace, &id).await;
             return encode(&body);
         }
@@ -3247,6 +3249,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         "auto_retrieved_context": hits_json,
         "subagent_prompt_injection": subagent_prompt,
     });
+    drop(_claim_guard);
     add_task_decisions(&mut reply, &store, &namespace, &id).await;
     if let Some(hint) = hint_root
         .as_deref()
@@ -11913,6 +11916,7 @@ exit 0
         )
         .unwrap();
         assert_eq!(read["task_decisions"], json!([]), "{read}");
+        assert!(read.get("task_decisions_error").is_none(), "{read}");
         let claimed: Value = serde_json::from_str(
             &handle_task_claim(
                 json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
@@ -11922,6 +11926,7 @@ exit 0
         )
         .unwrap();
         assert_eq!(claimed["task_decisions"], json!([]), "{claimed}");
+        assert!(claimed.get("task_decisions_error").is_none(), "{claimed}");
     }
 
     #[tokio::test]
