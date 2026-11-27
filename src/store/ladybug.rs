@@ -26766,9 +26766,10 @@ eurostrata\src\daemon.rs",
             .collect();
         assert!(imp_ids.is_empty(), "no importers: {imp_ids:?}");
 
+        // Seven: the retired mem-rule-a caller no longer counts.
         assert_eq!(
             summary.get("blast_radius_count").and_then(|v| v.as_u64()),
-            Some(8),
+            Some(7),
             "blast radius: {summary}"
         );
         assert_eq!(
