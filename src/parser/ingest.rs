@@ -74,7 +74,7 @@ pub fn is_ingest_eligible_path(path: &Path, root: &Path) -> bool {
     if !is_within(path, root) {
         return false;
     }
-    if path_is_in_skipped_dir(path) {
+    if path_is_in_skipped_dir(path, || path.is_file()) {
         return false;
     }
     !is_store_artifact(path)
@@ -140,14 +140,15 @@ fn normalize_lexical(path: &Path) -> Option<String> {
     Some(joined)
 }
 
-fn path_is_in_skipped_dir(path: &Path) -> bool {
+/// `is_file` is asked only when the last component matches a skipped name.
+fn path_is_in_skipped_dir(path: &Path, is_file: impl FnOnce() -> bool) -> bool {
     // Compare whole components with the host's own separators. A Unix filename
     // may legitimately contain backslashes (`src\vendor\module.rs` is one file,
     // not a path inside `vendor`), while `Path` on Windows already exposes both
     // `\` and `/` as components. Components also cover the case where the path
     // IS the skipped directory (a watched/ingested `.../target` node), which a
     // `/name/` substring test misses. Windows filesystems are case-insensitive.
-    path.components().any(|component| {
+    let is_skipped = |component: std::path::Component| {
         let std::path::Component::Normal(name) = component else {
             return false;
         };
@@ -159,7 +160,13 @@ fn path_is_in_skipped_dir(path: &Path) -> bool {
                 &*name == *skip_dir
             }
         })
-    })
+    };
+    let mut components = path.components();
+    // The skip list names folders: a file called `build` or `out` is kept. A
+    // path that is gone (a watcher remove event) still counts as a folder, so
+    // deleting `target/` does not start an ingest.
+    let last_is_skipped = components.next_back().is_some_and(is_skipped) && !is_file();
+    last_is_skipped || components.any(is_skipped)
 }
 
 fn is_store_artifact(path: &Path) -> bool {
@@ -6426,6 +6433,36 @@ use super::x;"#;
                 "the skipped directory itself must be rejected: {path}"
             );
         }
+    }
+
+    /// The skip list names folders. A file that happens to be called `build`,
+    /// `out` or `env` is ingested; a folder of that name is still skipped.
+    #[tokio::test]
+    async fn a_file_named_like_a_skipped_folder_is_ingested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("src").join("lib.rs"), "pub fn a() {}").unwrap();
+        std::fs::write(root.join("scripts").join("build"), "#!/bin/sh\n").unwrap();
+        std::fs::write(root.join("env"), "#!/bin/sh\n").unwrap();
+        std::fs::write(root.join("build").join("gen.rs"), "pub fn g() {}").unwrap();
+
+        assert!(is_ingest_eligible_path(
+            &root.join("scripts").join("build"),
+            root
+        ));
+        assert!(is_ingest_eligible_path(&root.join("env"), root));
+        assert!(!is_ingest_eligible_path(&root.join("build"), root));
+        assert!(!is_ingest_eligible_path(
+            &root.join("build").join("gen.rs"),
+            root
+        ));
+
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema parses");
+        let report = dry_run_directory(root, &schema, "estimate").await.unwrap();
+        assert!(report.contains("Files: 3\n"), "{report}");
     }
 
     /// Review on #386: `\server\share\repo\x` (rooted, no drive) is not
