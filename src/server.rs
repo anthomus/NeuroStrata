@@ -11020,8 +11020,8 @@ async fn handle_supersede_memory(
     );
 
     // Looked up after both writes, so the store's own live-row filter already
-    // drops the retired original; both ids are still excluded by name.
-    // A task is work, not a claim: there is nothing for it to duplicate.
+    // drops the retired original; both ids are still excluded by name. A task
+    // is work, not a claim, so there is nothing for it to duplicate.
     let similar = if old_is_task {
         Ok(Vec::new())
     } else {
@@ -11106,11 +11106,12 @@ async fn handle_supersede_memory(
     // Always present, and last, so a reader finds it on its own line.
     match similar {
         Ok(listed) => {
+            let any = !listed.is_empty();
             report.push_str(&format!(
                 "\nsimilar_memories: {}",
-                serde_json::Value::Array(listed.clone())
+                serde_json::Value::Array(listed)
             ));
-            if !listed.is_empty() {
+            if any {
                 report.push_str(
                     "\nThese live memories read like the same claim: supersede or archive each one that states it, so no stale copy stays live.",
                 );
@@ -19348,7 +19349,12 @@ mod tests {
         let mut p = payload(content);
         p.metadata = metadata;
         store
-            .upsert(namespace, &id, StubEmbedder.embed(content).await.unwrap(), p)
+            .upsert(
+                namespace,
+                &id,
+                StubEmbedder.embed(content).await.unwrap(),
+                p,
+            )
             .await
             .expect("seed a rule");
         id
@@ -19365,7 +19371,12 @@ mod tests {
     fn similar_ids_from(reply: &str) -> Vec<String> {
         similar_entries_from(reply)
             .iter()
-            .map(|m| m["id"].as_str().expect("each entry names its id").to_string())
+            .map(|m| {
+                m["id"]
+                    .as_str()
+                    .expect("each entry names its id")
+                    .to_string()
+            })
             .collect()
     }
 
@@ -19430,10 +19441,23 @@ mod tests {
         assert!(reply.starts_with("Superseded"), "got {}", reply);
 
         let listed = similar_ids_from(&reply);
-        assert!(listed.contains(&copy_of_old), "copy of the old claim: {}", reply);
-        assert!(listed.contains(&copy_of_new), "copy of the new claim: {}", reply);
+        assert!(
+            listed.contains(&copy_of_old),
+            "copy of the old claim: {}",
+            reply
+        );
+        assert!(
+            listed.contains(&copy_of_new),
+            "copy of the new claim: {}",
+            reply
+        );
         for absent in [&unrelated, &retired, &archived] {
-            assert!(!listed.contains(absent), "{} must not be listed: {}", absent, reply);
+            assert!(
+                !listed.contains(absent),
+                "{} must not be listed: {}",
+                absent,
+                reply
+            );
         }
         assert!(
             reply.contains("supersede or archive"),
@@ -19445,7 +19469,9 @@ mod tests {
             assert!(entry["first_sentence"]
                 .as_str()
                 .is_some_and(|s| !s.is_empty()));
-            let sim = entry["similarity"].as_f64().expect("similarity is a number");
+            let sim = entry["similarity"]
+                .as_f64()
+                .expect("similarity is a number");
             assert!((0.85..=1.0).contains(&sim), "similarity {} in bound", sim);
         }
     }
@@ -19487,7 +19513,11 @@ mod tests {
         .await;
         let listed = similar_ids_from(&reply);
         assert!(!listed.contains(&old_id), "old row listed: {}", reply);
-        assert!(!listed.contains(&new_id_from(&reply)), "new row listed: {}", reply);
+        assert!(
+            !listed.contains(&new_id_from(&reply)),
+            "new row listed: {}",
+            reply
+        );
         assert!(listed.is_empty(), "got {}", reply);
     }
 
