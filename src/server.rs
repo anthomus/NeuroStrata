@@ -485,7 +485,7 @@ async fn _with_watch(
                     },
                     {
                         "name": "neurostrata_supersede_memory",
-                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced.",
+                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced. The reply ends with a similar_memories line: a JSON list of up to 5 other live memories in the namespace whose text reads like the same claim (id, memory_type, first_sentence, similarity), [] when there are none; supersede or archive each one that states the same claim.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -4904,6 +4904,23 @@ fn payload_fallback_hash(
     crate::learning::observation::PayloadHash(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
+/// Which rows a memory is checked against for duplicates: procedures against
+/// procedures with the same trigger, everything else against domain memories.
+fn dedup_scope(payload: &MemoryPayload) -> crate::traits::DedupCandidateScope {
+    use crate::traits::DedupCandidateScope;
+    if payload.memory_type == "procedure" {
+        let trigger = payload
+            .metadata
+            .get("trigger")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        DedupCandidateScope::Procedure { trigger }
+    } else {
+        DedupCandidateScope::Domain
+    }
+}
+
 /// The write half of add_memory: init, embed, dedup check, upsert.
 /// task_complete's inline extraction runs this same pipeline (section 3.2,
 /// path 3) and the error strings stay identical across both callers.
@@ -4916,7 +4933,7 @@ pub(crate) async fn embed_dedup_and_upsert(
 ) -> Result<crate::judgment::policy::MemoryWriteReport, String> {
     use crate::judgment::canonical::canonical_duplicate_key;
     use crate::judgment::policy::{DedupDecision, DedupHint, MemoryWriteReport};
-    use crate::traits::{DedupCandidateScope, RawDistanceQuery};
+    use crate::traits::RawDistanceQuery;
 
     store.init(namespace).await.map_err(|e| {
         // The store's data-bearing identity refusal is
@@ -4937,18 +4954,7 @@ pub(crate) async fn embed_dedup_and_upsert(
     let incoming_key = canonical_duplicate_key(namespace, payload)
         .map_err(|e| format!("Failed to compute canonical key: {}", e))?;
 
-    // Determine scope.
-    let scope = if payload.memory_type == "procedure" {
-        let trigger = payload
-            .metadata
-            .get("trigger")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        DedupCandidateScope::Procedure { trigger }
-    } else {
-        DedupCandidateScope::Domain
-    };
+    let scope = dedup_scope(payload);
 
     let incoming_is_attempt = crate::attempt::is_failed_attempt(&payload.metadata);
 
@@ -10909,6 +10915,10 @@ async fn handle_supersede_memory(
     // Write the replacement BEFORE retiring the original. If the second write
     // fails the namespace holds both versions, which is visible and repairable;
     // the other order would leave the rule retired with no successor.
+    let similar_query_vector = vector.clone();
+    let similar_scope = dedup_scope(&new_payload);
+    let old_content = old_payload.content.clone();
+    let old_is_task = old_payload.memory_type == "task";
     let replacement_report = match store.upsert(namespace, &new_id, vector, new_payload).await {
         Ok(report) => report,
         Err(e) => {
@@ -11009,6 +11019,23 @@ async fn handle_supersede_memory(
         &RecursionToken::root(),
     );
 
+    // Looked up after both writes, so the store's own live-row filter already
+    // drops the retired original; both ids are still excluded by name.
+    // A task is work, not a claim: there is nothing for it to duplicate.
+    let similar = if old_is_task {
+        Ok(Vec::new())
+    } else {
+        similar_live_memories(
+            &store,
+            namespace,
+            similar_query_vector,
+            similar_scope,
+            [content, old_content.as_str()],
+            [id, new_id.as_str()],
+        )
+        .await
+    };
+
     let mut report = format!(
         "Superseded {} with {} in namespace {}. The old memory keeps its text and is no longer returned by search; it is still readable by id.",
         id, new_id, namespace
@@ -11076,7 +11103,101 @@ async fn handle_supersede_memory(
             content_lists.len()
         ));
     }
+    // Always present, and last, so a reader finds it on its own line.
+    match similar {
+        Ok(listed) => {
+            report.push_str(&format!(
+                "\nsimilar_memories: {}",
+                serde_json::Value::Array(listed.clone())
+            ));
+            if !listed.is_empty() {
+                report.push_str(
+                    "\nThese live memories read like the same claim: supersede or archive each one that states it, so no stale copy stays live.",
+                );
+            }
+        }
+        Err(e) => report.push_str(&format!(
+            "\nsimilar_memories: []\nCould not look for other memories that state the same claim: {}.",
+            e
+        )),
+    }
     report
+}
+
+/// Text similarity at or above which two memories count as the same claim:
+/// the token Jaccard bound add_memory's heuristic judge,
+/// find_duplicate_candidates and the conflict detector already use.
+const DUPLICATE_TEXT_SIMILARITY: f64 = 0.85;
+/// How many similar memories a supersede reply lists.
+const SIMILAR_MEMORIES_LISTED: usize = 5;
+/// Nearest rows scored for text similarity, from one vector query.
+const SIMILAR_MEMORIES_POOL: usize = 20;
+
+/// Live memories that read like the same claim as either text, best first.
+/// One vector query through the dedup candidate seam add_memory uses, so it
+/// returns only live rows (not retired, archived, tasks or structural), then
+/// the duplicate bound on text similarity.
+async fn similar_live_memories(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    vector: Vec<f32>,
+    scope: crate::traits::DedupCandidateScope,
+    texts: [&str; 2],
+    exclude: [&str; 2],
+) -> anyhow::Result<Vec<Value>> {
+    let candidates = store
+        .nearest_by_raw_distance(
+            namespace,
+            vector,
+            crate::traits::RawDistanceQuery {
+                limit: SIMILAR_MEMORIES_POOL,
+                scope,
+            },
+        )
+        .await?;
+    let mut scored: Vec<(f64, crate::traits::RawDistanceCandidate)> = candidates
+        .into_iter()
+        .filter(|c| !exclude.contains(&c.id.as_str()))
+        .filter_map(|c| {
+            let sim = texts
+                .iter()
+                .map(|t| f64::from(compute_token_jaccard(t, &c.payload.content)))
+                .fold(0.0, f64::max);
+            (sim >= DUPLICATE_TEXT_SIMILARITY).then_some((sim, c))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.1.id.cmp(&b.1.id))
+    });
+    Ok(scored
+        .into_iter()
+        .take(SIMILAR_MEMORIES_LISTED)
+        .map(|(sim, c)| {
+            json!({
+                "id": c.id,
+                "memory_type": c.payload.memory_type,
+                "first_sentence": first_sentence(&c.payload.content),
+                "similarity": (sim * 100.0).round() / 100.0,
+            })
+        })
+        .collect())
+}
+
+/// The first sentence (or first line) of a memory, at most 200 characters.
+fn first_sentence(content: &str) -> String {
+    let text = content.trim();
+    let line = text.lines().next().unwrap_or("");
+    let sentence = match line.find(". ") {
+        Some(i) => &line[..=i],
+        None => line,
+    };
+    if sentence.chars().count() > 200 {
+        format!("{}...", sentence.chars().take(200).collect::<String>())
+    } else {
+        sentence.to_string()
+    }
 }
 
 async fn handle_rebuild_lexical_index(arguments: Value, store: Arc<dyn VectorStore>) -> String {
@@ -11407,7 +11528,7 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
     let threshold = arguments
         .get("threshold")
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.85)
+        .unwrap_or(DUPLICATE_TEXT_SIMILARITY)
         .clamp(0.0, 1.0);
 
     let limit = arguments
@@ -19215,6 +19336,159 @@ mod tests {
         handle_supersede_memory(args.clone(), emb.clone(), store.clone(), quiet_bus()).await;
         let again = handle_supersede_memory(args, emb, store, quiet_bus()).await;
         assert!(again.contains("already superseded"), "got {}", again);
+    }
+
+    async fn seed_rule(
+        store: &Arc<dyn VectorStore>,
+        namespace: &str,
+        content: &str,
+        metadata: serde_json::Value,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut p = payload(content);
+        p.metadata = metadata;
+        store
+            .upsert(namespace, &id, StubEmbedder.embed(content).await.unwrap(), p)
+            .await
+            .expect("seed a rule");
+        id
+    }
+
+    fn similar_entries_from(reply: &str) -> Vec<serde_json::Value> {
+        let line = reply
+            .lines()
+            .find_map(|l| l.strip_prefix("similar_memories: "))
+            .unwrap_or_else(|| panic!("the reply always carries similar_memories: {}", reply));
+        serde_json::from_str(line).expect("similar_memories is a JSON array")
+    }
+
+    fn similar_ids_from(reply: &str) -> Vec<String> {
+        similar_entries_from(reply)
+            .iter()
+            .map(|m| m["id"].as_str().expect("each entry names its id").to_string())
+            .collect()
+    }
+
+    /// The incident: one rule lived in several copies, and correcting one left
+    /// the rest live and stale. The reply names the live copies so the agent
+    /// can fix them in the same turn.
+    #[tokio::test]
+    async fn supersede_lists_live_memories_that_state_the_same_claim() {
+        let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("probe").await.unwrap();
+        let old_text =
+            "build every container image with podman and never call docker in this repository";
+        let new_text = "build and test every container image with podman and never call docker in this repository";
+        let old_id = seed_rule(&store, "probe", old_text, serde_json::json!({})).await;
+        // A copy of the claim being corrected, and a copy of the corrected wording.
+        let copy_of_old = seed_rule(
+            &store,
+            "probe",
+            &format!("{old_text} today"),
+            serde_json::json!({}),
+        )
+        .await;
+        let copy_of_new = seed_rule(
+            &store,
+            "probe",
+            &format!("{new_text} now"),
+            serde_json::json!({}),
+        )
+        .await;
+        let unrelated = seed_rule(
+            &store,
+            "probe",
+            "the daemon listens on loopback port 34343 for local clients only",
+            serde_json::json!({}),
+        )
+        .await;
+        let retired = seed_rule(
+            &store,
+            "probe",
+            new_text,
+            serde_json::json!({ "valid_to": 1, "superseded_by": "someone-else" }),
+        )
+        .await;
+        let archived = seed_rule(
+            &store,
+            "probe",
+            &format!("{old_text} ever"),
+            serde_json::json!({ "archived": true }),
+        )
+        .await;
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": new_text, "reason": "tests too" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+
+        let listed = similar_ids_from(&reply);
+        assert!(listed.contains(&copy_of_old), "copy of the old claim: {}", reply);
+        assert!(listed.contains(&copy_of_new), "copy of the new claim: {}", reply);
+        for absent in [&unrelated, &retired, &archived] {
+            assert!(!listed.contains(absent), "{} must not be listed: {}", absent, reply);
+        }
+        assert!(
+            reply.contains("supersede or archive"),
+            "the reply tells the agent what to do with them: {}",
+            reply
+        );
+        for entry in similar_entries_from(&reply) {
+            assert_eq!(entry["memory_type"], "rule");
+            assert!(entry["first_sentence"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()));
+            let sim = entry["similarity"].as_f64().expect("similarity is a number");
+            assert!((0.85..=1.0).contains(&sim), "similarity {} in bound", sim);
+        }
+    }
+
+    /// Explicit zero: the field is there even when nothing matches.
+    #[tokio::test]
+    async fn supersede_with_no_similar_memories_lists_none() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        seed_rule(
+            &store,
+            "probe",
+            "the daemon listens on loopback port 34343 for local clients only",
+            serde_json::json!({}),
+        )
+        .await;
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": "always use docker" }),
+            Arc::new(StubEmbedder),
+            store,
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.contains("\nsimilar_memories: []"), "got {}", reply);
+        assert!(similar_ids_from(&reply).is_empty());
+        assert!(!reply.contains("supersede or archive"), "got {}", reply);
+    }
+
+    /// The row being corrected and its replacement state the claim by
+    /// construction; listing them would only be noise.
+    #[tokio::test]
+    async fn supersede_never_lists_the_old_or_the_new_row() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": "always use podman" }),
+            Arc::new(StubEmbedder),
+            store,
+            quiet_bus(),
+        )
+        .await;
+        let listed = similar_ids_from(&reply);
+        assert!(!listed.contains(&old_id), "old row listed: {}", reply);
+        assert!(!listed.contains(&new_id_from(&reply)), "new row listed: {}", reply);
+        assert!(listed.is_empty(), "got {}", reply);
     }
 
     /// Retiring a row hides it from every project on the machine, so the global
