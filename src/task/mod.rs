@@ -211,8 +211,14 @@ fn waiting_memories(memories: &[SearchResult], task_id: &str, now: i64) -> Vec<V
             _ => false,
         })
         .filter(|m| {
-            !crate::store::ladybug::is_retired_at(&m.payload.metadata, now)
+            m.payload
+                .metadata
+                .get("superseded_by")
+                .is_none_or(Value::is_null)
+                && !crate::store::ladybug::is_retired_at(&m.payload.metadata, now)
                 && !crate::handlers::archive_memory::is_archived(&m.payload)
+                // An unresolved mesh variant is disputed, not a decision.
+                && !crate::synaptic_mesh::conflict::is_conflicting(&m.payload)
         })
         .map(|m| json!({ "id": m.id, "first_sentence": first_sentence(&m.payload.content) }))
         .collect()
@@ -12400,6 +12406,20 @@ exit 0
             "fact",
             "already archived",
             json!({ "waits_on": id.as_str(), "archived": true }),
+        )
+        .await;
+        put_decision(
+            &store,
+            "rule",
+            "already superseded",
+            json!({ "waits_on": id.as_str(), "superseded_by": "newer" }),
+        )
+        .await;
+        put_decision(
+            &store,
+            "rule",
+            "unresolved mesh variant",
+            json!({ "waits_on": id.as_str(), "mesh": { "conflict": true } }),
         )
         .await;
 
