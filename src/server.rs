@@ -2501,10 +2501,13 @@ fn handle_context_plan_marker_do_not_remove() {}
 /// The freshness of a memory in a context plan, from its metadata: the
 /// stored file hash against the governed file on disk, its verification
 /// and its decision status. One computation for search hits and file
-/// lookup hits, so `exclude_stale` judges both the same way.
+/// lookup hits, so `exclude_stale` judges both the same way. A relative
+/// governed path is read under `root`, the caller's worktree when it gave
+/// one, so a rule is judged against the checkout it was read from.
 fn context_item_freshness(
     metadata: &Value,
     has_governed_path: bool,
+    root: &std::path::Path,
 ) -> crate::context::model::Freshness {
     let sha = |key: &str| metadata.get(key).and_then(|v| v.as_str()).map(String::from);
     let stored_file_sha256 = sha("file_sha256");
@@ -2528,7 +2531,7 @@ fn context_item_freshness(
             let resolved = if std::path::Path::new(p.as_str()).is_absolute() {
                 std::path::PathBuf::from(p)
             } else {
-                crate::daemon::resolve_project_root().join(p.as_str())
+                root.join(p.as_str())
             };
             match std::fs::read(&resolved) {
                 Ok(bytes) => Some({
@@ -2609,6 +2612,10 @@ async fn handle_context_plan(
     // The caller's worktree, as on neurostrata_memories_for_file: it places
     // absolute paths and pins each file lookup to that worktree's generation.
     let caller_root = arguments.get("project_root").and_then(|v| v.as_str());
+    // Where relative governed paths are read to judge freshness.
+    let freshness_root: std::path::PathBuf = caller_root
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::daemon::resolve_project_root);
     let caller_source: Option<String> =
         caller_root.map(|root| crate::parser::ingest::source_key_for(std::path::Path::new(root)));
     // Dedupe requested work at construction time by the same normalized path
@@ -2706,8 +2713,11 @@ async fn handle_context_plan(
         .to_string_lossy()
         .to_string();
     for res in results {
-        let freshness =
-            context_item_freshness(&res.payload.metadata, !res.payload.location.is_empty());
+        let freshness = context_item_freshness(
+            &res.payload.metadata,
+            !res.payload.location.is_empty(),
+            &freshness_root,
+        );
         if exclude_stale && crate::context::freshness::is_stale(&freshness) {
             continue;
         }
@@ -2828,17 +2838,14 @@ async fn handle_context_plan(
                                 || hits.len() >= crate::graph_read::memories_for_file::MAX_LIMIT;
                             let mut file_rules = Vec::new();
                             for hit in hits {
-                                // The search copy's freshness when there is
-                                // one; otherwise the same computation, since
-                                // the hit governs the requested file. A
-                                // stale hit is left out under `exclude_stale`
-                                // here as in the search, or it would come
-                                // back ahead of the fresh hits.
-                                let freshness = items
-                                    .iter()
-                                    .find(|it| it.id == hit.id)
-                                    .and_then(|it| it.freshness)
-                                    .unwrap_or_else(|| context_item_freshness(&hit.metadata, true));
+                                // Every hit here governs the requested file,
+                                // so its freshness is computed as governing a
+                                // path, whether or not the search also found
+                                // it. A stale hit is left out under
+                                // `exclude_stale` here as in the search, or it
+                                // would come back ahead of the fresh hits.
+                                let freshness =
+                                    context_item_freshness(&hit.metadata, true, &freshness_root);
                                 if exclude_stale && crate::context::freshness::is_stale(&freshness)
                                 {
                                     continue;
@@ -26396,6 +26403,40 @@ mod context_plan_tests {
         assert!(ids.contains(&"rule:two:rel"), "ids={ids:?}");
     }
 
+    /// A relative governed path is hashed under the root it is given, so
+    /// the same rule is current in the worktree whose file matches its hash
+    /// and stale in another whose file differs.
+    #[test]
+    fn context_item_freshness_reads_the_given_worktree() {
+        use sha2::{Digest, Sha256};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (a, b) = (tmp.path().join("wt-a"), tmp.path().join("wt-b"));
+        for (root, text) in [
+            (
+                &a,
+                "pub fn a() {}
+",
+            ),
+            (
+                &b,
+                "pub fn b() {}
+",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join("src")).expect("src dir");
+            std::fs::write(root.join("src/one.rs"), text).expect("write");
+        }
+        let hash = hex::encode(Sha256::digest(
+            b"pub fn b() {}
+",
+        ));
+        let metadata = serde_json::json!({"file_path": "src/one.rs", "file_sha256": hash});
+        let in_b = super::context_item_freshness(&metadata, true, &b);
+        let in_a = super::context_item_freshness(&metadata, true, &a);
+        assert!(!crate::context::freshness::is_stale(&in_b), "{in_b:?}");
+        assert!(crate::context::freshness::is_stale(&in_a), "{in_a:?}");
+    }
+
     /// Stores one rule governing `governs`, with `content` and `vector`.
     async fn seed_rule(
         store: &Arc<dyn VectorStore>,
@@ -26941,16 +26982,19 @@ mod context_plan_tests {
                 "namespace": "ns",
                 "query": "rule",
                 "files": ["src/one.rs"],
-                "max_items": total,
+                "max_items": 1,
             }),
         )
         .await;
-        // The store's full page reaches the planner; what lies past it may
-        // be missing, and the plan says so.
-        let seen = item_ids(&plan).len() + pointers(&plan).len();
-        assert!(
-            seen >= crate::graph_read::memories_for_file::MAX_LIMIT,
-            "{seen} of {total} rules seen: {plan}"
+        // One slot: the search can add at most one rule, and only as a cut
+        // candidate, so every rule seen came through the file lookup. Its
+        // full page of 20 reaches the planner; the rule past it is missing,
+        // and the plan says so.
+        assert_eq!(item_ids(&plan).len(), 1, "{plan}");
+        assert_eq!(
+            pointers(&plan).len(),
+            crate::graph_read::memories_for_file::MAX_LIMIT - 1,
+            "{plan}"
         );
         assert_eq!(plan["truncation"], true, "{plan}");
     }
