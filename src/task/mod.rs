@@ -189,8 +189,8 @@ fn redactions_json(found: &[&'static str]) -> Value {
 fn ruling_nudge(task_id: &str, note: Option<&str>) -> Value {
     match note {
         Some(n) if !crate::task::intent::detect_ruling_signals(n).is_empty() => json!(format!(
-            "This note records a decision; save it with neurostrata_add_memory (memory_type rule or fact, \
-             in this namespace) so recall can find it. If it waits on work, set metadata.waits_on to that \
+            "If this note records a decision, save it with neurostrata_add_memory (memory_type rule or fact, \
+             in this namespace) so recall can find it; task notes are not searched. If it waits on work, set metadata.waits_on to that \
              task's id (this task: {task_id}); completing that task then lists it."
         )),
         _ => Value::Null,

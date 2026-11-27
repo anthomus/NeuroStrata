@@ -571,7 +571,7 @@ async fn _with_watch(
                     },
                     {
                         "name": "neurostrata_task_update",
-                        "description": "Update a task: title (the rename surface: rewrites the task's content and re-embeds it, with the old and new wording appended to history), status (open/in_progress/blocked), a note appended to history (the Breath prompt lands here), priority, assignee, labels, or blockers. 'done' is rejected here on purpose: finish with neurostrata_task_complete.",
+                        "description": "Update a task: title (the rename surface: rewrites the task's content and re-embeds it, with the old and new wording appended to history), status (open/in_progress/blocked), a note appended to history (the Breath prompt lands here), priority, assignee, labels, or blockers. 'done' is rejected here on purpose: finish with neurostrata_task_complete. Notes are not searched: when a note records a decision or ruling, also save it with neurostrata_add_memory as a rule or fact (metadata.waits_on names the task it waits on).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {

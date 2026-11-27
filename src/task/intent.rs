@@ -143,6 +143,7 @@ const RULING_MARKERS: &[&str] = &[
 /// at its start.
 const RULING_NEGATIONS: &[&str] = &[
     "never", "not", "no", "don't", "didn't", "hasn't", "haven't", "isn't", "wasn't", "nothing",
+    "can't", "cannot", "couldn't",
 ];
 
 /// The clause around a marker: back to the last line, sentence, comma,
@@ -155,13 +156,25 @@ fn ruling_clause_start(text: &str, idx: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// `text` with every apostrophe form written as ASCII `'`: text pasted from
+/// chat, GitHub or a word processor writes "haven't" with a typographic,
+/// modifier-letter or full-width apostrophe, and markers are ASCII.
+fn plain_apostrophes(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '\u{201B}' | '\u{02BC}' | '\u{FF07}' => '\'',
+            c => c,
+        })
+        .collect()
+}
+
 /// Detect a recorded decision in `text`: the same scan as
 /// [`detect_task_intents`], over [`RULING_MARKERS`]. A marker counts only
 /// as whole words ("undecided" and "decidedly" are not "decided") and only
 /// when no negation word stands before it in its clause; a negated mention
-/// does not hide a later one. A typographic apostrophe reads as `'`.
+/// does not hide a later one. Every apostrophe form reads as `'`.
 pub fn detect_ruling_signals(text: &str) -> Vec<TaskIntentSignal> {
-    let text = &text.replace('\u{2019}', "'");
+    let text = &plain_apostrophes(text);
     let mut out = Vec::new();
     for &marker in RULING_MARKERS {
         let mut from = 0;
@@ -271,6 +284,12 @@ mod tests {
         assert!(detect_ruling_signals("Not yet decided; it is not out of scope").is_empty());
         assert!(detect_ruling_signals("Never decided").is_empty());
         assert!(detect_ruling_signals("We haven\u{2019}t decided yet").is_empty());
+        assert!(detect_ruling_signals("we can't decide this yet").is_empty());
+        assert!(detect_ruling_signals("we cannot call it out of scope").is_empty());
+        for apostrophe in ['\u{2018}', '\u{2019}', '\u{201B}', '\u{02BC}', '\u{FF07}'] {
+            let note = format!("we haven{apostrophe}t decided yet");
+            assert!(detect_ruling_signals(&note).is_empty(), "{note}");
+        }
     }
 
     #[test]
