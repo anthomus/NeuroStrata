@@ -1272,8 +1272,8 @@ async fn _with_watch(
                                 "query": { "type": "string", "description": "Optional search query." },
                                 "file_path": { "type": "string", "description": "Optional governed file path." },
                                 "files": { "type": "array", "items": { "type": "string" }, "description": "Optional governed file paths." },
-                                "max_items": { "type": "integer", "description": "Max items (default 10)." },
-                                "max_bytes": { "type": "integer", "description": "Approx byte budget (converted to tokens at ~4 bytes/token; defaults to max_items * 1024 bytes)." },
+                                "max_items": { "type": "integer", "description": "Max items (default 10). Rules that govern the requested files are dealt first, one per file in turns, each sent whole; a rule that does not fit is listed in not_shown as a pointer to fetch with neurostrata_get_memory." },
+                                "max_bytes": { "type": "integer", "description": "Approx byte budget (converted to tokens at ~4 bytes/token; defaults to max_items * 1024 bytes). Governing rules and search hits share it; nothing is cut, a rule that does not fit becomes a pointer in not_shown." },
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale from the context plan." },
                                 "file_paths": { "type": "array", "items": { "type": "string" }, "description": "Alias for files." },
                                 "target_namespace": { "type": "string", "description": "Optional cross-scope target namespace when authorized." },
@@ -2497,6 +2497,96 @@ pub(crate) mod context_plan_benchmark_instrumentation {
 #[allow(dead_code)]
 fn handle_context_plan_marker_do_not_remove() {}
 
+/// The freshness of a memory in a context plan, from its metadata: the
+/// stored file hash against the governed file on disk, its verification
+/// and its decision status. One computation for search hits and file
+/// lookup hits, so `exclude_stale` judges both the same way.
+fn context_item_freshness(
+    metadata: &Value,
+    has_governed_path: bool,
+) -> crate::context::model::Freshness {
+    let sha = |key: &str| metadata.get(key).and_then(|v| v.as_str()).map(String::from);
+    let stored_file_sha256 = sha("file_sha256");
+    // Copying the stored hash into `current_*` compared a value to itself,
+    // so file drift could never be detected. Instead, hash the governed
+    // file fresh off disk when the memory names a real one.
+    let governed_path = metadata
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            metadata
+                .get("location")
+                .and_then(|v| v.as_str())
+                .map(|loc| loc.split(':').next().unwrap_or(loc))
+        })
+        .map(|p| p.to_string())
+        // A virtual symbol URI governs no on-disk file to hash.
+        .filter(|p| !p.contains("://") && !p.starts_with("urn:") && !p.is_empty());
+    let current_file_sha256 = match governed_path {
+        Some(p) if stored_file_sha256.is_some() => {
+            let resolved = if std::path::Path::new(p.as_str()).is_absolute() {
+                std::path::PathBuf::from(p)
+            } else {
+                crate::daemon::resolve_project_root().join(p.as_str())
+            };
+            match std::fs::read(&resolved) {
+                Ok(bytes) => Some({
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(&bytes))
+                }),
+                // A governed file that can no longer be read is honestly
+                // reported as un-hashed (missing), not as unchanged.
+                Err(e) => {
+                    tracing::debug!(
+                        "hash_governed_file failed to read {}: {e}",
+                        resolved.display()
+                    );
+                    None
+                }
+            }
+        }
+        // No governed file path: the stored hash remains the best known
+        // state and currency stays as-is.
+        _ => stored_file_sha256.clone(),
+    };
+    crate::context::freshness::compute_freshness(&crate::context::freshness::FreshnessInputs {
+        stored_file_sha256: stored_file_sha256.clone(),
+        current_file_sha256,
+        stored_span_sha256: sha("span_sha256"),
+        current_span_sha256: metadata
+            .get("span_sha256")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        verification_status: metadata
+            .get("verification")
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        index_coverage: Some(crate::context::model::Coverage::Complete),
+        decision_status: metadata
+            .get("decision")
+            .and_then(|v| v.get("status"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        has_governed_path,
+    })
+}
+
+/// What a governing rule hit is attached to, or `None` for a `RELATES_TO`
+/// match, which is related to the file but does not govern it.
+fn governs_for(
+    kind: crate::graph_read::memories_for_file::GraphMatchKind,
+) -> Option<crate::context::model::Governs> {
+    use crate::context::model::Governs;
+    use crate::graph_read::memories_for_file::GraphMatchKind;
+    match kind {
+        GraphMatchKind::ExactSymbol | GraphMatchKind::SymbolTwoHop => Some(Governs::Symbol),
+        GraphMatchKind::ExactFile | GraphMatchKind::MetadataFallback => Some(Governs::File),
+        GraphMatchKind::AncestorDirectory => Some(Governs::Folder),
+        GraphMatchKind::Related => None,
+    }
+}
+
 async fn handle_context_plan(
     arguments: &Value,
     embedder: Arc<dyn Embedder>,
@@ -2605,75 +2695,28 @@ async fn handle_context_plan(
     let project_root = crate::daemon::resolve_project_root()
         .to_string_lossy()
         .to_string();
-    for res in results {
-        let metadata = &res.payload.metadata;
-        let sha = |key: &str| metadata.get(key).and_then(|v| v.as_str()).map(String::from);
-        let stored_file_sha256 = sha("file_sha256");
-        // Copying the stored hash into `current_*` compared a value to itself,
-        // so file drift could never be detected. Instead, hash the governed
-        // file fresh off disk when the memory names a real one.
-        let governed_path = metadata
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                metadata
-                    .get("location")
-                    .and_then(|v| v.as_str())
-                    .map(|loc| loc.split(':').next().unwrap_or(loc))
-            })
-            .map(|p| p.to_string())
-            // A virtual symbol URI governs no on-disk file to hash.
-            .filter(|p| !p.contains("://") && !p.starts_with("urn:") && !p.is_empty());
-        let current_file_sha256 = match governed_path {
-            Some(p) if stored_file_sha256.is_some() => {
-                let resolved = if std::path::Path::new(p.as_str()).is_absolute() {
-                    std::path::PathBuf::from(p)
-                } else {
-                    crate::daemon::resolve_project_root().join(p.as_str())
-                };
-                match std::fs::read(&resolved) {
-                    Ok(bytes) => Some({
-                        use sha2::{Digest, Sha256};
-                        hex::encode(Sha256::digest(&bytes))
-                    }),
-                    // A governed file that can no longer be read is honestly
-                    // reported as un-hashed (missing), not as unchanged.
-                    Err(e) => {
-                        tracing::debug!(
-                            "hash_governed_file failed to read {}: {e}",
-                            resolved.display()
-                        );
-                        None
-                    }
-                }
-            }
-            // No governed file path: the stored hash remains the best known
-            // state and currency stays as-is.
-            _ => stored_file_sha256.clone(),
+    // Where each hit stood in the search for `query`: it orders each file's
+    // governing rules. Without a query the search ran on an empty string and
+    // says nothing, so the fixed order alone decides.
+    let search_matches: std::collections::HashMap<String, crate::context::model::SearchMatch> =
+        if query.trim().is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            results
+                .iter()
+                .enumerate()
+                .map(|(rank, res)| {
+                    let hit = crate::context::model::SearchMatch {
+                        rank,
+                        score: res.score,
+                    };
+                    (res.id.clone(), hit)
+                })
+                .collect()
         };
-        let freshness = crate::context::freshness::compute_freshness(
-            &crate::context::freshness::FreshnessInputs {
-                stored_file_sha256: stored_file_sha256.clone(),
-                current_file_sha256,
-                stored_span_sha256: sha("span_sha256"),
-                current_span_sha256: metadata
-                    .get("span_sha256")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                verification_status: metadata
-                    .get("verification")
-                    .and_then(|v| v.get("status"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                index_coverage: Some(crate::context::model::Coverage::Complete),
-                decision_status: metadata
-                    .get("decision")
-                    .and_then(|v| v.get("status"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                has_governed_path: !res.payload.location.is_empty(),
-            },
-        );
+    for res in results {
+        let freshness =
+            context_item_freshness(&res.payload.metadata, !res.payload.location.is_empty());
         if exclude_stale && crate::context::freshness::is_stale(&freshness) {
             continue;
         }
@@ -2687,8 +2730,12 @@ async fn handle_context_plan(
         });
     }
     // Graph-read enrichment: when the store is LadybugStore, pull the memory
-    // hits governing each requested file path and surface them as plan items.
+    // hits governing each requested file path. Rules that govern a file are
+    // dealt by the planner ahead of the search hits, whole or as pointers;
+    // facts, procedures and RELATES_TO matches join the search hits.
     // `unsupported` backends still yield a plan -- just without this half.
+    let mut governing: Vec<Vec<crate::context::model::GoverningRule>> = Vec::new();
+    let mut governing_cut = false;
     {
         let ladybug = crate::traits::VectorStore::as_any(store.as_ref())
             .downcast_ref::<crate::store::LadybugStore>();
@@ -2769,7 +2816,9 @@ async fn handle_context_plan(
                         true,
                         &default_memory_types,
                         &[],
-                        max_items.max(1),
+                        // Every rule the store holds for the file, so the
+                        // planner decides what fits, not this lookup.
+                        crate::graph_read::memories_for_file::MAX_LIMIT,
                     )
                     .await
                     {
@@ -2781,17 +2830,50 @@ async fn handle_context_plan(
                                     &lookup.path,
                                 );
                             }
+                            // The store stops at MAX_LIMIT per file; a full
+                            // page may have left governing rules out.
+                            governing_cut |= retrieval.candidate_truncated
+                                || hits.len() >= crate::graph_read::memories_for_file::MAX_LIMIT;
+                            let mut file_rules = Vec::new();
                             for hit in hits {
-                                if items.iter().any(|it| it.id == hit.id) {
+                                // The search copy's freshness when there is
+                                // one; otherwise the same computation, since
+                                // the hit governs the requested file. A
+                                // stale hit is left out under `exclude_stale`
+                                // here as in the search, or it would come
+                                // back ahead of the fresh hits.
+                                let freshness = items
+                                    .iter()
+                                    .find(|it| it.id == hit.id)
+                                    .and_then(|it| it.freshness)
+                                    .unwrap_or_else(|| context_item_freshness(&hit.metadata, true));
+                                if exclude_stale && crate::context::freshness::is_stale(&freshness)
+                                {
                                     continue;
                                 }
-                                items.push(ContextItem {
+                                let governs = governs_for(hit.match_kind)
+                                    .filter(|_| hit.memory_type == "rule");
+                                let freshness = Some(freshness);
+                                let item = ContextItem {
                                     id: hit.id,
                                     memory_type: hit.memory_type,
                                     content: hit.content,
-                                    freshness: None,
-                                });
+                                    freshness,
+                                };
+                                match governs {
+                                    Some(governs) => {
+                                        file_rules.push(crate::context::model::GoverningRule {
+                                            search: search_matches.get(&item.id).copied(),
+                                            item,
+                                            file: fp.clone(),
+                                            governs,
+                                        })
+                                    }
+                                    None if items.iter().any(|it| it.id == item.id) => {}
+                                    None => items.push(item),
+                                }
                             }
+                            governing.push(file_rules);
                         }
                         Err(e) => {
                             had_backend_error = true;
@@ -2853,8 +2935,9 @@ async fn handle_context_plan(
     if let Err(reason) = req.policy.enforce() {
         return serde_json::json!({"ok": false, "error": reason}).to_string();
     }
-    let plan = service.plan_with_items(&req, items, budget, max_items);
+    let plan = service.plan_with_items(&req, governing, items, budget, max_items);
     let mut plan = plan;
+    plan.truncation |= governing_cut;
     plan.schema_version = CONTEXT_PLAN_SCHEMA_VERSION.to_string();
     plan.applied_scope = effective_ns.to_string();
     plan.event_id = "context-plan".into();
@@ -26293,6 +26376,470 @@ mod context_plan_tests {
         assert!(ids.contains(&"rule:one:rel"), "ids={ids:?}");
         assert!(ids.contains(&"rule:one:abs"), "ids={ids:?}");
         assert!(ids.contains(&"rule:two:rel"), "ids={ids:?}");
+    }
+
+    /// Stores one rule governing `governs`, with `content` and `vector`.
+    async fn seed_rule(
+        store: &Arc<dyn VectorStore>,
+        id: &str,
+        vector: Vec<f32>,
+        governs: &str,
+        content: &str,
+    ) {
+        store
+            .upsert(
+                "ns",
+                id,
+                vector,
+                crate::traits::MemoryPayload {
+                    content: content.to_string(),
+                    user_id: "test".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({"governs": [governs]}),
+                },
+            )
+            .await
+            .expect("upsert rule");
+    }
+
+    async fn test_store(tmp: &tempfile::TempDir) -> Arc<dyn VectorStore> {
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 4).expect("open"),
+        );
+        store.init("ns").await.expect("init ns");
+        store
+    }
+
+    async fn plan_for(store: &Arc<dyn VectorStore>, args: serde_json::Value) -> serde_json::Value {
+        let embedder: Arc<dyn Embedder> = Arc::new(LocalStubEmbedder);
+        let result = handle_context_plan(&args, embedder, store.clone()).await;
+        serde_json::from_str(&result).expect("plan json")
+    }
+
+    /// The rules sent whole. Search hits also bring the file's own node,
+    /// which is not a rule.
+    fn item_ids(plan: &serde_json::Value) -> Vec<String> {
+        plan["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .filter(|it| it["memory_type"] == "rule")
+            .filter_map(|it| it["id"].as_str().map(String::from))
+            .collect()
+    }
+
+    fn pointers(plan: &serde_json::Value) -> Vec<serde_json::Value> {
+        plan["not_shown"]
+            .as_array()
+            .unwrap_or_else(|| panic!("not_shown array: {plan}"))
+            .clone()
+    }
+
+    /// A pointer names the rule and how to fetch it; it never carries text.
+    fn assert_pointer_shape(pointer: &serde_json::Value) {
+        let mut keys: Vec<&str> = pointer
+            .as_object()
+            .expect("pointer object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["fetch", "file", "governs", "id", "match", "query_rank"],
+            "pointer={pointer}"
+        );
+        assert_eq!(pointer["fetch"], "neurostrata_get_memory", "{pointer}");
+    }
+
+    /// Broad before deep: with two files of six rules each and room for four,
+    /// each file gets two rules whole and the other eight are pointers.
+    #[tokio::test]
+    async fn context_plan_deals_governing_rules_across_files_in_turns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        for file in ["one", "two"] {
+            for i in 0..6 {
+                seed_rule(
+                    &store,
+                    &format!("rule:{file}:{i}"),
+                    vec![0.1f32; 4],
+                    &format!("src/{file}.rs"),
+                    &format!("rule {i} for {file}"),
+                )
+                .await;
+            }
+        }
+        let plan = plan_for(
+            &store,
+            serde_json::json!({
+                "namespace": "ns",
+                "query": "rule",
+                "files": ["src/one.rs", "src/two.rs"],
+                "max_items": 4,
+            }),
+        )
+        .await;
+        let ids = item_ids(&plan);
+        let whole = |file: &str| {
+            ids.iter()
+                .filter(|id| id.starts_with(&format!("rule:{file}:")))
+                .count()
+        };
+        assert_eq!((whole("one"), whole("two")), (2, 2), "ids={ids:?}");
+        let not_shown = pointers(&plan);
+        assert_eq!(not_shown.len(), 8, "{plan}");
+        for pointer in &not_shown {
+            assert_pointer_shape(pointer);
+            let id = pointer["id"].as_str().expect("pointer id");
+            assert!(
+                !ids.iter().any(|it| it == id),
+                "{id} both whole and pointer"
+            );
+            let file = id.split(':').nth(1).expect("file part");
+            assert_eq!(pointer["file"], format!("src/{file}.rs"), "{pointer}");
+            assert_eq!(pointer["governs"], "file", "{pointer}");
+        }
+    }
+
+    /// The rule that best matches the query is sent whole even when the
+    /// fixed order (symbol > file > folder) puts it last.
+    #[tokio::test]
+    async fn context_plan_sends_the_rule_that_best_matches_the_query_whole() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        let query = "podman";
+        let query_vector = LocalStubEmbedder.embed(query).await.expect("embed");
+        for i in 0..3 {
+            seed_rule(
+                &store,
+                &format!("rule:file:{i}"),
+                vec![0.1f32, 0.0, 0.0, 0.0],
+                "src/one.rs",
+                &format!("file rule {i}"),
+            )
+            .await;
+        }
+        seed_rule(&store, "rule:folder", query_vector, "src/", "use podman").await;
+        let plan = plan_for(
+            &store,
+            serde_json::json!({
+                "namespace": "ns",
+                "query": query,
+                "files": ["src/one.rs"],
+                "max_items": 1,
+            }),
+        )
+        .await;
+        assert_eq!(item_ids(&plan), vec!["rule:folder"], "{plan}");
+        let not_shown = pointers(&plan);
+        assert_eq!(not_shown.len(), 3, "{plan}");
+        for pointer in &not_shown {
+            assert_pointer_shape(pointer);
+        }
+    }
+
+    /// Without a query the fixed order alone decides: a rule on the file
+    /// comes before a rule on its folder.
+    #[tokio::test]
+    async fn context_plan_without_a_query_keeps_the_fixed_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        let folder_vector = LocalStubEmbedder.embed("").await.expect("embed");
+        seed_rule(&store, "rule:folder", folder_vector, "src/", "folder rule").await;
+        for i in 0..3 {
+            seed_rule(
+                &store,
+                &format!("rule:file:{i}"),
+                vec![-1.0f32, 0.0, 0.0, 0.0],
+                "src/one.rs",
+                &format!("file rule {i}"),
+            )
+            .await;
+        }
+        let plan = plan_for(
+            &store,
+            serde_json::json!({
+                "namespace": "ns",
+                "files": ["src/one.rs"],
+                "max_items": 1,
+            }),
+        )
+        .await;
+        let ids = item_ids(&plan);
+        assert_eq!(ids.len(), 1, "{plan}");
+        assert!(ids[0].starts_with("rule:file:"), "{plan}");
+        let folder = pointers(&plan)
+            .into_iter()
+            .find(|p| p["id"] == "rule:folder")
+            .unwrap_or_else(|| panic!("folder rule is a pointer: {plan}"));
+        assert_eq!(folder["governs"], "folder", "{folder}");
+        assert_eq!(folder["query_rank"], "4 of 4", "{folder}");
+    }
+
+    /// Each pointer says how well it matched the query, compared with the
+    /// rules sent whole: `close` at or above the weakest whole rule, `weaker`
+    /// below it, `none` when the search did not find it. The text format
+    /// names each pointer and the call that fetches it, never its content.
+    #[tokio::test]
+    async fn context_plan_pointers_carry_match_bands_and_no_content() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        let query = "rule";
+        let q = LocalStubEmbedder.embed(query).await.expect("embed");
+        let long = |tag: &str| format!("{tag} {}", "x".repeat(1000));
+        seed_rule(&store, "rule:a", q.clone(), "src/one.rs", "short rule a").await;
+        seed_rule(&store, "rule:b", q.clone(), "src/one.rs", &long("secret b")).await;
+        let weaker = vec![q[0], q[1], q[2] * 0.2, q[3]];
+        seed_rule(&store, "rule:c", weaker, "src/one.rs", &long("secret c")).await;
+        seed_rule(
+            &store,
+            "rule:d",
+            vec![-1.0f32, 0.0, 0.0, 0.0],
+            "src/one.rs",
+            &long("secret d"),
+        )
+        .await;
+        // 256 bytes is 64 tokens: room for rule a, not for b, c or d.
+        let args = serde_json::json!({
+            "namespace": "ns",
+            "query": query,
+            "files": ["src/one.rs"],
+            "max_items": 4,
+            "max_bytes": 256,
+        });
+        let plan = plan_for(&store, args.clone()).await;
+        assert_eq!(item_ids(&plan), vec!["rule:a"], "{plan}");
+        let not_shown = pointers(&plan);
+        let band = |id: &str| {
+            let p = not_shown
+                .iter()
+                .find(|p| p["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is a pointer: {plan}"));
+            assert_pointer_shape(p);
+            assert_eq!(p["file"], "src/one.rs", "{p}");
+            assert_eq!(p["governs"], "file", "{p}");
+            p["match"].as_str().expect("match").to_string()
+        };
+        // b sits on the query exactly as a does. Whether the search reaches
+        // c and d depends on its depth, so they are `weaker` or `none`; the
+        // bands themselves are pinned in the service tests.
+        assert_eq!(band("rule:b"), "close");
+        for id in ["rule:c", "rule:d"] {
+            let band = band(id);
+            assert!(band == "weaker" || band == "none", "{id}: {band}");
+        }
+
+        let mut text_args = args;
+        text_args["format"] = serde_json::json!("text");
+        let embedder: Arc<dyn Embedder> = Arc::new(LocalStubEmbedder);
+        let text = handle_context_plan(&text_args, embedder, store.clone()).await;
+        assert!(text.contains("short rule a"), "{text}");
+        for id in ["rule:b", "rule:c", "rule:d"] {
+            let line = text
+                .lines()
+                .find(|l| l.contains(id))
+                .unwrap_or_else(|| panic!("{id} line: {text}"));
+            assert!(line.contains("not shown"), "{line}");
+            assert!(line.contains("neurostrata_get_memory"), "{line}");
+        }
+        assert!(!text.contains("secret"), "{text}");
+    }
+
+    /// `truncation` is true when a governing rule is only a pointer, even
+    /// when no search hit was cut; with room for every rule there are no
+    /// pointers, `not_shown` is an empty list and nothing is truncated.
+    #[tokio::test]
+    async fn context_plan_reports_truncation_when_a_rule_is_a_pointer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        for i in 0..2 {
+            seed_rule(
+                &store,
+                &format!("rule:{i}"),
+                vec![0.1f32; 4],
+                "src/one.rs",
+                &format!("rule {i}"),
+            )
+            .await;
+        }
+        let args = |max_items: u64| {
+            serde_json::json!({
+                "namespace": "ns",
+                "query": "rule",
+                "files": ["src/one.rs"],
+                "max_items": max_items,
+            })
+        };
+        let plan = plan_for(&store, args(1)).await;
+        assert_eq!(item_ids(&plan).len(), 1, "{plan}");
+        assert_eq!(pointers(&plan).len(), 1, "{plan}");
+        assert_eq!(plan["truncation"], true, "{plan}");
+
+        let plan = plan_for(&store, args(5)).await;
+        assert_eq!(item_ids(&plan).len(), 2, "{plan}");
+        assert!(pointers(&plan).is_empty(), "{plan}");
+        assert_eq!(plan["truncation"], false, "{plan}");
+    }
+
+    /// A governing rule that `exclude_stale` dropped from the search hits
+    /// does not come back through the file lookup, neither whole nor as a
+    /// pointer.
+    #[tokio::test]
+    async fn context_plan_exclude_stale_keeps_stale_governing_rules_out() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        let governed = tmp.path().join("one.rs");
+        std::fs::write(&governed, "pub fn one() {}\n").expect("write governed file");
+        let query = "rule";
+        let q = LocalStubEmbedder.embed(query).await.expect("embed");
+        // The stored hash no longer matches the file on disk: stale.
+        store
+            .upsert(
+                "ns",
+                "rule:stale",
+                q,
+                crate::traits::MemoryPayload {
+                    content: "stale rule".to_string(),
+                    user_id: "test".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "src/one.rs".to_string(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "governs": ["src/one.rs"],
+                        "file_path": governed.to_string_lossy(),
+                        "file_sha256": "0".repeat(64),
+                    }),
+                },
+            )
+            .await
+            .expect("upsert stale rule");
+        seed_rule(
+            &store,
+            "rule:fresh",
+            vec![-1.0f32, 0.0, 0.0, 0.0],
+            "src/one.rs",
+            "fresh rule",
+        )
+        .await;
+        let args = |exclude_stale: bool| {
+            serde_json::json!({
+                "namespace": "ns",
+                "query": query,
+                "files": ["src/one.rs"],
+                "max_items": 1,
+                "exclude_stale": exclude_stale,
+            })
+        };
+        let plan = plan_for(&store, args(false)).await;
+        assert_eq!(item_ids(&plan), vec!["rule:stale"], "{plan}");
+
+        let plan = plan_for(&store, args(true)).await;
+        assert_eq!(item_ids(&plan), vec!["rule:fresh"], "{plan}");
+        assert!(
+            !pointers(&plan).iter().any(|p| p["id"] == "rule:stale"),
+            "{plan}"
+        );
+    }
+
+    /// A stale governing rule the search did not return is judged by the
+    /// file lookup the same way: left out under `exclude_stale`.
+    #[tokio::test]
+    async fn context_plan_exclude_stale_judges_rules_only_the_lookup_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        let governed = tmp.path().join("one.rs");
+        std::fs::write(
+            &governed,
+            "pub fn one() {}
+",
+        )
+        .expect("write governed file");
+        let query = "rule";
+        let q = LocalStubEmbedder.embed(query).await.expect("embed");
+        seed_rule(&store, "rule:fresh", q, "src/one.rs", "fresh rule").await;
+        store
+            .upsert(
+                "ns",
+                "rule:stale",
+                vec![-1.0f32, 0.0, 0.0, 0.0],
+                crate::traits::MemoryPayload {
+                    content: "stale rule".to_string(),
+                    user_id: "test".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "src/one.rs".to_string(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "governs": ["src/one.rs"],
+                        "file_path": governed.to_string_lossy(),
+                        "file_sha256": "0".repeat(64),
+                    }),
+                },
+            )
+            .await
+            .expect("upsert stale rule");
+        let args = |exclude_stale: bool| {
+            serde_json::json!({
+                "namespace": "ns",
+                "query": query,
+                "files": ["src/one.rs"],
+                "max_items": 1,
+                "exclude_stale": exclude_stale,
+            })
+        };
+        let plan = plan_for(&store, args(false)).await;
+        assert_eq!(item_ids(&plan), vec!["rule:fresh"], "{plan}");
+        assert!(
+            pointers(&plan).iter().any(|p| p["id"] == "rule:stale"),
+            "{plan}"
+        );
+
+        let plan = plan_for(&store, args(true)).await;
+        assert_eq!(item_ids(&plan), vec!["rule:fresh"], "{plan}");
+        assert!(pointers(&plan).is_empty(), "{plan}");
+    }
+
+    /// The store returns at most MAX_LIMIT memories per file. When more
+    /// rules govern a file than that, the plan says it was cut instead of
+    /// looking complete.
+    #[tokio::test]
+    async fn context_plan_reports_governing_rules_past_the_store_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = test_store(&tmp).await;
+        let total = crate::graph_read::memories_for_file::MAX_LIMIT + 1;
+        for i in 0..total {
+            seed_rule(
+                &store,
+                &format!("rule:gov:{i:02}"),
+                vec![0.1f32; 4],
+                "src/one.rs",
+                &format!("governing rule {i}"),
+            )
+            .await;
+        }
+        let plan = plan_for(
+            &store,
+            serde_json::json!({
+                "namespace": "ns",
+                "query": "rule",
+                "files": ["src/one.rs"],
+                "max_items": total,
+            }),
+        )
+        .await;
+        // The store's full page reaches the planner; what lies past it may
+        // be missing, and the plan says so.
+        let seen = item_ids(&plan).len() + pointers(&plan).len();
+        assert!(
+            seen >= crate::graph_read::memories_for_file::MAX_LIMIT,
+            "{seen} of {total} rules seen: {plan}"
+        );
+        assert_eq!(plan["truncation"], true, "{plan}");
     }
 
     #[ignore]

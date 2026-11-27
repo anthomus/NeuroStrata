@@ -1,7 +1,6 @@
 //! Deterministic ranking, deduplication and budget application for a context plan.
 
 use super::model::ContextItem;
-use std::borrow::Borrow;
 use std::collections::HashSet;
 
 /// Cumulative budgets applied while building a plan. All three must be
@@ -72,47 +71,103 @@ pub fn estimate_tokens(item: &ContextItem) -> usize {
     item.content.chars().count() / 4 + 8
 }
 
+/// What one offered item did to a [`Selection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offer {
+    /// Selected whole.
+    Taken,
+    /// Its id or content was already offered; nothing changed.
+    Duplicate,
+    /// It would exhaust a budget; skipped whole, never cut.
+    OverBudget,
+}
+
+/// Items chosen so far against one [`Budget`], deduplicated by id and
+/// content. Governing rules and search hits go through the same selection,
+/// so they share one budget and one dedup.
+#[derive(Debug, Clone)]
+pub struct Selection {
+    budget: Budget,
+    call_tokens: usize,
+    turn_tokens: usize,
+    session_tokens: usize,
+    seen_ids: HashSet<String>,
+    seen_content: HashSet<String>,
+    items: Vec<ContextItem>,
+}
+
+impl Selection {
+    pub fn new(budget: impl Into<Budget>) -> Self {
+        let budget = budget.into();
+        Selection {
+            // Per-turn and per-session ceilings are cumulative: they start
+            // from the usage reported on the budget, not from zero.
+            turn_tokens: budget.turn_used,
+            session_tokens: budget.session_used,
+            budget,
+            call_tokens: 0,
+            seen_ids: HashSet::new(),
+            seen_content: HashSet::new(),
+            items: Vec::new(),
+        }
+    }
+
+    /// Whether an item with this id was already offered, or its content
+    /// was already selected.
+    pub fn has_seen(&self, item: &ContextItem) -> bool {
+        self.seen_ids.contains(&item.id) || self.seen_content.contains(&item.content)
+    }
+
+    /// Offer one item: selected whole when it is new and fits every budget.
+    /// An item that does not fit is still marked as seen by id, so a later
+    /// copy of it is a duplicate; its content counts as seen only once
+    /// selected, so another memory with the same text is offered on its own.
+    pub fn offer(&mut self, item: &ContextItem) -> Offer {
+        if self.seen_ids.contains(&item.id) || self.seen_content.contains(&item.content) {
+            return Offer::Duplicate;
+        }
+        self.seen_ids.insert(item.id.clone());
+        let cost = estimate_tokens(item);
+        if self.call_tokens + cost > self.budget.per_call
+            || self.turn_tokens + cost > self.budget.per_turn
+            || self.session_tokens + cost > self.budget.per_session
+        {
+            // Skip rather than truncate content, so a plan never silently
+            // delivers a half-memory.
+            return Offer::OverBudget;
+        }
+        self.seen_content.insert(item.content.clone());
+        self.call_tokens += cost;
+        self.turn_tokens += cost;
+        self.session_tokens += cost;
+        self.items.push(item.clone());
+        Offer::Taken
+    }
+
+    pub fn count(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn into_items(self) -> Vec<ContextItem> {
+        self.items
+    }
+}
+
 /// Deduplicate `items` by id and content, then keep as many as fit in `budget`,
 /// respecting the cumulative per-call/turn/session ceilings. The input order is
-/// preserved (callers rank first).
+/// preserved (callers rank first). Production plans go through
+/// [`Selection`] directly; this is the one-shot form the tests pin.
+#[cfg(test)]
 pub fn rank_dedup_budget<I, T>(items: I, budget: impl Into<Budget>) -> Vec<ContextItem>
 where
     I: IntoIterator<Item = T>,
-    T: Borrow<ContextItem>,
+    T: std::borrow::Borrow<ContextItem>,
 {
-    let budget = budget.into();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut seen_content: HashSet<String> = HashSet::new();
-    let mut out: Vec<ContextItem> = Vec::new();
-    let mut call_tokens = 0usize;
-    // Per-turn and per-session ceilings are cumulative: they start from the
-    // usage reported on the budget, not from zero.
-    let mut turn_tokens = budget.turn_used;
-    let mut session_tokens = budget.session_used;
-
-    for borrowed in items {
-        let item = borrowed.borrow().clone();
-        if !seen_ids.insert(item.id.clone()) {
-            continue;
-        }
-        if !seen_content.insert(item.content.clone()) {
-            continue;
-        }
-        let cost = estimate_tokens(&item);
-        if call_tokens + cost > budget.per_call
-            || turn_tokens + cost > budget.per_turn
-            || session_tokens + cost > budget.per_session
-        {
-            // Budget exhausted for this item; skip rather than truncate content,
-            // so a plan never silently delivers a half-memory.
-            continue;
-        }
-        call_tokens += cost;
-        turn_tokens += cost;
-        session_tokens += cost;
-        out.push(item);
+    let mut selection = Selection::new(budget);
+    for item in items {
+        selection.offer(std::borrow::Borrow::borrow(&item));
     }
-    out
+    selection.into_items()
 }
 
 #[cfg(test)]

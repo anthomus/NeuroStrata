@@ -426,7 +426,7 @@ mod tests {
         let mut plan_samples = Vec::<f64>::new();
         for _ in 0..100 {
             let start = Instant::now();
-            let plan = svc.plan_with_items(request(), items(10), budget, 10);
+            let plan = svc.plan_with_items(request(), Vec::new(), items(10), budget, 10);
             plan_samples.push(start.elapsed().as_secs_f64() * 1000.0);
             assert!(!plan.items.is_empty());
         }

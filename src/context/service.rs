@@ -14,10 +14,13 @@
 //!   with no items). It is the base both other paths report through, and the
 //!   shape a caller uses when it only needs the degradation, policy and
 //!   scope semantics probed.
-//! * [`ContextService::plan_with_items`] takes ranked candidate items and a
-//!   [`Budget`], dedups and budgets them down (`plan::rank_dedup_budget`),
-//!   truncates to `max_items`, and reports `Supported` only when at least one
-//!   item survived. This is the production path the server and hosts use.
+//! * [`ContextService::plan_with_items`] takes the rules governing each
+//!   requested file, ranked candidate items and a [`Budget`]. It deals the
+//!   rules across files in turns, then fills the rest with candidates, all
+//!   whole and deduplicated inside the budget and `max_items` (`plan::Selection`);
+//!   a rule that does not fit becomes a pointer in `not_shown`. It reports
+//!   `Supported` only when at least one item survived. This is the
+//!   production path the server and hosts use.
 //!
 //! Rendering is deliberately not bundled into planning: production hosts render
 //! via the free `render` re-exported from `context`; the test-only `render`
@@ -79,9 +82,21 @@ impl ContextService {
         super::render::render(plan.as_ref())
     }
 
+    /// Deals the rules governing the requested files first, then fills the
+    /// rest with `candidates`, all inside one `budget` and `max_items`.
+    ///
+    /// `governing` holds one list per requested file, in the fixed order
+    /// (symbol > file > folder, then type and reads). Each list is reordered
+    /// by search rank, rules the search did not find after, and the lists
+    /// are dealt in turns: every file's first rule, then every file's
+    /// second, so one file's rules never crowd out another's. A rule is sent
+    /// whole or, when it does not fit, listed in `not_shown` as a pointer
+    /// with no content. `truncation` is set when there is a pointer or a
+    /// candidate was left out.
     pub fn plan_with_items<R>(
         &self,
         request: R,
+        governing: Vec<Vec<super::model::GoverningRule>>,
         candidates: Vec<super::model::ContextItem>,
         budget: super::plan::Budget,
         max_items: usize,
@@ -89,6 +104,9 @@ impl ContextService {
     where
         R: AsRef<ContextRequest>,
     {
+        use super::model::{NotShown, QueryMatch, FETCH_TOOL};
+        use super::plan::{Offer, Selection};
+
         let mut plan = self.plan(&request);
         if request.as_ref().policy.enforce().is_err() {
             // The egress policy denied this request; keep the denial shell
@@ -96,13 +114,74 @@ impl ContextService {
             // `Supported` — no item may be delivered against refused egress.
             return plan;
         }
-        let total = candidates.len();
-        let mut deduped = super::plan::rank_dedup_budget(candidates, budget);
-        if deduped.len() > max_items {
-            deduped.truncate(max_items);
+        let mut selection = Selection::new(budget);
+        let files: Vec<Vec<super::model::GoverningRule>> = governing
+            .into_iter()
+            .map(|mut rules| {
+                // Stable: rules with the same search standing keep the
+                // fixed order.
+                rules.sort_by_key(|rule| rule.search.map_or(usize::MAX, |hit| hit.rank));
+                rules
+            })
+            .collect();
+        let depth = files.iter().map(Vec::len).max().unwrap_or(0);
+        // (rule, its 1-based place in its file, the file's rule count)
+        let mut left_out: Vec<(&super::model::GoverningRule, usize, usize)> = Vec::new();
+        let mut left_out_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // The weakest search score among rules sent whole; scores are
+        // distances, so the weakest is the largest.
+        let mut weakest_whole: Option<f32> = None;
+        for turn in 0..depth {
+            for rules in &files {
+                let Some(rule) = rules.get(turn) else {
+                    continue;
+                };
+                // A rule governing two requested files is dealt once.
+                if left_out_ids.contains(rule.item.id.as_str()) || selection.has_seen(&rule.item) {
+                    continue;
+                }
+                let taken =
+                    selection.count() < max_items && selection.offer(&rule.item) == Offer::Taken;
+                if taken {
+                    if let Some(hit) = rule.search {
+                        weakest_whole = Some(weakest_whole.map_or(hit.score, |w| w.max(hit.score)));
+                    }
+                } else {
+                    left_out_ids.insert(rule.item.id.as_str());
+                    left_out.push((rule, turn + 1, rules.len()));
+                }
+            }
         }
-        plan.truncation = total > deduped.len();
-        plan.items = deduped;
+        plan.not_shown = left_out
+            .into_iter()
+            .map(|(rule, place, of)| NotShown {
+                id: rule.item.id.clone(),
+                file: rule.file.clone(),
+                governs: rule.governs,
+                query_rank: format!("{place} of {of}"),
+                query_match: match (rule.search, weakest_whole) {
+                    (None, _) => QueryMatch::NoMatch,
+                    (Some(hit), Some(weakest)) if hit.score > weakest => QueryMatch::Weaker,
+                    (Some(_), _) => QueryMatch::Close,
+                },
+                fetch: FETCH_TOOL.to_string(),
+            })
+            .collect();
+        // A search copy of a rule already dealt (whole or as a pointer) is
+        // not a separate hit, so it is not counted as cut.
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|it| !left_out_ids.contains(it.id.as_str()) && !selection.has_seen(it))
+            .collect();
+        let total = candidates.len();
+        let mut candidates_cut = false;
+        for candidate in &candidates {
+            if selection.count() >= max_items || selection.offer(candidate) != Offer::Taken {
+                candidates_cut = true;
+            }
+        }
+        plan.items = selection.into_items();
+        plan.truncation = candidates_cut || !plan.not_shown.is_empty();
         // A non-empty selection is fully supported even when `truncation` is
         // set: the plan delivered the items it planned, while `truncation`
         // records (and the debug log below surfaces) that the request was cut
@@ -115,11 +194,12 @@ impl ContextService {
         };
         if plan.truncation {
             tracing::debug!(
-                planned = total,
+                candidates = total,
                 delivered = plan.items.len(),
-                "context plan truncated: {} of {} candidates delivered",
+                not_shown = plan.not_shown.len(),
+                "context plan truncated: {} items delivered, {} governing rules as pointers",
                 plan.items.len(),
-                total
+                plan.not_shown.len()
             );
         }
         plan
@@ -178,6 +258,7 @@ mod tests {
 
         let with_items = service.plan_with_items(
             &denied,
+            Vec::new(),
             vec![item("i1", "c1")],
             Budget::from(10_000usize),
             10,
@@ -195,7 +276,13 @@ mod tests {
             item("i2", "c1"),
             item("i3", "c3"),
         ];
-        let plan = service.plan_with_items(&request(), candidates, Budget::from(10_000usize), 10);
+        let plan = service.plan_with_items(
+            &request(),
+            Vec::new(),
+            candidates,
+            Budget::from(10_000usize),
+            10,
+        );
         assert_eq!(plan.items.len(), 2);
         assert_eq!(plan.items[0].id, "i1");
         assert_eq!(plan.items[1].id, "i3");
@@ -210,7 +297,13 @@ mod tests {
         let service = ContextService::new();
         let candidates = vec![item("a", &"x".repeat(1000)), item("b", "tiny")];
         // item "a" costs 1000/4+8 = 258 tokens > the 30-token budget; "b" fits.
-        let plan = service.plan_with_items(&request(), candidates, Budget::from(30usize), 10);
+        let plan = service.plan_with_items(
+            &request(),
+            Vec::new(),
+            candidates,
+            Budget::from(30usize),
+            10,
+        );
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].id, "b");
     }
@@ -221,9 +314,141 @@ mod tests {
         let candidates: Vec<ContextItem> = (0..5)
             .map(|i| item(&format!("i{}", i), &format!("content-{}", i)))
             .collect();
-        let plan = service.plan_with_items(&request(), candidates, Budget::from(10_000usize), 3);
+        let plan = service.plan_with_items(
+            &request(),
+            Vec::new(),
+            candidates,
+            Budget::from(10_000usize),
+            3,
+        );
         assert_eq!(plan.items.len(), 3);
         assert!(plan.truncation);
+    }
+
+    fn rule(
+        id: &str,
+        file: &str,
+        content: &str,
+        search: Option<(usize, f32)>,
+    ) -> super::super::model::GoverningRule {
+        super::super::model::GoverningRule {
+            item: item(id, content),
+            file: file.into(),
+            governs: super::super::model::Governs::File,
+            search: search.map(|(rank, score)| super::super::model::SearchMatch { rank, score }),
+        }
+    }
+
+    /// Rules are dealt in turns across files; within a file, search rank
+    /// comes first and the given order breaks ties; a rule that governs two
+    /// files is dealt once.
+    #[test]
+    fn governing_rules_are_dealt_in_turns_by_search_rank() {
+        let service = ContextService::new();
+        let governing = vec![
+            vec![
+                rule("a1", "a.rs", "a one", None),
+                rule("a2", "a.rs", "a two", Some((3, 0.4))),
+                rule("shared", "a.rs", "shared", Some((0, 0.1))),
+            ],
+            vec![
+                rule("shared", "b.rs", "shared", Some((0, 0.1))),
+                rule("b1", "b.rs", "b one", None),
+                rule("b2", "b.rs", "b two", None),
+            ],
+        ];
+        let plan = service.plan_with_items(
+            &request(),
+            governing,
+            vec![item("hit", "search hit")],
+            Budget::from(10_000usize),
+            3,
+        );
+        let ids: Vec<&str> = plan.items.iter().map(|it| it.id.as_str()).collect();
+        // Turn 1: a.rs's best is `shared`; b.rs's `shared` is already dealt.
+        // Turn 2: a.rs gives a2, b.rs gives b1. No room is left.
+        assert_eq!(ids, vec!["shared", "a2", "b1"]);
+        let pointers: Vec<(&str, &str, &str)> = plan
+            .not_shown
+            .iter()
+            .map(|p| (p.id.as_str(), p.file.as_str(), p.query_rank.as_str()))
+            .collect();
+        assert_eq!(
+            pointers,
+            vec![("a1", "a.rs", "3 of 3"), ("b2", "b.rs", "3 of 3")]
+        );
+        assert!(plan.truncation);
+    }
+
+    /// `match` compares a pointer's search score (a distance) with the
+    /// weakest rule sent whole: as close or closer is `close`, farther is
+    /// `weaker`, not found is `none`.
+    #[test]
+    fn pointers_carry_match_bands() {
+        use super::super::model::QueryMatch;
+        let service = ContextService::new();
+        let long = "x".repeat(400);
+        let governing = vec![vec![
+            rule("whole", "a.rs", "short", Some((0, 0.2))),
+            rule("tie", "a.rs", &format!("tie {long}"), Some((1, 0.2))),
+            rule("far", "a.rs", &format!("far {long}"), Some((2, 0.5))),
+            rule("unfound", "a.rs", &format!("unfound {long}"), None),
+        ]];
+        // 50 tokens: room for "short" (9), not for any 400-character rule.
+        let plan =
+            service.plan_with_items(&request(), governing, Vec::new(), Budget::from(50usize), 10);
+        assert_eq!(plan.items.len(), 1);
+        let bands: Vec<(&str, QueryMatch)> = plan
+            .not_shown
+            .iter()
+            .map(|p| (p.id.as_str(), p.query_match))
+            .collect();
+        assert_eq!(
+            bands,
+            vec![
+                ("tie", QueryMatch::Close),
+                ("far", QueryMatch::Weaker),
+                ("unfound", QueryMatch::NoMatch),
+            ]
+        );
+        let json = serde_json::to_value(&plan.not_shown[0]).expect("pointer json");
+        assert_eq!(json["match"], "close");
+        assert_eq!(json["governs"], "file");
+        assert_eq!(json["fetch"], "neurostrata_get_memory");
+        assert!(json.get("content").is_none());
+    }
+
+    /// Two rules with the same text that both miss the budget are both
+    /// pointers: a rule that was not sent does not hide another.
+    #[test]
+    fn rules_with_the_same_text_are_both_pointers_when_neither_fits() {
+        let service = ContextService::new();
+        let text = "y".repeat(400);
+        let governing = vec![
+            vec![rule("a", "a.rs", &text, None)],
+            vec![rule("b", "b.rs", &text, None)],
+        ];
+        let plan =
+            service.plan_with_items(&request(), governing, Vec::new(), Budget::from(50usize), 10);
+        assert!(plan.items.is_empty());
+        let ids: Vec<&str> = plan.not_shown.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    /// Without governing rules nothing is a pointer, and a plan whose
+    /// candidates all fit is not truncated.
+    #[test]
+    fn no_governing_rules_means_no_pointers() {
+        let service = ContextService::new();
+        let plan = service.plan_with_items(
+            &request(),
+            Vec::new(),
+            vec![item("c", "candidate")],
+            Budget::from(10_000usize),
+            5,
+        );
+        assert!(plan.not_shown.is_empty());
+        assert!(!plan.truncation);
     }
 
     #[test]

@@ -34,6 +34,17 @@ pub fn render_plan(plan: &ContextPlan) -> String {
             out.push('\n');
         }
     }
+    for pointer in &plan.not_shown {
+        out.push_str(&format!(
+            "- not shown: rule {} governs {} ({}; query rank {}, match {}). Fetch it with {} before relying on it.\n",
+            pointer.id,
+            pointer.file,
+            pointer.governs,
+            pointer.query_rank,
+            pointer.query_match,
+            pointer.fetch
+        ));
+    }
     if plan.truncation {
         out.push_str("… (truncated)\n");
     }
